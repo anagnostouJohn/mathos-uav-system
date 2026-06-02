@@ -52,6 +52,9 @@
 #define MAV_MODE_FLAG_SAFETY_ARMED 0x80
 #define GATEWAY_FC_HEARTBEAT_PRINT_EVERY 1
 
+#define GATEWAY_ARM_DISARM_DRY_RUN 1
+#define GATEWAY_ARM_DISARM_REAL_ENABLE 0
+
 static uint8_t gateway_mavlink_tx_seq = 0;
 
 static uint32_t gateway_fc_heartbeat_count = 0;
@@ -74,6 +77,20 @@ typedef struct
     int pitch;
     int roll;
 } rc_packet_t;
+
+static uint8_t gateway_fc_heartbeat_is_fresh(void)
+{
+    TickType_t now = xTaskGetTickCount();
+
+    if (gateway_fc_last_heartbeat_tick != 0 &&
+        (now - gateway_fc_last_heartbeat_tick) < pdMS_TO_TICKS(1500))
+    {
+        return 1;
+    }
+
+    return 0;
+}
+
 static const char *gateway_fc_arm_state_to_string(uint8_t armed)
 {
     if (armed)
@@ -213,14 +230,7 @@ static void gateway_mavlink_dry_run(const rc_packet_t *packet)
         Safety rule:
         if remote is not ARMED, gateway would send neutral controls.
     */
-    TickType_t now = xTaskGetTickCount();
-    uint8_t fc_heartbeat_fresh = 0;
-
-    if (gateway_fc_last_heartbeat_tick != 0 &&
-        (now - gateway_fc_last_heartbeat_tick) < pdMS_TO_TICKS(1500))
-    {
-        fc_heartbeat_fresh = 1;
-    }
+    uint8_t fc_heartbeat_fresh = gateway_fc_heartbeat_is_fresh();
 
     if (packet->state != RC_ARMED ||
         !fc_heartbeat_fresh ||
@@ -246,6 +256,59 @@ static void gateway_mavlink_dry_run(const rc_packet_t *packet)
                z_throttle,
                r_yaw);
     }
+
+#endif
+}
+
+static void gateway_arm_disarm_dry_run(const rc_packet_t *packet)
+{
+#if GATEWAY_ARM_DISARM_DRY_RUN
+
+    static uint8_t initialized = 0;
+    static rc_state_t last_remote_state = RC_DISARMED;
+
+    if (packet == NULL)
+    {
+        return;
+    }
+
+    if (!initialized)
+    {
+        last_remote_state = packet->state;
+        initialized = 1;
+        return;
+    }
+
+    if (packet->state == last_remote_state)
+    {
+        return;
+    }
+
+    uint8_t fc_fresh = gateway_fc_heartbeat_is_fresh();
+
+    if (packet->state == RC_ARMED)
+    {
+        printf("[GATEWAY ARM DRY RUN] remote changed to ARMED packet_id=%lu fc=%s fc_fresh=%u ACTION=PRINT_ONLY\n",
+               (unsigned long)packet->packet_id,
+               gateway_fc_arm_state_to_string(gateway_fc_is_armed),
+               fc_fresh);
+    }
+    else if (packet->state == RC_DISARMED)
+    {
+        printf("[GATEWAY DISARM DRY RUN] remote changed to DISARMED packet_id=%lu fc=%s fc_fresh=%u ACTION=PRINT_ONLY\n",
+               (unsigned long)packet->packet_id,
+               gateway_fc_arm_state_to_string(gateway_fc_is_armed),
+               fc_fresh);
+    }
+    else if (packet->state == RC_FAILSAFE)
+    {
+        printf("[GATEWAY FAILSAFE DRY RUN] remote changed to FAILSAFE packet_id=%lu fc=%s fc_fresh=%u ACTION=PRINT_ONLY\n",
+               (unsigned long)packet->packet_id,
+               gateway_fc_arm_state_to_string(gateway_fc_is_armed),
+               fc_fresh);
+    }
+
+    last_remote_state = packet->state;
 
 #endif
 }
@@ -373,6 +436,7 @@ static void gateway_handle_frame(const uint8_t *frame, size_t frame_len)
         return;
     }
 
+    gateway_arm_disarm_dry_run(&rc_packet);
     gateway_mavlink_dry_run(&rc_packet);
 
     if (ok_count == 1 || (ok_count % GATEWAY_PRINT_EVERY) == 0)
