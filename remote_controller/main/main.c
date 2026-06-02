@@ -19,7 +19,7 @@
 #include "esp_random.h"
 ////////////////////////////////////////////////////////////////////////////////////
 
-#define DEBUG_CRYPTO_TAMPER_TEST 1
+#define DEBUG_CRYPTO_TAMPER_TEST 0
 #define CRYPTO_TAMPER_EVERY 200
 
 #define BENCH_FAILSAFE_DISARM 1

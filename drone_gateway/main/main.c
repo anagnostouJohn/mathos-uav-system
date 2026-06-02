@@ -18,7 +18,45 @@
 
 #define GATEWAY_RX_BUFFER_SIZE 256
 #define GATEWAY_PRINT_EVERY 50
+#define DEBUG_GATEWAY_RX_BYTES 0
+#define GATEWAY_MAVLINK_DRY_RUN 1
+#define GATEWAY_DRY_RUN_PRINT_EVERY 50
 
+#define GATEWAY_FC_UART_ENABLE 1
+
+#define GATEWAY_FC_UART_PORT UART_NUM_2
+#define GATEWAY_FC_UART_TX_PIN 38
+#define GATEWAY_FC_UART_RX_PIN 39
+#define GATEWAY_FC_UART_BAUD 115200
+
+#define GATEWAY_MAVLINK_HEARTBEAT_ENABLE 1
+#define GATEWAY_MAVLINK_MANUAL_CONTROL_ENABLE 0
+
+#define MAVLINK2_STX 0xFD
+
+#define GATEWAY_MAVLINK_SYS_ID 245
+#define GATEWAY_MAVLINK_COMP_ID 190
+
+#define MAVLINK_MSG_ID_HEARTBEAT 0
+#define MAVLINK_MSG_HEARTBEAT_LEN 9
+#define MAVLINK_MSG_HEARTBEAT_CRC_EXTRA 50
+
+#define MAV_TYPE_GCS 6
+#define MAV_AUTOPILOT_INVALID 8
+#define MAV_MODE_FLAG_CUSTOM_MODE_ENABLED 1
+#define MAV_STATE_ACTIVE 4
+#define MAVLINK_VERSION_FIELD 3
+#define MAVLINK1_STX 0xFE
+#define MAVLINK_MAX_FRAME_LEN (10 + 255 + 2 + 13)
+
+#define MAV_MODE_FLAG_SAFETY_ARMED 0x80
+#define GATEWAY_FC_HEARTBEAT_PRINT_EVERY 1
+
+static uint8_t gateway_mavlink_tx_seq = 0;
+
+static uint32_t gateway_fc_heartbeat_count = 0;
+static uint8_t gateway_fc_is_armed = 0;
+static TickType_t gateway_fc_last_heartbeat_tick = 0;
 typedef enum
 {
     RC_DISARMED = 0,
@@ -36,6 +74,15 @@ typedef struct
     int pitch;
     int roll;
 } rc_packet_t;
+static const char *gateway_fc_arm_state_to_string(uint8_t armed)
+{
+    if (armed)
+    {
+        return "ARMED";
+    }
+
+    return "DISARMED";
+}
 
 static const char *state_to_string(rc_state_t state)
 {
@@ -94,6 +141,115 @@ static void gateway_uart_init(void)
         UART_PIN_NO_CHANGE,
         UART_PIN_NO_CHANGE));
 }
+static int16_t gateway_clamp_i16(int value, int min, int max)
+{
+    if (value < min)
+    {
+        return min;
+    }
+
+    if (value > max)
+    {
+        return max;
+    }
+
+    return value;
+}
+
+static int gateway_rc_packet_is_valid(const rc_packet_t *packet)
+{
+    if (packet == NULL)
+    {
+        return 0;
+    }
+
+    if (packet->state != RC_DISARMED &&
+        packet->state != RC_ARMED &&
+        packet->state != RC_FAILSAFE)
+    {
+        return 0;
+    }
+
+    if (packet->throttle < 0 || packet->throttle > 1000)
+    {
+        return 0;
+    }
+
+    if (packet->yaw < -1000 || packet->yaw > 1000)
+    {
+        return 0;
+    }
+
+    if (packet->pitch < -1000 || packet->pitch > 1000)
+    {
+        return 0;
+    }
+
+    if (packet->roll < -1000 || packet->roll > 1000)
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
+static void gateway_mavlink_dry_run(const rc_packet_t *packet)
+{
+#if GATEWAY_MAVLINK_DRY_RUN
+
+    static uint32_t dry_run_count = 0;
+
+    if (packet == NULL)
+    {
+        return;
+    }
+
+    int16_t x_pitch = gateway_clamp_i16(packet->pitch, -1000, 1000);
+    int16_t y_roll = gateway_clamp_i16(packet->roll, -1000, 1000);
+    int16_t z_throttle = gateway_clamp_i16(packet->throttle, 0, 1000);
+    int16_t r_yaw = gateway_clamp_i16(packet->yaw, -1000, 1000);
+
+    /*
+        Safety rule:
+        if remote is not ARMED, gateway would send neutral controls.
+    */
+    TickType_t now = xTaskGetTickCount();
+    uint8_t fc_heartbeat_fresh = 0;
+
+    if (gateway_fc_last_heartbeat_tick != 0 &&
+        (now - gateway_fc_last_heartbeat_tick) < pdMS_TO_TICKS(1500))
+    {
+        fc_heartbeat_fresh = 1;
+    }
+
+    if (packet->state != RC_ARMED ||
+        !fc_heartbeat_fresh ||
+        !gateway_fc_is_armed)
+    {
+        x_pitch = 0;
+        y_roll = 0;
+        z_throttle = 0;
+        r_yaw = 0;
+    }
+
+    dry_run_count++;
+
+    if (dry_run_count == 1 || (dry_run_count % GATEWAY_DRY_RUN_PRINT_EVERY) == 0)
+    {
+        printf("[GATEWAY MAVLINK DRY RUN] packet_id=%lu remote=%s fc=%s fc_fresh=%u x_pitch=%d y_roll=%d z_throttle=%d r_yaw=%d\n",
+               (unsigned long)packet->packet_id,
+               state_to_string(packet->state),
+               gateway_fc_arm_state_to_string(gateway_fc_is_armed),
+               fc_heartbeat_fresh,
+               x_pitch,
+               y_roll,
+               z_throttle,
+               r_yaw);
+    }
+
+#endif
+}
+
 static void gateway_handle_frame(const uint8_t *frame, size_t frame_len)
 {
     static uint32_t ok_count = 0;
@@ -193,6 +349,31 @@ static void gateway_handle_frame(const uint8_t *frame, size_t frame_len)
     {
         memcpy(&rc_packet, packet.payload, sizeof(rc_packet_t));
     }
+    else
+    {
+        printf("[GATEWAY] invalid RC payload size. got=%u expected=%u seq=%lu\n",
+               packet.payload_len,
+               (unsigned int)sizeof(rc_packet_t),
+               (unsigned long)packet.sequence);
+
+        return;
+    }
+
+    if (!gateway_rc_packet_is_valid(&rc_packet))
+    {
+        printf("[GATEWAY] decrypted RC INVALID packet_id=%lu state=%d throttle=%d yaw=%d pitch=%d roll=%d seq=%lu\n",
+               (unsigned long)rc_packet.packet_id,
+               rc_packet.state,
+               rc_packet.throttle,
+               rc_packet.yaw,
+               rc_packet.pitch,
+               rc_packet.roll,
+               (unsigned long)packet.sequence);
+
+        return;
+    }
+
+    gateway_mavlink_dry_run(&rc_packet);
 
     if (ok_count == 1 || (ok_count % GATEWAY_PRINT_EVERY) == 0)
     {
@@ -314,6 +495,7 @@ static void gateway_rx_task(void *pvParameters)
 
         if (len > 0)
         {
+#if DEBUG_GATEWAY_RX_BYTES
             static uint32_t rx_total = 0;
             rx_total += len;
 
@@ -324,6 +506,7 @@ static void gateway_rx_task(void *pvParameters)
                        len,
                        rx_buffer[0]);
             }
+#endif
 
             for (int i = 0; i < len; i++)
             {
@@ -333,8 +516,455 @@ static void gateway_rx_task(void *pvParameters)
     }
 }
 
+static void gateway_mav_put_u32_le(uint8_t *buffer, int *index, uint32_t value)
+{
+    buffer[(*index)++] = (uint8_t)((value >> 0) & 0xFF);
+    buffer[(*index)++] = (uint8_t)((value >> 8) & 0xFF);
+    buffer[(*index)++] = (uint8_t)((value >> 16) & 0xFF);
+    buffer[(*index)++] = (uint8_t)((value >> 24) & 0xFF);
+}
+
+static void gateway_mavlink_crc_accumulate(uint8_t data, uint16_t *crc)
+{
+    uint8_t tmp = data ^ (uint8_t)(*crc & 0xFF);
+    tmp ^= (tmp << 4);
+
+    *crc = (*crc >> 8) ^
+           ((uint16_t)tmp << 8) ^
+           ((uint16_t)tmp << 3) ^
+           ((uint16_t)tmp >> 4);
+}
+
+static uint16_t gateway_mavlink_crc_calculate(
+    const uint8_t *data,
+    int len,
+    uint8_t crc_extra)
+{
+    uint16_t crc = 0xFFFF;
+
+    for (int i = 0; i < len; i++)
+    {
+        gateway_mavlink_crc_accumulate(data[i], &crc);
+    }
+
+    gateway_mavlink_crc_accumulate(crc_extra, &crc);
+
+    return crc;
+}
+
+static void gateway_handle_fc_heartbeat(
+    uint8_t sys_id,
+    uint8_t comp_id,
+    const uint8_t *payload,
+    uint8_t payload_len)
+{
+    if (payload == NULL || payload_len < MAVLINK_MSG_HEARTBEAT_LEN)
+    {
+        return;
+    }
+
+    uint8_t type = payload[4];
+    uint8_t autopilot = payload[5];
+    uint8_t base_mode = payload[6];
+    uint8_t system_status = payload[7];
+
+    uint8_t armed = (base_mode & MAV_MODE_FLAG_SAFETY_ARMED) != 0;
+
+    gateway_fc_heartbeat_count++;
+    gateway_fc_last_heartbeat_tick = xTaskGetTickCount();
+    gateway_fc_is_armed = armed;
+
+    if (gateway_fc_heartbeat_count == 1 ||
+        (gateway_fc_heartbeat_count % GATEWAY_FC_HEARTBEAT_PRINT_EVERY) == 0)
+    {
+        printf("[GATEWAY FC HEARTBEAT] count=%lu sys=%u comp=%u type=%u autopilot=%u base_mode=0x%02X status=%u FC=%s\n",
+               (unsigned long)gateway_fc_heartbeat_count,
+               sys_id,
+               comp_id,
+               type,
+               autopilot,
+               base_mode,
+               system_status,
+               gateway_fc_arm_state_to_string(armed));
+    }
+}
+static void gateway_handle_fc_mavlink2_frame(const uint8_t *frame, size_t frame_len)
+{
+    if (frame == NULL || frame_len < 12)
+    {
+        return;
+    }
+
+    uint8_t payload_len = frame[1];
+    uint8_t incompat_flags = frame[2];
+
+    size_t signature_len = 0;
+
+    if ((incompat_flags & 0x01) != 0)
+    {
+        signature_len = 13;
+    }
+
+    size_t expected_len = 10 + payload_len + 2 + signature_len;
+
+    if (frame_len != expected_len)
+    {
+        return;
+    }
+
+    uint8_t sys_id = frame[5];
+    uint8_t comp_id = frame[6];
+
+    uint32_t msg_id =
+        ((uint32_t)frame[7] << 0) |
+        ((uint32_t)frame[8] << 8) |
+        ((uint32_t)frame[9] << 16);
+
+    uint8_t crc_extra = 0;
+
+    if (msg_id == MAVLINK_MSG_ID_HEARTBEAT)
+    {
+        crc_extra = MAVLINK_MSG_HEARTBEAT_CRC_EXTRA;
+    }
+    else
+    {
+        return;
+    }
+
+    uint16_t rx_crc =
+        ((uint16_t)frame[10 + payload_len] << 0) |
+        ((uint16_t)frame[10 + payload_len + 1] << 8);
+
+    uint16_t calc_crc = gateway_mavlink_crc_calculate(
+        &frame[1],
+        9 + payload_len,
+        crc_extra);
+
+    if (rx_crc != calc_crc)
+    {
+        printf("[GATEWAY FC MAVLINK] BAD CRC msg=%lu rx=0x%04X calc=0x%04X\n",
+               (unsigned long)msg_id,
+               rx_crc,
+               calc_crc);
+
+        return;
+    }
+
+    gateway_handle_fc_heartbeat(
+        sys_id,
+        comp_id,
+        &frame[10],
+        payload_len);
+}
+
+static void gateway_handle_fc_mavlink1_frame(const uint8_t *frame, size_t frame_len)
+{
+    if (frame == NULL || frame_len < 8)
+    {
+        return;
+    }
+
+    uint8_t payload_len = frame[1];
+
+    size_t expected_len = 6 + payload_len + 2;
+
+    if (frame_len != expected_len)
+    {
+        return;
+    }
+
+    uint8_t sys_id = frame[3];
+    uint8_t comp_id = frame[4];
+    uint8_t msg_id = frame[5];
+
+    uint8_t crc_extra = 0;
+
+    if (msg_id == MAVLINK_MSG_ID_HEARTBEAT)
+    {
+        crc_extra = MAVLINK_MSG_HEARTBEAT_CRC_EXTRA;
+    }
+    else
+    {
+        return;
+    }
+
+    uint16_t rx_crc =
+        ((uint16_t)frame[6 + payload_len] << 0) |
+        ((uint16_t)frame[6 + payload_len + 1] << 8);
+
+    uint16_t calc_crc = gateway_mavlink_crc_calculate(
+        &frame[1],
+        5 + payload_len,
+        crc_extra);
+
+    if (rx_crc != calc_crc)
+    {
+        printf("[GATEWAY FC MAVLINK] BAD CRC MAVLink1 msg=%u rx=0x%04X calc=0x%04X\n",
+               msg_id,
+               rx_crc,
+               calc_crc);
+
+        return;
+    }
+
+    gateway_handle_fc_heartbeat(
+        sys_id,
+        comp_id,
+        &frame[6],
+        payload_len);
+}
+
+static void gateway_fc_mavlink_process_byte(uint8_t byte)
+{
+    static uint8_t frame[MAVLINK_MAX_FRAME_LEN];
+    static size_t frame_index = 0;
+    static size_t expected_frame_len = 0;
+
+    if (frame_index == 0)
+    {
+        if (byte != MAVLINK2_STX && byte != MAVLINK1_STX)
+        {
+            return;
+        }
+
+        frame[frame_index++] = byte;
+        expected_frame_len = 0;
+        return;
+    }
+
+    if (frame_index >= sizeof(frame))
+    {
+        frame_index = 0;
+        expected_frame_len = 0;
+        return;
+    }
+
+    frame[frame_index++] = byte;
+
+    if (frame_index == 2)
+    {
+        uint8_t payload_len = frame[1];
+
+        if (frame[0] == MAVLINK1_STX)
+        {
+            expected_frame_len = 6 + payload_len + 2;
+        }
+    }
+
+    if (frame_index == 3)
+    {
+        uint8_t payload_len = frame[1];
+
+        if (frame[0] == MAVLINK2_STX)
+        {
+            uint8_t incompat_flags = frame[2];
+            size_t signature_len = 0;
+
+            if ((incompat_flags & 0x01) != 0)
+            {
+                signature_len = 13;
+            }
+
+            expected_frame_len = 10 + payload_len + 2 + signature_len;
+        }
+    }
+
+    if (expected_frame_len > sizeof(frame))
+    {
+        frame_index = 0;
+        expected_frame_len = 0;
+        return;
+    }
+
+    if (expected_frame_len > 0 && frame_index >= expected_frame_len)
+    {
+        if (frame[0] == MAVLINK2_STX)
+        {
+            gateway_handle_fc_mavlink2_frame(frame, expected_frame_len);
+        }
+        else if (frame[0] == MAVLINK1_STX)
+        {
+            gateway_handle_fc_mavlink1_frame(frame, expected_frame_len);
+        }
+
+        frame_index = 0;
+        expected_frame_len = 0;
+    }
+}
+static void gateway_fc_mavlink_rx_task(void *pvParameters)
+{
+    uint8_t rx_buffer[128];
+
+    printf("[GATEWAY FC MAVLINK] RX task started\n");
+
+    while (1)
+    {
+        int len = uart_read_bytes(
+            GATEWAY_FC_UART_PORT,
+            rx_buffer,
+            sizeof(rx_buffer),
+            pdMS_TO_TICKS(100));
+
+        if (len > 0)
+        {
+            for (int i = 0; i < len; i++)
+            {
+                gateway_fc_mavlink_process_byte(rx_buffer[i]);
+            }
+        }
+    }
+}
+static int gateway_fc_uart_init(void)
+{
+#if GATEWAY_FC_UART_ENABLE
+
+    printf("[GATEWAY FC UART] MAVLink tx=%d rx=%d baud=%d\n",
+           GATEWAY_FC_UART_TX_PIN,
+           GATEWAY_FC_UART_RX_PIN,
+           GATEWAY_FC_UART_BAUD);
+
+    uart_config_t uart_config = {
+        .baud_rate = GATEWAY_FC_UART_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+
+    ESP_ERROR_CHECK(uart_driver_install(
+        GATEWAY_FC_UART_PORT,
+        4096,
+        4096,
+        0,
+        NULL,
+        0));
+
+    ESP_ERROR_CHECK(uart_param_config(
+        GATEWAY_FC_UART_PORT,
+        &uart_config));
+
+    ESP_ERROR_CHECK(uart_set_pin(
+        GATEWAY_FC_UART_PORT,
+        GATEWAY_FC_UART_TX_PIN,
+        GATEWAY_FC_UART_RX_PIN,
+        UART_PIN_NO_CHANGE,
+        UART_PIN_NO_CHANGE));
+
+#endif
+
+    return 1;
+}
+
+static int gateway_mavlink_send_message(
+    uint32_t msg_id,
+    const uint8_t *payload,
+    uint8_t payload_len,
+    uint8_t crc_extra)
+{
+#if GATEWAY_FC_UART_ENABLE
+
+    uint8_t frame[10 + 255 + 2];
+    int index = 0;
+
+    frame[index++] = MAVLINK2_STX;
+    frame[index++] = payload_len;
+    frame[index++] = 0x00;
+    frame[index++] = 0x00;
+    frame[index++] = gateway_mavlink_tx_seq++;
+    frame[index++] = GATEWAY_MAVLINK_SYS_ID;
+    frame[index++] = GATEWAY_MAVLINK_COMP_ID;
+
+    frame[index++] = (uint8_t)((msg_id >> 0) & 0xFF);
+    frame[index++] = (uint8_t)((msg_id >> 8) & 0xFF);
+    frame[index++] = (uint8_t)((msg_id >> 16) & 0xFF);
+
+    if (payload_len > 0 && payload != NULL)
+    {
+        memcpy(&frame[index], payload, payload_len);
+        index += payload_len;
+    }
+
+    uint16_t crc = gateway_mavlink_crc_calculate(
+        &frame[1],
+        9 + payload_len,
+        crc_extra);
+
+    frame[index++] = (uint8_t)(crc & 0xFF);
+    frame[index++] = (uint8_t)((crc >> 8) & 0xFF);
+
+    int written = uart_write_bytes(
+        GATEWAY_FC_UART_PORT,
+        (const char *)frame,
+        index);
+
+    return written == index;
+
+#else
+
+    return 1;
+
+#endif
+}
+
+static int gateway_mavlink_send_heartbeat(void)
+{
+#if GATEWAY_MAVLINK_HEARTBEAT_ENABLE
+
+    uint8_t payload[MAVLINK_MSG_HEARTBEAT_LEN];
+    int p = 0;
+
+    gateway_mav_put_u32_le(payload, &p, 0);
+
+    payload[p++] = MAV_TYPE_GCS;
+    payload[p++] = MAV_AUTOPILOT_INVALID;
+    payload[p++] = MAV_MODE_FLAG_CUSTOM_MODE_ENABLED;
+    payload[p++] = MAV_STATE_ACTIVE;
+    payload[p++] = MAVLINK_VERSION_FIELD;
+
+    if (p != MAVLINK_MSG_HEARTBEAT_LEN)
+    {
+        return 0;
+    }
+
+    return gateway_mavlink_send_message(
+        MAVLINK_MSG_ID_HEARTBEAT,
+        payload,
+        MAVLINK_MSG_HEARTBEAT_LEN,
+        MAVLINK_MSG_HEARTBEAT_CRC_EXTRA);
+
+#else
+
+    return 1;
+
+#endif
+}
+
+static void gateway_mavlink_heartbeat_task(void *pvParameters)
+{
+    while (1)
+    {
+        if (!gateway_mavlink_send_heartbeat())
+        {
+            printf("[GATEWAY MAVLINK] HEARTBEAT send FAILED\n");
+        }
+        else
+        {
+            printf("[GATEWAY MAVLINK] HEARTBEAT sent to FC\n");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
 void app_main(void)
 {
+    if (!gateway_fc_uart_init())
+    {
+        printf("[FATAL] gateway FC UART init failed\n");
+        return;
+    }
+
     printf("\n");
     printf("========================================\n");
     printf(" MATHOS DRONE GATEWAY v0.2.0\n");
@@ -347,4 +977,6 @@ void app_main(void)
     gateway_uart_init();
 
     xTaskCreate(gateway_rx_task, "gateway_rx_task", 4096, NULL, 5, NULL);
+    xTaskCreate(gateway_mavlink_heartbeat_task, "gateway_mavlink_heartbeat_task", 4096, NULL, 3, NULL);
+    xTaskCreate(gateway_fc_mavlink_rx_task, "gateway_fc_mavlink_rx_task", 4096, NULL, 4, NULL);
 }
