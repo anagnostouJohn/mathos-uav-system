@@ -1,5 +1,5 @@
 idf_component_register(
     SRCS "main.c"
     INCLUDE_DIRS "."
-    REQUIRES driver esp_adc esp_timer espressif__led_strip
+    REQUIRES driver esp_adc esp_timer espressif__led_strip mathos_protocol mathos_secure
 )

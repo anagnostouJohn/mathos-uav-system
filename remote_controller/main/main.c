@@ -14,6 +14,9 @@
 #include "driver/spi_master.h"
 #include "esp_timer.h"
 #include "driver/uart.h"
+#include "mathos_protocol.h"
+#include "mathos_secure.h"
+#include "esp_random.h"
 ////////////////////////////////////////////////////////////////////////////////////
 
 #define BENCH_FAILSAFE_DISARM 1
@@ -75,6 +78,13 @@
 #define CONTROL_UART_TX_PIN 8
 #define CONTROL_UART_RX_PIN 9
 #define CONTROL_UART_BAUD 115200
+
+#define LINK_UART_PORT UART_NUM_2
+#define LINK_UART_TX_PIN 38
+#define LINK_UART_RX_PIN 39
+#define LINK_UART_BAUD 115200
+
+#define FEATURE_LINK_UART_TX 1
 
 //////////////////// UART
 //////////////////// MAVLINK
@@ -155,7 +165,8 @@
 #define DEBUG_SECURITY_TIMING 1
 #define DEBUG_HEARTBEAT_TX 0
 #define DEBUG_MAVLINK_RX_CRC 0
-
+#define DEBUG_SECURE_WIRE_TEST 1
+#define SECURE_WIRE_TEST_PRINT_EVERY 100
 ///////////////////FEATURE FLAGS//////////////////
 #define FEATURE_SECURITY_SKELETON 1
 #define FEATURE_WIFI_TELEMETRY 0
@@ -363,6 +374,7 @@ volatile uint8_t fc_autopilot = 0;
 volatile uint8_t fc_base_mode = 0;
 volatile uint8_t fc_system_status = 0;
 volatile uint32_t fc_custom_mode = 0;
+static uint32_t mathos_session_id = 1;
 
 volatile rc_input_t rc_input = {
     .throttle = 0,
@@ -1357,7 +1369,61 @@ int control_output_init(void)
 
     return 1;
 }
+int link_uart_init(void)
+{
+#if FEATURE_LINK_UART_TX
 
+    printf("[LINK UART] mode=MATHOS_WIRE tx=%d rx=%d baud=%d\n",
+           LINK_UART_TX_PIN,
+           LINK_UART_RX_PIN,
+           LINK_UART_BAUD);
+
+    uart_config_t uart_config = {
+        .baud_rate = LINK_UART_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+
+    ESP_ERROR_CHECK(uart_driver_install(LINK_UART_PORT, 2048, 2048, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(LINK_UART_PORT, &uart_config));
+
+    ESP_ERROR_CHECK(uart_set_pin(
+        LINK_UART_PORT,
+        LINK_UART_TX_PIN,
+        LINK_UART_RX_PIN,
+        UART_PIN_NO_CHANGE,
+        UART_PIN_NO_CHANGE));
+
+#endif
+
+    return 1;
+}
+
+int link_uart_send_frame(const uint8_t *frame, size_t frame_len)
+{
+#if FEATURE_LINK_UART_TX
+
+    if (frame == NULL || frame_len == 0)
+    {
+        return 0;
+    }
+
+    int written = uart_write_bytes(
+        LINK_UART_PORT,
+        (const char *)frame,
+        frame_len);
+
+    return written == frame_len;
+
+#else
+
+    return 1;
+
+#endif
+}
 static int control_mavlink_send_manual_control(const rc_packet_t *packet)
 {
     if (packet == NULL)
@@ -1735,8 +1801,7 @@ int security_wrap_rc_packet(const rc_packet_t *rc_packet,
     memset(secure_packet, 0, sizeof(secure_packet_t));
 
     secure_packet->sequence = security_next_tx_sequence();
-    secure_packet->timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000);
-
+    secure_packet->timestamp_ms = mathos_session_id;
     secure_packet->controller_id = SECURITY_CONTROLLER_ID;
     secure_packet->link_id = (uint8_t)link_mode;
     secure_packet->payload_type = SECURITY_PAYLOAD_TYPE_RC;
@@ -1789,7 +1854,65 @@ security_status_t security_verify_packet_basic(const secure_packet_t *packet, ui
 
     return SECURITY_STATUS_OK;
 }
+static int mathos_from_local_secure_packet(
+    const secure_packet_t *src,
+    mathos_secure_packet_t *dst)
+{
+    if (src == NULL || dst == NULL)
+    {
+        return 0;
+    }
 
+    if (src->payload_len > MATHOS_PAYLOAD_MAX_LEN)
+    {
+        return 0;
+    }
+
+    memset(dst, 0, sizeof(mathos_secure_packet_t));
+
+    dst->sequence = src->sequence;
+    dst->timestamp_ms = src->timestamp_ms;
+
+    dst->controller_id = src->controller_id;
+    dst->link_id = src->link_id;
+    dst->payload_type = src->payload_type;
+    dst->payload_len = src->payload_len;
+
+    memcpy(dst->payload, src->payload, src->payload_len);
+    memcpy(dst->auth_tag, src->auth_tag, MATHOS_AUTH_TAG_LEN);
+
+    return 1;
+}
+
+static int mathos_to_local_secure_packet(
+    const mathos_secure_packet_t *src,
+    secure_packet_t *dst)
+{
+    if (src == NULL || dst == NULL)
+    {
+        return 0;
+    }
+
+    if (src->payload_len > SECURITY_PAYLOAD_MAX_LEN)
+    {
+        return 0;
+    }
+
+    memset(dst, 0, sizeof(secure_packet_t));
+
+    dst->sequence = src->sequence;
+    dst->timestamp_ms = src->timestamp_ms;
+
+    dst->controller_id = src->controller_id;
+    dst->link_id = src->link_id;
+    dst->payload_type = src->payload_type;
+    dst->payload_len = src->payload_len;
+
+    memcpy(dst->payload, src->payload, src->payload_len);
+    memcpy(dst->auth_tag, src->auth_tag, SECURITY_AUTH_TAG_LEN);
+
+    return 1;
+}
 void enter_failsafe(const char *reason)
 {
     rc_state_t command_state = drone_command_get();
@@ -3232,7 +3355,85 @@ void radio_tx_task(void *pvParameters)
                 security_verify_packet_basic(&secure_packet, &security_test_last_sequence);
 
             int64_t security_work_us = esp_timer_get_time() - security_start_us;
+#if DEBUG_SECURE_WIRE_TEST
+            static uint32_t wire_print_counter = 0;
+            static uint32_t wire_last_accepted_sequence = 0;
 
+            mathos_secure_packet_t wire_packet;
+            mathos_secure_packet_t decoded_wire_packet;
+            mathos_secure_status_t encrypt_status = MATHOS_SECURE_STATUS_BAD_ARGUMENT;
+            mathos_secure_status_t decrypt_status = MATHOS_SECURE_STATUS_BAD_ARGUMENT;
+            int payload_match = 0;
+            secure_packet_t decoded_secure_packet;
+
+            uint8_t wire_frame[MATHOS_WIRE_MAX_FRAME_LEN];
+            size_t wire_frame_len = 0;
+
+            mathos_status_t encode_status = MATHOS_STATUS_BAD_ARGUMENT;
+            mathos_status_t decode_status = MATHOS_STATUS_BAD_ARGUMENT;
+            security_status_t decoded_security_status = SECURITY_STATUS_BAD_ARGUMENT;
+            if (mathos_from_local_secure_packet(&secure_packet, &wire_packet))
+            {
+                encrypt_status = mathos_secure_encrypt_packet(&wire_packet);
+
+                if (encrypt_status == MATHOS_SECURE_STATUS_OK)
+                {
+                    encode_status = mathos_wire_encode(
+                        &wire_packet,
+                        wire_frame,
+                        sizeof(wire_frame),
+                        &wire_frame_len);
+
+                    if (encode_status == MATHOS_STATUS_OK)
+                    {
+#if FEATURE_LINK_UART_TX
+                        if (!link_uart_send_frame(wire_frame, wire_frame_len))
+                        {
+                            static uint32_t link_uart_fail_count = 0;
+                            link_uart_fail_count++;
+
+                            if ((link_uart_fail_count % 50) == 1)
+                            {
+                                printf("[LINK UART] TX FAILED count=%lu\n",
+                                       (unsigned long)link_uart_fail_count);
+                            }
+                        }
+#endif
+
+                        decode_status = mathos_wire_decode(
+                            wire_frame,
+                            wire_frame_len,
+                            &decoded_wire_packet);
+
+                        if (decode_status == MATHOS_STATUS_OK)
+                        {
+                            decrypt_status = mathos_secure_decrypt_packet(&decoded_wire_packet);
+
+                            if (decrypt_status == MATHOS_SECURE_STATUS_OK &&
+                                decoded_wire_packet.payload_len == secure_packet.payload_len &&
+                                memcmp(decoded_wire_packet.payload,
+                                       secure_packet.payload,
+                                       secure_packet.payload_len) == 0)
+                            {
+                                payload_match = 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (++wire_print_counter >= SECURE_WIRE_TEST_PRINT_EVERY)
+            {
+                wire_print_counter = 0;
+
+                printf("[WIRE TEST] len=%u encode=%s decode=%s verify=%s seq=%lu\n",
+                       (unsigned int)wire_frame_len,
+                       mathos_status_to_string(encode_status),
+                       mathos_status_to_string(decode_status),
+                       security_status_to_string(decoded_security_status),
+                       (unsigned long)secure_packet.sequence);
+            }
+#endif
             security_timing_update(security_work_us, security_status);
             security_timing_print_if_needed();
 
@@ -3707,6 +3908,21 @@ void app_main(void)
         printf("[FATAL] control output init failed\n");
         return;
     }
+    if (!link_uart_init())
+    {
+        printf("[FATAL] link UART init failed\n");
+        return;
+    }
+
+    mathos_session_id = esp_random();
+
+    if (mathos_session_id == 0)
+    {
+        mathos_session_id = 1;
+    }
+
+    printf("[SECURITY] session_id=0x%08lx\n",
+           (unsigned long)mathos_session_id);
 
     led_strip_config_t strip_config = {
         .strip_gpio_num = RGB_LED_PIN,
