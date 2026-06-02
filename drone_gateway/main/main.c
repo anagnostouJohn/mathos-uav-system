@@ -94,13 +94,15 @@ static void gateway_uart_init(void)
         UART_PIN_NO_CHANGE,
         UART_PIN_NO_CHANGE));
 }
-
 static void gateway_handle_frame(const uint8_t *frame, size_t frame_len)
 {
     static uint32_t ok_count = 0;
     static uint32_t bad_count = 0;
     static uint32_t replay_count = 0;
+
     static uint32_t last_sequence = 0;
+    static uint32_t last_session_id = 0;
+    static int has_session = 0;
 
     mathos_secure_packet_t packet;
 
@@ -108,6 +110,26 @@ static void gateway_handle_frame(const uint8_t *frame, size_t frame_len)
         frame,
         frame_len,
         &packet);
+
+    if (status != MATHOS_STATUS_OK)
+    {
+        bad_count++;
+
+        if ((bad_count % 20) == 1)
+        {
+            printf("[GATEWAY] frame BAD status=%s bad_count=%lu len=%u\n",
+                   mathos_status_to_string(status),
+                   (unsigned long)bad_count,
+                   (unsigned int)frame_len);
+        }
+
+        return;
+    }
+
+    /*
+        Only decrypt AFTER wire decode succeeds.
+        If wire decode failed, packet contents are not trusted.
+    */
     mathos_secure_status_t crypto_status = mathos_secure_decrypt_packet(&packet);
 
     if (crypto_status != MATHOS_SECURE_STATUS_OK)
@@ -124,36 +146,19 @@ static void gateway_handle_frame(const uint8_t *frame, size_t frame_len)
 
         return;
     }
-    if (status != MATHOS_STATUS_OK)
-    {
-        bad_count++;
-
-        if ((bad_count % 20) == 1)
-        {
-            printf("[GATEWAY] frame BAD status=%s bad_count=%lu len=%u\n",
-                   mathos_status_to_string(status),
-                   (unsigned long)bad_count,
-                   (unsigned int)frame_len);
-        }
-
-        return;
-    }
-    static uint32_t last_session_id = 0;
-    static int has_session = 0;
-
-    uint32_t session_id = packet.timestamp_ms;
 
     /*
         DEV MODE:
         packet.timestamp_ms is currently used as session_id.
 
-        If the remote reboots, it generates a new session_id and its
-        sequence counter starts again from 1.
+        Same session:
+            sequence must increase.
 
-        So replay protection must be:
-        same session  -> sequence must increase
-        new session   -> reset last_sequence
+        New session:
+            remote probably rebooted, so sequence can safely restart.
     */
+    uint32_t session_id = packet.timestamp_ms;
+
     if (!has_session || session_id != last_session_id)
     {
         printf("[GATEWAY] NEW SESSION old=0x%08lx new=0x%08lx reset last_sequence\n",
@@ -191,9 +196,10 @@ static void gateway_handle_frame(const uint8_t *frame, size_t frame_len)
 
     if (ok_count == 1 || (ok_count % GATEWAY_PRINT_EVERY) == 0)
     {
-        printf("[GATEWAY] frame OK count=%lu len=%u seq=%lu controller=%u link=%u payload_type=%u payload_len=%u\n",
+        printf("[GATEWAY] frame OK count=%lu len=%u session=0x%08lx seq=%lu controller=%u link=%u payload_type=%u payload_len=%u\n",
                (unsigned long)ok_count,
                (unsigned int)frame_len,
+               (unsigned long)session_id,
                (unsigned long)packet.sequence,
                packet.controller_id,
                packet.link_id,
