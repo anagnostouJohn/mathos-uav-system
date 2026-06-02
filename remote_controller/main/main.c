@@ -19,6 +19,9 @@
 #include "esp_random.h"
 ////////////////////////////////////////////////////////////////////////////////////
 
+#define DEBUG_CRYPTO_TAMPER_TEST 1
+#define CRYPTO_TAMPER_EVERY 200
+
 #define BENCH_FAILSAFE_DISARM 1
 
 #define FC_ARM_PENDING_TIMEOUT_MS 3000
@@ -3378,11 +3381,32 @@ void radio_tx_task(void *pvParameters)
 
                 if (encrypt_status == MATHOS_SECURE_STATUS_OK)
                 {
+                    mathos_secure_packet_t packet_to_send;
+                    memcpy(&packet_to_send, &wire_packet, sizeof(packet_to_send));
+
+#if DEBUG_CRYPTO_TAMPER_TEST
+                    if ((packet_to_send.sequence % CRYPTO_TAMPER_EVERY) == 0 &&
+                        packet_to_send.payload_len > 0)
+                    {
+                        packet_to_send.payload[0] ^= 0x01;
+
+                        printf("[TAMPER TEST] damaged encrypted payload byte seq=%lu\n",
+                               (unsigned long)packet_to_send.sequence);
+                    }
+#endif
+
                     encode_status = mathos_wire_encode(
-                        &wire_packet,
+                        &packet_to_send,
                         wire_frame,
                         sizeof(wire_frame),
                         &wire_frame_len);
+                    // if (encrypt_status == MATHOS_SECURE_STATUS_OK)
+                    // {
+                    //     encode_status = mathos_wire_encode(
+                    //         &wire_packet,
+                    //         wire_frame,
+                    //         sizeof(wire_frame),
+                    //         &wire_frame_len);
 
                     if (encode_status == MATHOS_STATUS_OK)
                     {
