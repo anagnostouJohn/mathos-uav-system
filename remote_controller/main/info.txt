@@ -1,0 +1,119 @@
+| Master switch | Drone arm switch | Current command | Button      | Result                                                                           |
+| ------------- | ---------------- | --------------: | ----------- | -------------------------------------------------------------------------------- |
+| OFF           | anything         |        DISARMED | anything    | Stay DISARMED / controller locked                                                |
+| OFF           | anything         |           ARMED | anything    | FAILSAFE                                                                         |
+| ON            | OFF              |        DISARMED | none        | LOCKED / DISARMED                                                                |
+| ON            | OFF              |        DISARMED | short press | Do nothing                                                                       |
+| ON            | OFF              |        DISARMED | long press  | Do nothing                                                                       |
+| ON            | ON               |        DISARMED | none        | READY or BLOCKED                                                                 |
+| ON            | ON               |        DISARMED | short press | ARM only if prearm passes                                                        |
+| ON            | ON               |        DISARMED | long press  | Do nothing                                                                       |
+| ON            | ON               |           ARMED | short press | Do nothing for now                                                               |
+| ON            | ON               |           ARMED | long press  | FAILSAFE                                                                         |
+| ON            | OFF              |           ARMED | —           | FAILSAFE                                                                         |
+| OFF           | anything         |           ARMED | —           | FAILSAFE command if controller still powered; link-loss failsafe if power is cut |
+
+
+
+Task 1: Fix joystick center until LCD can show READY.
+Task 2: Remove FAILSAFE spam in drone_rx_task(). <- OK
+Task 3: Add separate ARM / DISARM / FAILSAFE button pins.
+Task 4: Refactor rc_state -> drone_command_state.  <- OK
+
+
+1. Named fault printer <- 
+2. Clean prearm status as the single source of truth
+3. Dedicated ARM / DISARM / FAILSAFE events
+4. Real input abstraction: simulator / joystick / FrSky / SBUS / CRSF
+5. Real flight-controller heartbeat receive
+6. Real MAVLink state parser
+7. Real arming confirmation from FC, not just local command
+8. Link quality scoring
+9. More structured failsafe reasons
+10. Persistent event log
+11. Watchdog reset policy
+12. Hardware-in-the-loop test procedure
+
+
+THR_FAILSAFE = 0
+RC_PROTOCOLS = 0
+ARMING_CHECK = 0
+
+setup -> full parameter list
+flight mode
+
+FLIGHT_OPTIONS	0	0	
+FLTMODE1	11	11	
+FLTMODE2	11	11	
+FLTMODE3	5	5	
+FLTMODE4	5	5	
+FLTMODE5	0	0	
+FLTMODE6	0	0	
+FLTMODE_CH	8	8	
+
+
+1. ARM from ESP32
+2. Confirm ARMED
+3. Press FAILSAFE
+4. FC should disarm
+5. ESP32 should show FAILSAFE
+6. Turn ARM permission OFF
+7. Press DISARM
+8. ESP32 returns DISARMED
+9. Turn ARM permission ON
+10. Press ARM again
+
+
+
+
+1. Stable MAVLink link              DONE
+2. ARM / DISARM from ESP32          DONE
+3. FC ACK + heartbeat confirmation  DONE
+4. FAILSAFE bench behavior          DONE
+5. Roll / pitch joystick control    DONE
+6. Code cleanup                     NEXT
+7. Add second joystick              LATER
+8. Throttle / yaw                   LATER
+9. Proper flight failsafe modes     LATER
+10. LCD/operator polish             LATER
+
+
+Props off, as always:
+
+1. ARM from ESP32
+2. Confirm ARMED
+3. Turn MASTER switch OFF
+4. FC should DISARM
+5. ESP32 should show FAILSAFE
+
+Then reboot or recover, and test:
+
+1. ARM from ESP32
+2. Confirm ARMED
+3. Turn ARM permission switch OFF
+4. FC should DISARM
+5. ESP32 should show FAILSAFE
+
+
+Press ARM
+→ send MAVLink ARM
+→ fc_arm_pending = 1
+→ command_status = ARMING
+→ LCD shows ARMING
+→ FC heartbeat says armed
+→ command_status = IDLE
+→ controller command = ARMED
+→ LCD shows ARMED
+
+Good.
+
+DISARM flow
+Press DISARM
+→ send MAVLink DISARM
+→ fc_disarm_pending = 1
+→ command_status = DISARMING
+→ controller command immediately DISARMED
+→ controls neutral immediately
+→ FC heartbeat says disarmed
+→ command_status = IDLE
+→ LCD shows DISARMED

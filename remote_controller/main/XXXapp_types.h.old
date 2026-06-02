@@ -1,0 +1,52 @@
+#pragma once
+
+#include <stdint.h>
+typedef enum
+{
+    RC_DISARMED = 0,
+    RC_ARMED = 1,
+    RC_FAILSAFE = 2
+} rc_state_t;
+
+typedef enum
+{
+    EVENT_BUTTON_SHORT_PRESS = 0,
+    EVENT_BUTTON_LONG_PRESS
+} rc_event_type_t;
+
+typedef struct
+{
+    uint32_t packet_id;
+    rc_state_t state;
+    int throttle;
+    int yaw;
+    int pitch;
+    int roll;
+    uint32_t checksum;
+} rc_packet_t;
+
+typedef struct
+{
+    rc_event_type_t type;
+    uint32_t duration_ms;
+} rc_event_t;
+
+typedef struct
+{
+    uint32_t telemetry_id;
+    uint32_t last_rx_packet_id;
+    rc_state_t drone_state;
+    uint32_t received_packets;
+    uint32_t lost_packets;
+    uint32_t bad_packets;
+    int link_ok;
+} telemetry_packet_t;
+
+typedef struct
+{
+    int throttle;
+    int yaw;
+    int pitch;
+    int roll;
+    int valid;
+} rc_input_t;
