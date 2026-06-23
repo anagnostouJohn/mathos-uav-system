@@ -173,8 +173,8 @@
 ///////////////////FEATURE FLAGS//////////////////
 #define FEATURE_SECURITY_SKELETON 1
 #define FEATURE_WIFI_TELEMETRY 0
-#define FEATURE_SECURE_GATEWAY_MODE 0
-#define FEATURE_DIRECT_MAVLINK_MODE 1
+#define FEATURE_SECURE_GATEWAY_MODE 1
+#define FEATURE_DIRECT_MAVLINK_MODE 0
 
 #if FEATURE_DIRECT_MAVLINK_MODE && FEATURE_SECURE_GATEWAY_MODE
 #error "Only one control mode can be enabled: DIRECT MAVLINK or SECURE GATEWAY"
@@ -194,7 +194,11 @@
 #define SECURITY_LINK_ID_LOCAL_TEST 0
 
 #define SECURITY_PAYLOAD_TYPE_RC 1
+#define SECURITY_GATEWAY_ID 2
+#define SECURITY_PAYLOAD_TYPE_GATEWAY_STATUS 2
 
+#define LINK_RX_BUFFER_SIZE 128
+#define GATEWAY_STATUS_FRESH_MS 1000
 #define SECURITY_PAYLOAD_MAX_LEN 64
 #define SECURITY_AUTH_TAG_LEN 16
 #define SECURITY_TIMING_DIAGNOSTIC DEBUG_SECURITY_TIMING
@@ -277,6 +281,33 @@ typedef struct
     int pitch;
     int roll;
 } rc_packet_t;
+
+typedef enum
+{
+    GATEWAY_ACTION_NONE = 0,
+    GATEWAY_ACTION_ARM_DRY_RUN,
+    GATEWAY_ACTION_DISARM_DRY_RUN,
+    GATEWAY_ACTION_FAILSAFE_DRY_RUN
+} gateway_action_t;
+
+typedef struct __attribute__((packed))
+{
+    uint32_t packet_id;
+    uint32_t session_id;
+
+    uint8_t fc_heartbeat_fresh;
+    uint8_t fc_is_armed;
+    uint8_t remote_state;
+    uint8_t gateway_link_ok;
+    uint8_t last_action;
+
+    uint8_t reserved[3];
+
+    uint32_t rx_ok_count;
+    uint32_t rx_bad_count;
+    uint32_t rx_replay_count;
+} gateway_status_packet_t;
+
 typedef struct
 {
     uint32_t sequence;
@@ -358,6 +389,7 @@ volatile TickType_t rc_input_last_update_tick = 0;
 volatile TickType_t telemetry_last_update_tick = 0;
 volatile TickType_t fc_arm_pending_start_tick = 0;
 volatile TickType_t fc_disarm_pending_start_tick = 0;
+volatile TickType_t gateway_status_last_update_tick = 0;
 volatile rc_state_t drone_state = RC_DISARMED;
 volatile rc_state_t drone_command_state = RC_DISARMED;
 volatile command_status_t command_status = COMMAND_STATUS_IDLE;
@@ -370,6 +402,8 @@ volatile int fc_is_armed = 0;
 volatile int fc_arm_pending = 0;
 volatile int fc_disarm_pending = 0;
 
+volatile int gateway_status_valid = 0;
+
 volatile uint8_t fc_system_id = 0;
 volatile uint8_t fc_component_id = 0;
 volatile uint8_t fc_type = 0;
@@ -378,7 +412,7 @@ volatile uint8_t fc_base_mode = 0;
 volatile uint8_t fc_system_status = 0;
 volatile uint32_t fc_custom_mode = 0;
 static uint32_t mathos_session_id = 1;
-
+static gateway_status_packet_t gateway_status_snapshot = {0};
 volatile rc_input_t rc_input = {
     .throttle = 0,
     .yaw = 0,
@@ -393,6 +427,7 @@ portMUX_TYPE fault_mux = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE state_mux = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE heartbeat_mux = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE security_mux = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE gateway_status_mux = portMUX_INITIALIZER_UNLOCKED;
 
 SemaphoreHandle_t button_semaphore_arm = NULL;
 SemaphoreHandle_t button_semaphore_failsafe = NULL;
@@ -414,6 +449,7 @@ TaskHandle_t lcd_task_handle = NULL;
 TaskHandle_t heartbeat_task_handle = NULL;
 TaskHandle_t mavlink_heartbeat_task_handle = NULL;
 TaskHandle_t mavlink_rx_task_handle = NULL;
+TaskHandle_t gateway_status_rx_task_handle = NULL;
 
 static spi_device_handle_t lcd_spi = NULL;
 static uint8_t mavlink_tx_seq = 0;
@@ -726,6 +762,30 @@ static const uint8_t *get_font(char c)
     }
 
     return font_5x7[36];
+}
+static int gateway_status_is_fresh(void)
+{
+    int valid;
+    TickType_t last_update;
+
+    taskENTER_CRITICAL(&gateway_status_mux);
+    valid = gateway_status_valid;
+    last_update = gateway_status_last_update_tick;
+    taskEXIT_CRITICAL(&gateway_status_mux);
+
+    if (!valid)
+    {
+        return 0;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+
+    if ((now - last_update) > pdMS_TO_TICKS(GATEWAY_STATUS_FRESH_MS))
+    {
+        return 0;
+    }
+
+    return 1;
 }
 
 static void lcd_draw_char(int x, int y, char c, int scale, uint16_t text_color, uint16_t bg_color)
@@ -1925,7 +1985,7 @@ void enter_failsafe(const char *reason)
         return;
     }
 
-#if BENCH_FAILSAFE_DISARM
+#if BENCH_FAILSAFE_DISARM && FEATURE_DIRECT_MAVLINK_MODE
     if (fc_is_armed)
     {
         if (control_mavlink_send_arm_disarm(0))
@@ -2667,7 +2727,7 @@ arm_status_t get_arm_status(void)
     {
         return ARM_STATUS_STICKS_NOT_CENTERED;
     }
-
+#if FEATURE_DIRECT_MAVLINK_MODE
     if (!telemetry_is_fresh())
     {
         return ARM_STATUS_TELEMETRY_STALE;
@@ -2682,7 +2742,13 @@ arm_status_t get_arm_status(void)
     {
         return ARM_STATUS_DRONE_FAILSAFE;
     }
-
+#endif
+#if FEATURE_SECURE_GATEWAY_MODE
+    if (!gateway_status_is_fresh())
+    {
+        return ARM_STATUS_LINK_BAD;
+    }
+#endif
     if (input_snapshot.throttle > ARM_THROTTLE_MAX)
     {
         return ARM_STATUS_THROTTLE_HIGH;
@@ -2740,16 +2806,26 @@ void system_health_task(void *pvParameters)
             fault_clear(FAULT_HEAP_LOW);
         }
 
+#if FEATURE_DIRECT_MAVLINK_MODE
+
         if (command_state == RC_ARMED && !telemetry_fresh)
         {
             enter_failsafe("telemetry stale while armed");
             printf("[HEALTH] FAILSAFE: telemetry stale while ARMED\n");
         }
-        else if (command_state == RC_ARMED && !input_fresh)
-        {
-            enter_failsafe("joystick input stale while armed");
-            printf("[HEALTH] FAILSAFE: joystick input stale while ARMED\n");
-        }
+        else
+
+#endif
+            //     if (command_state == RC_ARMED && !input_fresh)
+            // {
+            //     enter_failsafe("joystick input stale while armed");
+            //     printf("[HEALTH] FAILSAFE: joystick input stale while ARMED\n");
+            // }
+            if (command_state == RC_ARMED && !input_fresh)
+            {
+                enter_failsafe("joystick input stale while armed");
+                printf("[HEALTH] FAILSAFE: joystick input stale while ARMED\n");
+            }
 
         if (!input_fresh)
         {
@@ -2759,7 +2835,7 @@ void system_health_task(void *pvParameters)
         {
             fault_clear(FAULT_JOYSTICK_STALE);
         }
-
+#if FEATURE_DIRECT_MAVLINK_MODE
         if (!telemetry_fresh)
         {
             fault_set(FAULT_TELEMETRY_STALE);
@@ -2778,8 +2854,19 @@ void system_health_task(void *pvParameters)
         {
             fault_clear(FAULT_DRONE_LINK_BAD);
         }
+#else
 
-        if (drone_state_snapshot == RC_FAILSAFE)
+        fault_clear(FAULT_TELEMETRY_STALE);
+        fault_clear(FAULT_DRONE_LINK_BAD);
+
+        /*
+            In secure gateway mode, remote link status comes from
+            encrypted gateway status packets.
+        */
+        drone_link_ok = gateway_status_is_fresh();
+
+#endif
+        if (command_state == RC_FAILSAFE || drone_state_snapshot == RC_FAILSAFE)
         {
             fault_set(FAULT_DRONE_FAILSAFE);
         }
@@ -2799,13 +2886,16 @@ void system_health_task(void *pvParameters)
             stack_problem |= print_stack_watermark("button_task_failsafe", button_task_failsafe_handle);
             stack_problem |= print_stack_watermark("controller_task", controller_task_handle);
             stack_problem |= print_stack_watermark("radio_tx_task", radio_tx_task_handle);
+            stack_problem |= print_stack_watermark("gateway_status_rx_task", gateway_status_rx_task_handle);
             stack_problem |= print_stack_watermark("joystick_adc_task", joystick_adc_task_handle);
             stack_problem |= print_stack_watermark("link_mode_task", link_mode_task_handle);
             stack_problem |= print_stack_watermark("arm_safety_task", arm_safety_task_handle);
             stack_problem |= print_stack_watermark("lcd_task", lcd_task_handle);
             stack_problem |= print_stack_watermark("task_supervisor_task", heartbeat_task_handle);
+#if FEATURE_DIRECT_MAVLINK_MODE
             stack_problem |= print_stack_watermark("mavlink_heartbeat_task", mavlink_heartbeat_task_handle);
             stack_problem |= print_stack_watermark("mavlink_rx_task", mavlink_rx_task_handle);
+#endif
 
             if (stack_problem)
             {
@@ -2820,12 +2910,16 @@ void system_health_task(void *pvParameters)
         command_state = drone_command_get();
         drone_state_snapshot = drone_get_state();
         uint32_t fault_snapshot = fault_get_snapshot();
+        const char *telemetry_text = telemetry_fresh ? "FRESH" : "STALE";
 
+#if FEATURE_SECURE_GATEWAY_MODE
+        telemetry_text = gateway_status_is_fresh() ? "GATEWAY" : "GW_STALE";
+#endif
         DBG_PRINT("[HEALTH] command=%s drone=%s input=%s telemetry=%s faults=0x%08lx age=%lu ms heap=%lu link=%s\n",
                   state_to_string(command_state),
                   state_to_string(drone_state_snapshot),
                   input_fresh ? "FRESH" : "STALE",
-                  telemetry_fresh ? "FRESH" : "STALE",
+                  telemetry_text,
                   (unsigned long)fault_snapshot,
                   (unsigned long)input_age_ms,
                   (unsigned long)free_heap,
@@ -3035,6 +3129,298 @@ int prearm_checks_pass(void)
     printf("[PREARM] PASS\n");
     return 1;
 }
+static uint16_t link_get_u16_le(const uint8_t *buffer)
+{
+    return ((uint16_t)buffer[0] << 0) |
+           ((uint16_t)buffer[1] << 8);
+}
+
+static const char *gateway_action_to_string(uint8_t action)
+{
+    switch (action)
+    {
+    case GATEWAY_ACTION_NONE:
+        return "NONE";
+
+    case GATEWAY_ACTION_ARM_DRY_RUN:
+        return "ARM_DRY_RUN";
+
+    case GATEWAY_ACTION_DISARM_DRY_RUN:
+        return "DISARM_DRY_RUN";
+
+    case GATEWAY_ACTION_FAILSAFE_DRY_RUN:
+        return "FAILSAFE_DRY_RUN";
+
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static void gateway_status_update(const gateway_status_packet_t *status)
+{
+    if (status == NULL)
+    {
+        return;
+    }
+
+    taskENTER_CRITICAL(&gateway_status_mux);
+
+    gateway_status_snapshot = *status;
+    gateway_status_last_update_tick = xTaskGetTickCount();
+    gateway_status_valid = 1;
+
+    taskEXIT_CRITICAL(&gateway_status_mux);
+}
+
+static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
+{
+    static uint32_t last_sequence = 0;
+    static uint32_t last_session_id = 0;
+    static int has_session = 0;
+
+    static uint32_t ok_count = 0;
+    static uint32_t bad_count = 0;
+    static uint32_t replay_count = 0;
+
+    if (frame == NULL || frame_len == 0)
+    {
+        return;
+    }
+
+    mathos_secure_packet_t packet;
+
+    mathos_status_t decode_status = mathos_wire_decode(
+        frame,
+        frame_len,
+        &packet);
+
+    if (decode_status != MATHOS_STATUS_OK)
+    {
+        bad_count++;
+
+        if ((bad_count % 20) == 1)
+        {
+            printf("[GATEWAY STATUS RX] wire BAD status=%s bad_count=%lu len=%u\n",
+                   mathos_status_to_string(decode_status),
+                   (unsigned long)bad_count,
+                   (unsigned int)frame_len);
+        }
+
+        return;
+    }
+
+    mathos_secure_status_t crypto_status = mathos_secure_decrypt_packet(&packet);
+
+    if (crypto_status != MATHOS_SECURE_STATUS_OK)
+    {
+        bad_count++;
+
+        if ((bad_count % 20) == 1)
+        {
+            printf("[GATEWAY STATUS RX] crypto BAD status=%s bad_count=%lu len=%u\n",
+                   mathos_secure_status_to_string(crypto_status),
+                   (unsigned long)bad_count,
+                   (unsigned int)frame_len);
+        }
+
+        return;
+    }
+
+    if (packet.controller_id != SECURITY_GATEWAY_ID)
+    {
+        bad_count++;
+
+        printf("[GATEWAY STATUS RX] bad controller_id=%u expected=%u\n",
+               packet.controller_id,
+               SECURITY_GATEWAY_ID);
+        return;
+    }
+
+    if (packet.payload_type != SECURITY_PAYLOAD_TYPE_GATEWAY_STATUS)
+    {
+        bad_count++;
+
+        printf("[GATEWAY STATUS RX] bad payload_type=%u expected=%u\n",
+               packet.payload_type,
+               SECURITY_PAYLOAD_TYPE_GATEWAY_STATUS);
+        return;
+    }
+
+    if (packet.payload_len != sizeof(gateway_status_packet_t))
+    {
+        bad_count++;
+
+        printf("[GATEWAY STATUS RX] bad payload_len=%u expected=%u\n",
+               packet.payload_len,
+               (unsigned int)sizeof(gateway_status_packet_t));
+        return;
+    }
+
+    uint32_t session_id = packet.timestamp_ms;
+
+    if (!has_session || session_id != last_session_id)
+    {
+        printf("[GATEWAY STATUS RX] NEW SESSION old=0x%08lx new=0x%08lx reset last_sequence\n",
+               (unsigned long)last_session_id,
+               (unsigned long)session_id);
+
+        last_session_id = session_id;
+        last_sequence = 0;
+        has_session = 1;
+    }
+
+    if (packet.sequence <= last_sequence)
+    {
+        replay_count++;
+
+        printf("[GATEWAY STATUS RX] REPLAY/OLD session=0x%08lx seq=%lu last=%lu replay_count=%lu\n",
+               (unsigned long)session_id,
+               (unsigned long)packet.sequence,
+               (unsigned long)last_sequence,
+               (unsigned long)replay_count);
+
+        return;
+    }
+
+    last_sequence = packet.sequence;
+
+    gateway_status_packet_t status;
+    memset(&status, 0, sizeof(status));
+
+    memcpy(&status, packet.payload, sizeof(status));
+
+    gateway_status_update(&status);
+
+    ok_count++;
+
+    static uint32_t print_counter = 0;
+    static uint8_t last_fc_armed = 255;
+    static uint8_t last_fc_fresh = 255;
+    static uint8_t last_action = 255;
+
+    print_counter++;
+
+    int changed =
+        (last_fc_armed != status.fc_is_armed) ||
+        (last_fc_fresh != status.fc_heartbeat_fresh) ||
+        (last_action != status.last_action);
+
+    if (changed || print_counter == 1 || (print_counter % 10) == 0)
+    {
+        last_fc_armed = status.fc_is_armed;
+        last_fc_fresh = status.fc_heartbeat_fresh;
+        last_action = status.last_action;
+
+        printf("[GATEWAY STATUS RX] packet_id=%lu fc=%s fc_fresh=%u remote=%s link=%u action=%s ok=%lu bad=%lu replay=%lu\n",
+               (unsigned long)status.packet_id,
+               status.fc_is_armed ? "ARMED" : "DISARMED",
+               status.fc_heartbeat_fresh,
+               state_to_string((rc_state_t)status.remote_state),
+               status.gateway_link_ok,
+               gateway_action_to_string(status.last_action),
+               (unsigned long)status.rx_ok_count,
+               (unsigned long)status.rx_bad_count,
+               (unsigned long)status.rx_replay_count);
+    }
+}
+
+static void gateway_status_process_byte(uint8_t byte)
+{
+    static uint8_t frame[MATHOS_WIRE_MAX_FRAME_LEN];
+    static size_t frame_index = 0;
+    static size_t expected_frame_len = 0;
+
+    if (frame_index == 0)
+    {
+        if (byte != MATHOS_WIRE_MAGIC_0)
+        {
+            return;
+        }
+
+        frame[frame_index++] = byte;
+        expected_frame_len = 0;
+        return;
+    }
+
+    if (frame_index == 1)
+    {
+        if (byte == MATHOS_WIRE_MAGIC_1)
+        {
+            frame[frame_index++] = byte;
+            return;
+        }
+
+        if (byte == MATHOS_WIRE_MAGIC_0)
+        {
+            frame[0] = byte;
+            frame_index = 1;
+            expected_frame_len = 0;
+            return;
+        }
+
+        frame_index = 0;
+        expected_frame_len = 0;
+        return;
+    }
+
+    if (frame_index >= sizeof(frame))
+    {
+        frame_index = 0;
+        expected_frame_len = 0;
+        return;
+    }
+
+    frame[frame_index++] = byte;
+
+    if (frame_index == 6)
+    {
+        expected_frame_len = link_get_u16_le(&frame[4]);
+
+        if (expected_frame_len < (MATHOS_WIRE_HEADER_LEN + MATHOS_AUTH_TAG_LEN + MATHOS_WIRE_CRC_LEN) ||
+            expected_frame_len > MATHOS_WIRE_MAX_FRAME_LEN)
+        {
+            printf("[GATEWAY STATUS RX] bad declared frame length=%u\n",
+                   (unsigned int)expected_frame_len);
+
+            frame_index = 0;
+            expected_frame_len = 0;
+            return;
+        }
+    }
+
+    if (expected_frame_len > 0 && frame_index >= expected_frame_len)
+    {
+        gateway_status_handle_frame(frame, expected_frame_len);
+
+        frame_index = 0;
+        expected_frame_len = 0;
+    }
+}
+
+void gateway_status_rx_task(void *pvParameters)
+{
+    uint8_t rx_buffer[LINK_RX_BUFFER_SIZE];
+
+    printf("[GATEWAY STATUS RX] task started. Waiting for encrypted gateway status...\n");
+
+    while (1)
+    {
+        int len = uart_read_bytes(
+            LINK_UART_PORT,
+            rx_buffer,
+            sizeof(rx_buffer),
+            pdMS_TO_TICKS(100));
+
+        if (len > 0)
+        {
+            for (int i = 0; i < len; i++)
+            {
+                gateway_status_process_byte(rx_buffer[i]);
+            }
+        }
+    }
+}
+
 void task_supervisor_task(void *pvParameters)
 {
     while (1)
@@ -3067,14 +3453,14 @@ void task_supervisor_task(void *pvParameters)
                    (unsigned long)arm_age);
             stalled = 1;
         }
-
+#if FEATURE_DIRECT_MAVLINK_MODE
         if (mavlink_rx_age > 1000)
         {
             printf("[SUPERVISOR] MAVLINK RX TASK STALLED age=%lu ms\n",
                    (unsigned long)mavlink_rx_age);
             stalled = 1;
         }
-
+#endif
         /*
             LCD is not flight-critical.
             We print warning only, but we do not enter FAILSAFE because of LCD.
@@ -3141,11 +3527,12 @@ void controller_task(void *pvParameters)
                     }
                     else if (prearm_checks_pass())
                     {
+#if FEATURE_DIRECT_MAVLINK_MODE
+
                         if (control_mavlink_send_arm_disarm(1))
                         {
                             fc_arm_pending = 1;
                             fc_disarm_pending = 0;
-
                             fc_arm_pending_start_tick = xTaskGetTickCount();
 
                             command_status_set(COMMAND_STATUS_ARMING, "ARM command sent to FC");
@@ -3159,6 +3546,21 @@ void controller_task(void *pvParameters)
                             command_status_set(COMMAND_STATUS_DENIED, "failed to send ARM command");
                             printf("[CONTROLLER] ARM BLOCKED: failed to send FC ARM command\n");
                         }
+
+#else
+
+                        drone_command_set(RC_ARMED, "secure gateway mode ARM intent");
+                        command_status_set(COMMAND_STATUS_IDLE, "ARM intent sent to gateway");
+
+                        printf("[CONTROLLER] ARM INTENT SENT TO GATEWAY\n");
+
+#endif
+
+                        // {
+                        //     fault_set(FAULT_OUTPUT_FAILED);
+                        //     command_status_set(COMMAND_STATUS_DENIED, "failed to send ARM command");
+                        //     printf("[CONTROLLER] ARM BLOCKED: failed to send FC ARM command\n");
+                        // }
                     }
                     else
                     {
@@ -3203,6 +3605,8 @@ void controller_task(void *pvParameters)
                 {
                     fc_arm_pending = 0;
 
+#if FEATURE_DIRECT_MAVLINK_MODE
+
                     if (control_mavlink_send_arm_disarm(0))
                     {
                         fc_disarm_pending = 1;
@@ -3218,10 +3622,18 @@ void controller_task(void *pvParameters)
                         printf("[CONTROLLER] Pending ARM cancelled. Failed to send DISARM to FC\n");
                     }
 
+#else
+
+                    command_status_set(COMMAND_STATUS_IDLE, "pending ARM intent cancelled");
+                    printf("[CONTROLLER] Pending ARM intent cancelled in gateway mode\n");
+
+#endif
+
                     drone_command_set(RC_DISARMED, "DISARM pressed while ARM pending");
                 }
                 else if (command_state == RC_ARMED)
                 {
+#if FEATURE_DIRECT_MAVLINK_MODE
                     if (!control_mavlink_send_arm_disarm(0))
                     {
                         fault_set(FAULT_OUTPUT_FAILED);
@@ -3246,6 +3658,14 @@ void controller_task(void *pvParameters)
                         This forces MANUAL_CONTROL back to neutral even if FC disarm is delayed/refused.
                     */
                     drone_command_set(RC_DISARMED, "DISARM button pressed");
+#else
+
+                    drone_command_set(RC_DISARMED, "secure gateway mode DISARM intent");
+                    command_status_set(COMMAND_STATUS_IDLE, "DISARM intent sent to gateway");
+
+                    printf("[CONTROLLER] DISARM INTENT SENT TO GATEWAY\n");
+
+#endif
                 }
                 else if (command_state == RC_DISARMED)
                 {
@@ -3255,6 +3675,8 @@ void controller_task(void *pvParameters)
                 {
                     if (!arm_permission)
                     {
+#if FEATURE_DIRECT_MAVLINK_MODE
+
                         if (control_mavlink_send_arm_disarm(0))
                         {
                             printf("[CONTROLLER] FAILSAFE RESET: DISARM command sent to FC\n");
@@ -3264,6 +3686,12 @@ void controller_task(void *pvParameters)
                             fault_set(FAULT_OUTPUT_FAILED);
                             printf("[CONTROLLER] FAILSAFE RESET WARNING: failed to send FC DISARM command\n");
                         }
+
+#else
+
+                        printf("[CONTROLLER] FAILSAFE RESET: gateway mode, no direct FC command\n");
+
+#endif
 
                         drone_command_set(RC_DISARMED, "failsafe reset with DISARM button and arm permission OFF");
 
@@ -3491,11 +3919,14 @@ void radio_tx_task(void *pvParameters)
 
 #endif
 
+#if FEATURE_DIRECT_MAVLINK_MODE
+
         if (!control_output_send(&packet))
         {
             printf("[OUTPUT] FAILED to send control packet id=%lu\n",
                    (unsigned long)packet.packet_id);
             fault_set(FAULT_OUTPUT_FAILED);
+
             if (drone_command_get() == RC_ARMED)
             {
                 enter_failsafe("control output failed");
@@ -3505,6 +3936,17 @@ void radio_tx_task(void *pvParameters)
         {
             fault_clear(FAULT_OUTPUT_FAILED);
         }
+
+#else
+
+        /*
+            Secure gateway mode:
+            remote only sends encrypted Mathos packets to gateway.
+            No direct MAVLink output from remote.
+        */
+        fault_clear(FAULT_OUTPUT_FAILED);
+
+#endif
         int64_t work_us = esp_timer_get_time() - work_start_us;
 
         static int radio_slow_count = 0;
@@ -3927,11 +4369,15 @@ void app_main(void)
         return;
     }
 
+#if FEATURE_DIRECT_MAVLINK_MODE
     if (!control_output_init())
     {
         printf("[FATAL] control output init failed\n");
         return;
     }
+#else
+    printf("[OUTPUT] direct MAVLink disabled. Using secure gateway mode.\n");
+#endif
     if (!link_uart_init())
     {
         printf("[FATAL] link UART init failed\n");
@@ -4039,8 +4485,13 @@ void app_main(void)
     create_task_checked(button_task_failsafe, "button_task_failsafe", 4096, NULL, 5, &button_task_failsafe_handle);
     create_task_checked(controller_task, "controller_task", 4096, NULL, 5, &controller_task_handle);
     create_task_checked(radio_tx_task, "radio_tx_task", 4096, NULL, 3, &radio_tx_task_handle);
+    create_task_checked(gateway_status_rx_task, "gateway_status_rx_task", 4096, NULL, 3, &gateway_status_rx_task_handle);
+#if FEATURE_DIRECT_MAVLINK_MODE
     create_task_checked(mavlink_heartbeat_task, "mavlink_heartbeat_task", 4096, NULL, 3, &mavlink_heartbeat_task_handle);
     create_task_checked(mavlink_rx_task, "mavlink_rx_task", 4096, NULL, 3, &mavlink_rx_task_handle);
+#else
+    printf("[BOOT] Direct MAVLink tasks disabled in secure gateway mode\n");
+#endif
     create_task_checked(system_health_task, "system_health_task", 4096, NULL, 2, &system_health_task_handle);
     create_task_checked(link_mode_task, "link_mode_task", 4096, NULL, 3, &link_mode_task_handle);
     create_task_checked(arm_safety_task, "arm_safety_task", 4096, NULL, 5, &arm_safety_task_handle);

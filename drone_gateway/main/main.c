@@ -10,6 +10,7 @@
 
 #include "mathos_protocol.h"
 #include "mathos_secure.h"
+#include "esp_random.h"
 
 #define GATEWAY_UART_PORT UART_NUM_1
 #define GATEWAY_UART_TX_PIN 8
@@ -55,11 +56,24 @@
 #define GATEWAY_ARM_DISARM_DRY_RUN 1
 #define GATEWAY_ARM_DISARM_REAL_ENABLE 0
 
+#define GATEWAY_STATUS_TX_ENABLE 1
+#define GATEWAY_STATUS_TX_PERIOD_MS 200
+
+#define MATHOS_GATEWAY_ID 2
+#define MATHOS_LINK_ID_STATUS 0
+#define MATHOS_PAYLOAD_TYPE_GATEWAY_STATUS 2
+
+#define GATEWAY_REMOTE_LINK_FRESH_MS 1000
+
 static uint8_t gateway_mavlink_tx_seq = 0;
 
 static uint32_t gateway_fc_heartbeat_count = 0;
 static uint8_t gateway_fc_is_armed = 0;
+static uint32_t gateway_status_session_id = 1;
 static TickType_t gateway_fc_last_heartbeat_tick = 0;
+
+
+
 typedef enum
 {
     RC_DISARMED = 0,
@@ -77,6 +91,42 @@ typedef struct
     int pitch;
     int roll;
 } rc_packet_t;
+
+typedef enum
+{
+    GATEWAY_ACTION_NONE = 0,
+    GATEWAY_ACTION_ARM_DRY_RUN,
+    GATEWAY_ACTION_DISARM_DRY_RUN,
+    GATEWAY_ACTION_FAILSAFE_DRY_RUN
+} gateway_action_t;
+
+typedef struct __attribute__((packed))
+{
+    uint32_t packet_id;
+    uint32_t session_id;
+
+    uint8_t fc_heartbeat_fresh;
+    uint8_t fc_is_armed;
+    uint8_t remote_state;
+    uint8_t gateway_link_ok;
+    uint8_t last_action;
+
+    uint8_t reserved[3];
+
+    uint32_t rx_ok_count;
+    uint32_t rx_bad_count;
+    uint32_t rx_replay_count;
+} gateway_status_packet_t;
+
+static uint32_t gateway_status_tx_sequence = 1;
+
+static volatile uint32_t gateway_rx_ok_count = 0;
+static volatile uint32_t gateway_rx_bad_count = 0;
+static volatile uint32_t gateway_rx_replay_count = 0;
+
+static volatile rc_state_t gateway_last_remote_state = RC_DISARMED;
+static volatile uint8_t gateway_last_action = GATEWAY_ACTION_NONE;
+static volatile TickType_t gateway_last_remote_packet_tick = 0;
 
 static uint8_t gateway_fc_heartbeat_is_fresh(void)
 {
@@ -259,7 +309,6 @@ static void gateway_mavlink_dry_run(const rc_packet_t *packet)
 
 #endif
 }
-
 static void gateway_arm_disarm_dry_run(const rc_packet_t *packet)
 {
 #if GATEWAY_ARM_DISARM_DRY_RUN
@@ -288,6 +337,8 @@ static void gateway_arm_disarm_dry_run(const rc_packet_t *packet)
 
     if (packet->state == RC_ARMED)
     {
+        gateway_last_action = GATEWAY_ACTION_ARM_DRY_RUN;
+
         printf("[GATEWAY ARM DRY RUN] remote changed to ARMED packet_id=%lu fc=%s fc_fresh=%u ACTION=PRINT_ONLY\n",
                (unsigned long)packet->packet_id,
                gateway_fc_arm_state_to_string(gateway_fc_is_armed),
@@ -295,6 +346,8 @@ static void gateway_arm_disarm_dry_run(const rc_packet_t *packet)
     }
     else if (packet->state == RC_DISARMED)
     {
+        gateway_last_action = GATEWAY_ACTION_DISARM_DRY_RUN;
+
         printf("[GATEWAY DISARM DRY RUN] remote changed to DISARMED packet_id=%lu fc=%s fc_fresh=%u ACTION=PRINT_ONLY\n",
                (unsigned long)packet->packet_id,
                gateway_fc_arm_state_to_string(gateway_fc_is_armed),
@@ -302,6 +355,8 @@ static void gateway_arm_disarm_dry_run(const rc_packet_t *packet)
     }
     else if (packet->state == RC_FAILSAFE)
     {
+        gateway_last_action = GATEWAY_ACTION_FAILSAFE_DRY_RUN;
+
         printf("[GATEWAY FAILSAFE DRY RUN] remote changed to FAILSAFE packet_id=%lu fc=%s fc_fresh=%u ACTION=PRINT_ONLY\n",
                (unsigned long)packet->packet_id,
                gateway_fc_arm_state_to_string(gateway_fc_is_armed),
@@ -333,6 +388,7 @@ static void gateway_handle_frame(const uint8_t *frame, size_t frame_len)
     if (status != MATHOS_STATUS_OK)
     {
         bad_count++;
+        gateway_rx_bad_count = bad_count;
 
         if ((bad_count % 20) == 1)
         {
@@ -354,7 +410,7 @@ static void gateway_handle_frame(const uint8_t *frame, size_t frame_len)
     if (crypto_status != MATHOS_SECURE_STATUS_OK)
     {
         bad_count++;
-
+gateway_rx_bad_count = bad_count;
         if ((bad_count % 20) == 1)
         {
             printf("[GATEWAY] crypto BAD status=%s bad_count=%lu len=%u\n",
@@ -392,7 +448,7 @@ static void gateway_handle_frame(const uint8_t *frame, size_t frame_len)
     if (packet.sequence <= last_sequence)
     {
         replay_count++;
-
+gateway_rx_replay_count = replay_count;
         printf("[GATEWAY] REPLAY/OLD session=0x%08lx seq=%lu last=%lu replay_count=%lu\n",
                (unsigned long)session_id,
                (unsigned long)packet.sequence,
@@ -404,7 +460,8 @@ static void gateway_handle_frame(const uint8_t *frame, size_t frame_len)
 
     last_sequence = packet.sequence;
     ok_count++;
-
+gateway_rx_ok_count = ok_count;
+gateway_last_remote_packet_tick = xTaskGetTickCount();
     rc_packet_t rc_packet;
     memset(&rc_packet, 0, sizeof(rc_packet));
 
@@ -435,7 +492,7 @@ static void gateway_handle_frame(const uint8_t *frame, size_t frame_len)
 
         return;
     }
-
+gateway_last_remote_state = rc_packet.state;
     gateway_arm_disarm_dry_run(&rc_packet);
     gateway_mavlink_dry_run(&rc_packet);
 
@@ -631,7 +688,19 @@ static void gateway_handle_fc_heartbeat(
     uint8_t autopilot = payload[5];
     uint8_t base_mode = payload[6];
     uint8_t system_status = payload[7];
+/*
+    Ignore our own GCS heartbeat.
+    Trust only the real FC/autopilot heartbeat.
+*/
+if (sys_id == GATEWAY_MAVLINK_SYS_ID && comp_id == GATEWAY_MAVLINK_COMP_ID)
+{
+    return;
+}
 
+if (autopilot == MAV_AUTOPILOT_INVALID)
+{
+    return;
+}
     uint8_t armed = (base_mode & MAV_MODE_FLAG_SAFETY_ARMED) != 0;
 
     gateway_fc_heartbeat_count++;
@@ -1020,7 +1089,146 @@ static void gateway_mavlink_heartbeat_task(void *pvParameters)
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
+static const char *gateway_action_to_string(uint8_t action)
+{
+    switch (action)
+    {
+    case GATEWAY_ACTION_NONE:
+        return "NONE";
 
+    case GATEWAY_ACTION_ARM_DRY_RUN:
+        return "ARM_DRY_RUN";
+
+    case GATEWAY_ACTION_DISARM_DRY_RUN:
+        return "DISARM_DRY_RUN";
+
+    case GATEWAY_ACTION_FAILSAFE_DRY_RUN:
+        return "FAILSAFE_DRY_RUN";
+
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static int gateway_status_send_once(void)
+{
+#if GATEWAY_STATUS_TX_ENABLE
+
+    gateway_status_packet_t status;
+    memset(&status, 0, sizeof(status));
+
+    TickType_t now = xTaskGetTickCount();
+
+    uint8_t remote_link_ok = 0;
+
+    if (gateway_last_remote_packet_tick != 0 &&
+        (now - gateway_last_remote_packet_tick) < pdMS_TO_TICKS(GATEWAY_REMOTE_LINK_FRESH_MS))
+    {
+        remote_link_ok = 1;
+    }
+
+    uint32_t seq = gateway_status_tx_sequence++;
+
+    status.packet_id = seq;
+    status.session_id = gateway_status_session_id;
+
+    status.fc_heartbeat_fresh = gateway_fc_heartbeat_is_fresh();
+    status.fc_is_armed = gateway_fc_is_armed;
+    status.remote_state = (uint8_t)gateway_last_remote_state;
+    status.gateway_link_ok = remote_link_ok;
+    status.last_action = gateway_last_action;
+
+    status.rx_ok_count = gateway_rx_ok_count;
+    status.rx_bad_count = gateway_rx_bad_count;
+    status.rx_replay_count = gateway_rx_replay_count;
+
+    mathos_secure_packet_t packet;
+    memset(&packet, 0, sizeof(packet));
+
+    packet.sequence = seq;
+    packet.timestamp_ms = status.session_id;
+    packet.controller_id = MATHOS_GATEWAY_ID;
+    packet.link_id = MATHOS_LINK_ID_STATUS;
+    packet.payload_type = MATHOS_PAYLOAD_TYPE_GATEWAY_STATUS;
+    packet.payload_len = sizeof(gateway_status_packet_t);
+
+    if (packet.payload_len > MATHOS_PAYLOAD_MAX_LEN)
+    {
+        printf("[GATEWAY STATUS TX] payload too large=%u max=%u\n",
+               packet.payload_len,
+               MATHOS_PAYLOAD_MAX_LEN);
+        return 0;
+    }
+
+    memcpy(packet.payload, &status, sizeof(status));
+
+    mathos_secure_status_t crypto_status = mathos_secure_encrypt_packet(&packet);
+
+    if (crypto_status != MATHOS_SECURE_STATUS_OK)
+    {
+        printf("[GATEWAY STATUS TX] encrypt failed status=%s\n",
+               mathos_secure_status_to_string(crypto_status));
+        return 0;
+    }
+
+    uint8_t wire_frame[MATHOS_WIRE_MAX_FRAME_LEN];
+    size_t wire_frame_len = 0;
+
+    mathos_status_t encode_status = mathos_wire_encode(
+        &packet,
+        wire_frame,
+        sizeof(wire_frame),
+        &wire_frame_len);
+
+    if (encode_status != MATHOS_STATUS_OK)
+    {
+        printf("[GATEWAY STATUS TX] encode failed status=%s\n",
+               mathos_status_to_string(encode_status));
+        return 0;
+    }
+
+    int written = uart_write_bytes(
+        GATEWAY_UART_PORT,
+        (const char *)wire_frame,
+        wire_frame_len);
+
+    return written == wire_frame_len;
+
+#else
+
+    return 1;
+
+#endif
+}
+
+static void gateway_status_tx_task(void *pvParameters)
+{
+    uint32_t print_counter = 0;
+
+    printf("[GATEWAY STATUS TX] task started\n");
+
+    while (1)
+    {
+        int ok = gateway_status_send_once();
+
+        print_counter++;
+
+        if (print_counter == 1 || (print_counter % 10) == 0)
+        {
+            printf("[GATEWAY STATUS TX] %s fc=%s fc_fresh=%u remote=%s action=%s ok_count=%lu bad_count=%lu replay_count=%lu\n",
+                   ok ? "OK" : "FAILED",
+                   gateway_fc_arm_state_to_string(gateway_fc_is_armed),
+                   gateway_fc_heartbeat_is_fresh(),
+                   state_to_string(gateway_last_remote_state),
+                   gateway_action_to_string(gateway_last_action),
+                   (unsigned long)gateway_rx_ok_count,
+                   (unsigned long)gateway_rx_bad_count,
+                   (unsigned long)gateway_rx_replay_count);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(GATEWAY_STATUS_TX_PERIOD_MS));
+    }
+}
 void app_main(void)
 {
     if (!gateway_fc_uart_init())
@@ -1039,8 +1247,17 @@ void app_main(void)
     printf("========================================\n");
 
     gateway_uart_init();
+gateway_status_session_id = esp_random();
 
+if (gateway_status_session_id == 0)
+{
+    gateway_status_session_id = 1;
+}
+
+printf("[GATEWAY STATUS] session_id=0x%08lx\n",
+       (unsigned long)gateway_status_session_id);
     xTaskCreate(gateway_rx_task, "gateway_rx_task", 4096, NULL, 5, NULL);
     xTaskCreate(gateway_mavlink_heartbeat_task, "gateway_mavlink_heartbeat_task", 4096, NULL, 3, NULL);
     xTaskCreate(gateway_fc_mavlink_rx_task, "gateway_fc_mavlink_rx_task", 4096, NULL, 4, NULL);
+    xTaskCreate(gateway_status_tx_task, "gateway_status_tx_task", 4096, NULL, 3, NULL);
 }
