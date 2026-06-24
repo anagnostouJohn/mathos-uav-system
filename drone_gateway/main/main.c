@@ -56,6 +56,28 @@
 #define GATEWAY_ARM_DISARM_DRY_RUN 1
 #define GATEWAY_ARM_DISARM_REAL_ENABLE 0
 
+#define MAVLINK_TARGET_SYS_ID 1
+#define MAVLINK_TARGET_COMP_ID 1
+
+#define MAVLINK_MSG_ID_COMMAND_LONG 76
+#define MAVLINK_MSG_COMMAND_LONG_LEN 33
+#define MAVLINK_MSG_COMMAND_LONG_CRC_EXTRA 152
+
+#define MAVLINK_MSG_ID_COMMAND_ACK 77
+#define MAVLINK_MSG_COMMAND_ACK_CRC_EXTRA 143
+
+#define MAV_CMD_COMPONENT_ARM_DISARM 400
+
+#define MAV_RESULT_ACCEPTED 0
+#define MAV_RESULT_TEMPORARILY_REJECTED 1
+#define MAV_RESULT_DENIED 2
+#define MAV_RESULT_UNSUPPORTED 3
+#define MAV_RESULT_FAILED 4
+#define MAV_RESULT_IN_PROGRESS 5
+#define MAV_RESULT_CANCELLED 6
+
+#define GATEWAY_ARM_PENDING_TIMEOUT_MS 3000
+
 #define GATEWAY_STATUS_TX_ENABLE 1
 #define GATEWAY_STATUS_TX_PERIOD_MS 200
 
@@ -97,7 +119,16 @@ typedef enum
     GATEWAY_ACTION_NONE = 0,
     GATEWAY_ACTION_ARM_DRY_RUN,
     GATEWAY_ACTION_DISARM_DRY_RUN,
-    GATEWAY_ACTION_FAILSAFE_DRY_RUN
+    GATEWAY_ACTION_FAILSAFE_DRY_RUN,
+
+    GATEWAY_ACTION_ARM_REAL_SENT,
+    GATEWAY_ACTION_DISARM_REAL_SENT,
+    GATEWAY_ACTION_ARM_CONFIRMED,
+    GATEWAY_ACTION_DISARM_CONFIRMED,
+    GATEWAY_ACTION_ARM_DENIED,
+    GATEWAY_ACTION_DISARM_DENIED,
+    GATEWAY_ACTION_ARM_TIMEOUT,
+    GATEWAY_ACTION_DISARM_TIMEOUT
 } gateway_action_t;
 
 typedef struct __attribute__((packed))
@@ -127,6 +158,12 @@ static volatile uint32_t gateway_rx_replay_count = 0;
 static volatile rc_state_t gateway_last_remote_state = RC_DISARMED;
 static volatile uint8_t gateway_last_action = GATEWAY_ACTION_NONE;
 static volatile TickType_t gateway_last_remote_packet_tick = 0;
+
+static volatile uint8_t gateway_arm_pending = 0;
+static volatile uint8_t gateway_disarm_pending = 0;
+
+static volatile TickType_t gateway_arm_pending_start_tick = 0;
+static volatile TickType_t gateway_disarm_pending_start_tick = 0;
 
 static uint8_t gateway_fc_heartbeat_is_fresh(void)
 {
@@ -309,6 +346,8 @@ static void gateway_mavlink_dry_run(const rc_packet_t *packet)
 
 #endif
 }
+static int gateway_mavlink_send_arm_disarm(int arm);
+static const char *gateway_mav_result_to_string(uint8_t result);
 static void gateway_arm_disarm_dry_run(const rc_packet_t *packet)
 {
 #if GATEWAY_ARM_DISARM_DRY_RUN
@@ -361,6 +400,93 @@ static void gateway_arm_disarm_dry_run(const rc_packet_t *packet)
                (unsigned long)packet->packet_id,
                gateway_fc_arm_state_to_string(gateway_fc_is_armed),
                fc_fresh);
+    }
+
+    last_remote_state = packet->state;
+
+#endif
+}
+
+
+static void gateway_arm_disarm_real_if_enabled(const rc_packet_t *packet)
+{
+#if GATEWAY_ARM_DISARM_REAL_ENABLE
+
+    static uint8_t initialized = 0;
+    static rc_state_t last_remote_state = RC_DISARMED;
+
+    if (packet == NULL)
+    {
+        return;
+    }
+
+    if (!initialized)
+    {
+        last_remote_state = packet->state;
+        initialized = 1;
+        return;
+    }
+
+    if (packet->state == last_remote_state)
+    {
+        return;
+    }
+
+    uint8_t fc_fresh = gateway_fc_heartbeat_is_fresh();
+
+    if (packet->state == RC_ARMED)
+    {
+        if (!fc_fresh)
+        {
+            printf("[GATEWAY ARM REAL] BLOCKED: FC heartbeat stale\n");
+            gateway_last_action = GATEWAY_ACTION_ARM_DENIED;
+        }
+        else if (gateway_fc_is_armed)
+        {
+            printf("[GATEWAY ARM REAL] ignored: FC already ARMED\n");
+            gateway_last_action = GATEWAY_ACTION_ARM_CONFIRMED;
+        }
+        else if (gateway_mavlink_send_arm_disarm(1))
+        {
+            gateway_arm_pending = 1;
+            gateway_disarm_pending = 0;
+            gateway_arm_pending_start_tick = xTaskGetTickCount();
+            gateway_last_action = GATEWAY_ACTION_ARM_REAL_SENT;
+
+            printf("[GATEWAY ARM REAL] ARM command sent to FC\n");
+        }
+        else
+        {
+            gateway_last_action = GATEWAY_ACTION_ARM_DENIED;
+            printf("[GATEWAY ARM REAL] FAILED to send ARM command\n");
+        }
+    }
+    else if (packet->state == RC_DISARMED || packet->state == RC_FAILSAFE)
+    {
+        if (!fc_fresh)
+        {
+            printf("[GATEWAY DISARM REAL] BLOCKED: FC heartbeat stale\n");
+            gateway_last_action = GATEWAY_ACTION_DISARM_DENIED;
+        }
+        else if (!gateway_fc_is_armed)
+        {
+            printf("[GATEWAY DISARM REAL] ignored: FC already DISARMED\n");
+            gateway_last_action = GATEWAY_ACTION_DISARM_CONFIRMED;
+        }
+        else if (gateway_mavlink_send_arm_disarm(0))
+        {
+            gateway_disarm_pending = 1;
+            gateway_arm_pending = 0;
+            gateway_disarm_pending_start_tick = xTaskGetTickCount();
+            gateway_last_action = GATEWAY_ACTION_DISARM_REAL_SENT;
+
+            printf("[GATEWAY DISARM REAL] DISARM command sent to FC\n");
+        }
+        else
+        {
+            gateway_last_action = GATEWAY_ACTION_DISARM_DENIED;
+            printf("[GATEWAY DISARM REAL] FAILED to send DISARM command\n");
+        }
     }
 
     last_remote_state = packet->state;
@@ -493,8 +619,10 @@ gateway_last_remote_packet_tick = xTaskGetTickCount();
         return;
     }
 gateway_last_remote_state = rc_packet.state;
-    gateway_arm_disarm_dry_run(&rc_packet);
-    gateway_mavlink_dry_run(&rc_packet);
+
+gateway_arm_disarm_dry_run(&rc_packet);
+gateway_arm_disarm_real_if_enabled(&rc_packet);
+gateway_mavlink_dry_run(&rc_packet);
 
     if (ok_count == 1 || (ok_count % GATEWAY_PRINT_EVERY) == 0)
     {
@@ -645,6 +773,30 @@ static void gateway_mav_put_u32_le(uint8_t *buffer, int *index, uint32_t value)
     buffer[(*index)++] = (uint8_t)((value >> 24) & 0xFF);
 }
 
+static void gateway_mav_put_u16_le(uint8_t *buffer, int *index, uint16_t value)
+{
+    buffer[(*index)++] = (uint8_t)((value >> 0) & 0xFF);
+    buffer[(*index)++] = (uint8_t)((value >> 8) & 0xFF);
+}
+
+static void gateway_mav_put_float_le(uint8_t *buffer, int *index, float value)
+{
+    uint32_t raw = 0;
+
+    memcpy(&raw, &value, sizeof(raw));
+
+    buffer[(*index)++] = (uint8_t)((raw >> 0) & 0xFF);
+    buffer[(*index)++] = (uint8_t)((raw >> 8) & 0xFF);
+    buffer[(*index)++] = (uint8_t)((raw >> 16) & 0xFF);
+    buffer[(*index)++] = (uint8_t)((raw >> 24) & 0xFF);
+}
+
+static uint16_t gateway_mav_get_u16_le(const uint8_t *buffer)
+{
+    return ((uint16_t)buffer[0] << 0) |
+           ((uint16_t)buffer[1] << 8);
+}
+
 static void gateway_mavlink_crc_accumulate(uint8_t data, uint16_t *crc)
 {
     uint8_t tmp = data ^ (uint8_t)(*crc & 0xFF);
@@ -706,7 +858,23 @@ if (autopilot == MAV_AUTOPILOT_INVALID)
     gateway_fc_heartbeat_count++;
     gateway_fc_last_heartbeat_tick = xTaskGetTickCount();
     gateway_fc_is_armed = armed;
+    if (armed && gateway_arm_pending)
+    {
+        gateway_arm_pending = 0;
+        gateway_disarm_pending = 0;
+        gateway_last_action = GATEWAY_ACTION_ARM_CONFIRMED;
 
+        printf("[GATEWAY ARM] FC heartbeat confirmed ARMED\n");
+    }
+
+    if (!armed && gateway_disarm_pending)
+    {
+        gateway_disarm_pending = 0;
+        gateway_arm_pending = 0;
+        gateway_last_action = GATEWAY_ACTION_DISARM_CONFIRMED;
+
+        printf("[GATEWAY DISARM] FC heartbeat confirmed DISARMED\n");
+    }
     if (gateway_fc_heartbeat_count == 1 ||
         (gateway_fc_heartbeat_count % GATEWAY_FC_HEARTBEAT_PRINT_EVERY) == 0)
     {
@@ -721,6 +889,51 @@ if (autopilot == MAV_AUTOPILOT_INVALID)
                gateway_fc_arm_state_to_string(armed));
     }
 }
+
+static void gateway_handle_fc_command_ack(
+    uint8_t sys_id,
+    uint8_t comp_id,
+    const uint8_t *payload,
+    uint8_t payload_len)
+{
+    if (payload == NULL || payload_len < 3)
+    {
+        return;
+    }
+
+    uint16_t command = gateway_mav_get_u16_le(&payload[0]);
+    uint8_t result = payload[2];
+
+    if (command != MAV_CMD_COMPONENT_ARM_DISARM)
+    {
+        return;
+    }
+
+    printf("[GATEWAY FC COMMAND_ACK] sys=%u comp=%u command=%u result=%s\n",
+           sys_id,
+           comp_id,
+           command,
+           gateway_mav_result_to_string(result));
+
+    if (result != MAV_RESULT_ACCEPTED)
+    {
+        if (gateway_arm_pending)
+        {
+            gateway_last_action = GATEWAY_ACTION_ARM_DENIED;
+        }
+        else if (gateway_disarm_pending)
+        {
+            gateway_last_action = GATEWAY_ACTION_DISARM_DENIED;
+        }
+
+        gateway_arm_pending = 0;
+        gateway_disarm_pending = 0;
+
+        printf("[GATEWAY ARM/DISARM] FC rejected command result=%s\n",
+               gateway_mav_result_to_string(result));
+    }
+}
+
 static void gateway_handle_fc_mavlink2_frame(const uint8_t *frame, size_t frame_len)
 {
     if (frame == NULL || frame_len < 12)
@@ -755,14 +968,18 @@ static void gateway_handle_fc_mavlink2_frame(const uint8_t *frame, size_t frame_
 
     uint8_t crc_extra = 0;
 
-    if (msg_id == MAVLINK_MSG_ID_HEARTBEAT)
-    {
-        crc_extra = MAVLINK_MSG_HEARTBEAT_CRC_EXTRA;
-    }
-    else
-    {
-        return;
-    }
+if (msg_id == MAVLINK_MSG_ID_HEARTBEAT)
+{
+    crc_extra = MAVLINK_MSG_HEARTBEAT_CRC_EXTRA;
+}
+else if (msg_id == MAVLINK_MSG_ID_COMMAND_ACK)
+{
+    crc_extra = MAVLINK_MSG_COMMAND_ACK_CRC_EXTRA;
+}
+else
+{
+    return;
+}
 
     uint16_t rx_crc =
         ((uint16_t)frame[10 + payload_len] << 0) |
@@ -783,11 +1000,22 @@ static void gateway_handle_fc_mavlink2_frame(const uint8_t *frame, size_t frame_
         return;
     }
 
+if (msg_id == MAVLINK_MSG_ID_HEARTBEAT)
+{
     gateway_handle_fc_heartbeat(
         sys_id,
         comp_id,
         &frame[10],
         payload_len);
+}
+else if (msg_id == MAVLINK_MSG_ID_COMMAND_ACK)
+{
+    gateway_handle_fc_command_ack(
+        sys_id,
+        comp_id,
+        &frame[10],
+        payload_len);
+}
 }
 
 static void gateway_handle_fc_mavlink1_frame(const uint8_t *frame, size_t frame_len)
@@ -812,14 +1040,18 @@ static void gateway_handle_fc_mavlink1_frame(const uint8_t *frame, size_t frame_
 
     uint8_t crc_extra = 0;
 
-    if (msg_id == MAVLINK_MSG_ID_HEARTBEAT)
-    {
-        crc_extra = MAVLINK_MSG_HEARTBEAT_CRC_EXTRA;
-    }
-    else
-    {
-        return;
-    }
+if (msg_id == MAVLINK_MSG_ID_HEARTBEAT)
+{
+    crc_extra = MAVLINK_MSG_HEARTBEAT_CRC_EXTRA;
+}
+else if (msg_id == MAVLINK_MSG_ID_COMMAND_ACK)
+{
+    crc_extra = MAVLINK_MSG_COMMAND_ACK_CRC_EXTRA;
+}
+else
+{
+    return;
+}
 
     uint16_t rx_crc =
         ((uint16_t)frame[6 + payload_len] << 0) |
@@ -840,11 +1072,22 @@ static void gateway_handle_fc_mavlink1_frame(const uint8_t *frame, size_t frame_
         return;
     }
 
+if (msg_id == MAVLINK_MSG_ID_HEARTBEAT)
+{
     gateway_handle_fc_heartbeat(
         sys_id,
         comp_id,
         &frame[6],
         payload_len);
+}
+else if (msg_id == MAVLINK_MSG_ID_COMMAND_ACK)
+{
+    gateway_handle_fc_command_ack(
+        sys_id,
+        comp_id,
+        &frame[6],
+        payload_len);
+}
 }
 
 static void gateway_fc_mavlink_process_byte(uint8_t byte)
@@ -1040,6 +1283,92 @@ static int gateway_mavlink_send_message(
 #endif
 }
 
+
+static int gateway_mavlink_send_arm_disarm(int arm)
+{
+    uint8_t payload[MAVLINK_MSG_COMMAND_LONG_LEN];
+    int p = 0;
+
+    /*
+        COMMAND_LONG payload order:
+
+        float param1
+        float param2
+        float param3
+        float param4
+        float param5
+        float param6
+        float param7
+        uint16 command
+        uint8 target_system
+        uint8 target_component
+        uint8 confirmation
+
+        MAV_CMD_COMPONENT_ARM_DISARM:
+        param1 = 1.0 arm
+        param1 = 0.0 disarm
+    */
+
+    gateway_mav_put_float_le(payload, &p, arm ? 1.0f : 0.0f);
+    gateway_mav_put_float_le(payload, &p, 0.0f);
+    gateway_mav_put_float_le(payload, &p, 0.0f);
+    gateway_mav_put_float_le(payload, &p, 0.0f);
+    gateway_mav_put_float_le(payload, &p, 0.0f);
+    gateway_mav_put_float_le(payload, &p, 0.0f);
+    gateway_mav_put_float_le(payload, &p, 0.0f);
+
+    gateway_mav_put_u16_le(payload, &p, MAV_CMD_COMPONENT_ARM_DISARM);
+
+    payload[p++] = MAVLINK_TARGET_SYS_ID;
+    payload[p++] = MAVLINK_TARGET_COMP_ID;
+    payload[p++] = 0;
+
+    if (p != MAVLINK_MSG_COMMAND_LONG_LEN)
+    {
+        return 0;
+    }
+
+    int ok = gateway_mavlink_send_message(
+        MAVLINK_MSG_ID_COMMAND_LONG,
+        payload,
+        MAVLINK_MSG_COMMAND_LONG_LEN,
+        MAVLINK_MSG_COMMAND_LONG_CRC_EXTRA);
+
+    printf("[GATEWAY MAVLINK TX] COMMAND_LONG %s result=%s\n",
+           arm ? "ARM" : "DISARM",
+           ok ? "OK" : "FAILED");
+
+    return ok;
+}
+static const char *gateway_mav_result_to_string(uint8_t result)
+{
+    switch (result)
+    {
+    case MAV_RESULT_ACCEPTED:
+        return "ACCEPTED";
+
+    case MAV_RESULT_TEMPORARILY_REJECTED:
+        return "TEMPORARILY_REJECTED";
+
+    case MAV_RESULT_DENIED:
+        return "DENIED";
+
+    case MAV_RESULT_UNSUPPORTED:
+        return "UNSUPPORTED";
+
+    case MAV_RESULT_FAILED:
+        return "FAILED";
+
+    case MAV_RESULT_IN_PROGRESS:
+        return "IN_PROGRESS";
+
+    case MAV_RESULT_CANCELLED:
+        return "CANCELLED";
+
+    default:
+        return "UNKNOWN";
+    }
+}
 static int gateway_mavlink_send_heartbeat(void)
 {
 #if GATEWAY_MAVLINK_HEARTBEAT_ENABLE
@@ -1104,6 +1433,30 @@ static const char *gateway_action_to_string(uint8_t action)
 
     case GATEWAY_ACTION_FAILSAFE_DRY_RUN:
         return "FAILSAFE_DRY_RUN";
+
+    case GATEWAY_ACTION_ARM_REAL_SENT:
+        return "ARM_REAL_SENT";
+
+    case GATEWAY_ACTION_DISARM_REAL_SENT:
+        return "DISARM_REAL_SENT";
+
+    case GATEWAY_ACTION_ARM_CONFIRMED:
+        return "ARM_CONFIRMED";
+
+    case GATEWAY_ACTION_DISARM_CONFIRMED:
+        return "DISARM_CONFIRMED";
+
+    case GATEWAY_ACTION_ARM_DENIED:
+        return "ARM_DENIED";
+
+    case GATEWAY_ACTION_DISARM_DENIED:
+        return "DISARM_DENIED";
+
+    case GATEWAY_ACTION_ARM_TIMEOUT:
+        return "ARM_TIMEOUT";
+
+    case GATEWAY_ACTION_DISARM_TIMEOUT:
+        return "DISARM_TIMEOUT";
 
     default:
         return "UNKNOWN";
@@ -1201,6 +1554,33 @@ static int gateway_status_send_once(void)
 #endif
 }
 
+static void gateway_arm_disarm_pending_timeout_check(void)
+{
+#if GATEWAY_ARM_DISARM_REAL_ENABLE
+
+    TickType_t now = xTaskGetTickCount();
+
+    if (gateway_arm_pending &&
+        (now - gateway_arm_pending_start_tick) > pdMS_TO_TICKS(GATEWAY_ARM_PENDING_TIMEOUT_MS))
+    {
+        gateway_arm_pending = 0;
+        gateway_last_action = GATEWAY_ACTION_ARM_TIMEOUT;
+
+        printf("[GATEWAY ARM] TIMEOUT waiting for FC armed heartbeat\n");
+    }
+
+    if (gateway_disarm_pending &&
+        (now - gateway_disarm_pending_start_tick) > pdMS_TO_TICKS(GATEWAY_ARM_PENDING_TIMEOUT_MS))
+    {
+        gateway_disarm_pending = 0;
+        gateway_last_action = GATEWAY_ACTION_DISARM_TIMEOUT;
+
+        printf("[GATEWAY DISARM] TIMEOUT waiting for FC disarmed heartbeat\n");
+    }
+
+#endif
+}
+
 static void gateway_status_tx_task(void *pvParameters)
 {
     uint32_t print_counter = 0;
@@ -1209,7 +1589,9 @@ static void gateway_status_tx_task(void *pvParameters)
 
     while (1)
     {
+        gateway_arm_disarm_pending_timeout_check();
         int ok = gateway_status_send_once();
+        
 
         print_counter++;
 
