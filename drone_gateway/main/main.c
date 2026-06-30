@@ -54,7 +54,30 @@
 #define GATEWAY_FC_HEARTBEAT_PRINT_EVERY 1
 
 #define GATEWAY_ARM_DISARM_DRY_RUN 1
+
+/*
+    REAL ARM/DISARM SAFETY GATES
+
+    GATEWAY_ARM_DISARM_REAL_ENABLE:
+        Enables real MAVLink ARM/DISARM code path.
+
+    GATEWAY_ALLOW_REAL_ARM_BENCH_TEST:
+        Human confirmation flag.
+        Must also be enabled for real ARM/DISARM to compile.
+
+    Never enable these for flight yet.
+    Bench only. Props off.
+*/
 #define GATEWAY_ARM_DISARM_REAL_ENABLE 1
+#define GATEWAY_ALLOW_REAL_ARM_BENCH_TEST 1
+
+#if GATEWAY_ARM_DISARM_REAL_ENABLE && !GATEWAY_ALLOW_REAL_ARM_BENCH_TEST
+#error "Real ARM/DISARM requires GATEWAY_ALLOW_REAL_ARM_BENCH_TEST=1"
+#endif
+
+#if GATEWAY_ALLOW_REAL_ARM_BENCH_TEST && !GATEWAY_ARM_DISARM_REAL_ENABLE
+#error "Bench real ARM flag set, but real ARM/DISARM is not enabled"
+#endif
 
 #define MAVLINK_TARGET_SYS_ID 1
 #define MAVLINK_TARGET_COMP_ID 1
@@ -1635,9 +1658,19 @@ if (gateway_status_session_id == 0)
 {
     gateway_status_session_id = 1;
 }
-
 printf("[GATEWAY STATUS] session_id=0x%08lx\n",
        (unsigned long)gateway_status_session_id);
+#if GATEWAY_ARM_DISARM_REAL_ENABLE
+    printf("[SAFETY] REAL ARM/DISARM ENABLED - BENCH ONLY - PROPS OFF\n");
+#else
+    printf("[SAFETY] Real ARM/DISARM disabled. Dry-run/safe mode.\n");
+#endif
+
+#if GATEWAY_ARM_DISARM_DRY_RUN
+    printf("[SAFETY] ARM/DISARM dry-run logging enabled.\n");
+#endif
+
+
     xTaskCreate(gateway_rx_task, "gateway_rx_task", 4096, NULL, 5, NULL);
     xTaskCreate(gateway_mavlink_heartbeat_task, "gateway_mavlink_heartbeat_task", 4096, NULL, 3, NULL);
     xTaskCreate(gateway_fc_mavlink_rx_task, "gateway_fc_mavlink_rx_task", 4096, NULL, 4, NULL);

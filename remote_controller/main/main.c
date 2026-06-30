@@ -3189,6 +3189,139 @@ static const char *gateway_action_to_string(uint8_t action)
     }
 }
 
+static void gateway_status_apply_to_remote(const gateway_status_packet_t *status)
+{
+    if (status == NULL)
+    {
+        return;
+    }
+
+    command_status_t op_status = command_status_get();
+    rc_state_t command_state = drone_command_get();
+
+    /*
+        Track actual FC state from the gateway.
+        This is the real aircraft state, not just the local button intent.
+    */
+    if (status->fc_is_armed)
+    {
+        drone_set_state(RC_ARMED, "gateway reports FC armed");
+    }
+    else
+    {
+        drone_set_state(RC_DISARMED, "gateway reports FC disarmed");
+    }
+
+    switch ((gateway_action_t)status->last_action)
+    {
+    case GATEWAY_ACTION_ARM_REAL_SENT:
+        if (op_status == COMMAND_STATUS_ARMING || command_state == RC_ARMED)
+        {
+            command_status_set(COMMAND_STATUS_ARMING, "gateway sent real ARM command");
+        }
+        break;
+
+case GATEWAY_ACTION_ARM_CONFIRMED:
+    if (status->fc_is_armed &&
+        op_status == COMMAND_STATUS_ARMING)
+    {
+        drone_command_set(RC_ARMED, "gateway confirmed FC armed");
+        drone_set_state(RC_ARMED, "gateway confirmed FC armed");
+        command_status_set(COMMAND_STATUS_IDLE, "gateway confirmed FC armed");
+
+        printf("[REMOTE] ARM CONFIRMED by gateway/FC\n");
+    }
+    break;
+
+    case GATEWAY_ACTION_ARM_DENIED:
+        if (op_status == COMMAND_STATUS_ARMING)
+        {
+            drone_command_set(RC_DISARMED, "gateway denied ARM");
+            drone_set_state(RC_DISARMED, "gateway denied ARM");
+            command_status_set(COMMAND_STATUS_DENIED, "gateway denied ARM");
+
+            printf("[REMOTE] ARM DENIED by gateway/FC\n");
+        }
+        break;
+
+    case GATEWAY_ACTION_ARM_TIMEOUT:
+        if (op_status == COMMAND_STATUS_ARMING)
+        {
+            drone_command_set(RC_DISARMED, "gateway ARM timeout");
+            drone_set_state(RC_DISARMED, "gateway ARM timeout");
+            command_status_set(COMMAND_STATUS_TIMEOUT, "gateway ARM timeout");
+
+            printf("[REMOTE] ARM TIMEOUT from gateway/FC\n");
+        }
+        break;
+
+    case GATEWAY_ACTION_DISARM_REAL_SENT:
+        if (op_status == COMMAND_STATUS_DISARMING)
+        {
+            command_status_set(COMMAND_STATUS_DISARMING, "gateway sent real DISARM command");
+        }
+        break;
+
+    case GATEWAY_ACTION_DISARM_CONFIRMED:
+        /*
+            Normal DISARM confirmation clears DISARMING.
+            If the local command is FAILSAFE, keep FAILSAFE latched until
+            the operator resets it intentionally.
+        */
+        if (op_status == COMMAND_STATUS_DISARMING &&
+            command_state != RC_FAILSAFE)
+        {
+            drone_command_set(RC_DISARMED, "gateway confirmed FC disarmed");
+            drone_set_state(RC_DISARMED, "gateway confirmed FC disarmed");
+            command_status_set(COMMAND_STATUS_IDLE, "gateway confirmed FC disarmed");
+
+            printf("[REMOTE] DISARM CONFIRMED by gateway/FC\n");
+        }
+        break;
+
+    case GATEWAY_ACTION_DISARM_DENIED:
+        if (op_status == COMMAND_STATUS_DISARMING)
+        {
+            drone_command_set(RC_DISARMED, "gateway denied DISARM, keeping output neutral");
+            command_status_set(COMMAND_STATUS_DENIED, "gateway denied DISARM");
+
+            if (status->fc_is_armed)
+            {
+                drone_set_state(RC_ARMED, "gateway says FC still armed after DISARM denied");
+            }
+            else
+            {
+                drone_set_state(RC_DISARMED, "gateway says FC disarmed after DISARM denied");
+            }
+
+            printf("[REMOTE] DISARM DENIED by gateway/FC\n");
+        }
+        break;
+
+    case GATEWAY_ACTION_DISARM_TIMEOUT:
+        if (op_status == COMMAND_STATUS_DISARMING)
+        {
+            drone_command_set(RC_DISARMED, "gateway DISARM timeout, keeping output neutral");
+            command_status_set(COMMAND_STATUS_TIMEOUT, "gateway DISARM timeout");
+
+            if (status->fc_is_armed)
+            {
+                drone_set_state(RC_ARMED, "gateway says FC still armed after DISARM timeout");
+            }
+            else
+            {
+                drone_set_state(RC_DISARMED, "gateway says FC disarmed after DISARM timeout");
+            }
+
+            printf("[REMOTE] DISARM TIMEOUT from gateway/FC\n");
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
 static void gateway_status_update(const gateway_status_packet_t *status)
 {
     if (status == NULL)
@@ -3323,6 +3456,7 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
     memcpy(&status, packet.payload, sizeof(status));
 
     gateway_status_update(&status);
+    gateway_status_apply_to_remote(&status);
 
     ok_count++;
 
@@ -3582,18 +3716,13 @@ void controller_task(void *pvParameters)
 
 #else
 
-                        drone_command_set(RC_ARMED, "secure gateway mode ARM intent");
-                        command_status_set(COMMAND_STATUS_IDLE, "ARM intent sent to gateway");
+                        drone_command_set(RC_ARMED, "secure gateway mode ARM request");
+                        command_status_set(COMMAND_STATUS_ARMING, "ARM request sent to gateway");
 
-                        printf("[CONTROLLER] ARM INTENT SENT TO GATEWAY\n");
+                        printf("[CONTROLLER] ARM REQUEST SENT TO GATEWAY\n");
+                        printf("[CONTROLLER] Waiting for gateway/FC ARM confirmation\n");
 
 #endif
-
-                        // {
-                        //     fault_set(FAULT_OUTPUT_FAILED);
-                        //     command_status_set(COMMAND_STATUS_DENIED, "failed to send ARM command");
-                        //     printf("[CONTROLLER] ARM BLOCKED: failed to send FC ARM command\n");
-                        // }
                     }
                     else
                     {
@@ -3693,10 +3822,11 @@ void controller_task(void *pvParameters)
                     drone_command_set(RC_DISARMED, "DISARM button pressed");
 #else
 
-                    drone_command_set(RC_DISARMED, "secure gateway mode DISARM intent");
-                    command_status_set(COMMAND_STATUS_IDLE, "DISARM intent sent to gateway");
+                    drone_command_set(RC_DISARMED, "secure gateway mode DISARM request");
+                    command_status_set(COMMAND_STATUS_DISARMING, "DISARM request sent to gateway");
 
-                    printf("[CONTROLLER] DISARM INTENT SENT TO GATEWAY\n");
+                    printf("[CONTROLLER] DISARM REQUEST SENT TO GATEWAY\n");
+                    printf("[CONTROLLER] Waiting for gateway/FC DISARM confirmation\n");
 
 #endif
                 }
@@ -3767,6 +3897,7 @@ void radio_tx_task(void *pvParameters)
         int roll_to_send = input_snapshot.roll;
 
         rc_state_t command_state = drone_command_get();
+        command_status_t op_status = command_status_get();
 
 #if TEST_FIXED_MANUAL_CONTROL
 
@@ -3785,7 +3916,10 @@ void radio_tx_task(void *pvParameters)
 
 #else
 
-        if (command_state != RC_ARMED || !rc_input_is_fresh())
+        if (command_state != RC_ARMED ||
+            op_status == COMMAND_STATUS_ARMING ||
+            op_status == COMMAND_STATUS_DISARMING ||
+            !rc_input_is_fresh())
         {
             throttle_to_send = 0;
             yaw_to_send = 0;
