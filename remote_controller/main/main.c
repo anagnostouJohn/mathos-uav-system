@@ -18,6 +18,7 @@
 #include "mathos_secure.h"
 #include "esp_random.h"
 ////////////////////////////////////////////////////////////////////////////////////
+#define COMMAND_STATUS_MESSAGE_CLEAR_MS 3000
 
 #define DEBUG_CRYPTO_TAMPER_TEST 0
 #define CRYPTO_TAMPER_EVERY 200
@@ -402,6 +403,7 @@ volatile TickType_t gateway_status_last_update_tick = 0;
 volatile rc_state_t drone_state = RC_DISARMED;
 volatile rc_state_t drone_command_state = RC_DISARMED;
 volatile command_status_t command_status = COMMAND_STATUS_IDLE;
+volatile TickType_t command_status_last_change_tick = 0;
 
 volatile int telemetry_valid = 0;
 volatile int drone_link_ok = 0;
@@ -459,6 +461,7 @@ TaskHandle_t heartbeat_task_handle = NULL;
 TaskHandle_t mavlink_heartbeat_task_handle = NULL;
 TaskHandle_t mavlink_rx_task_handle = NULL;
 TaskHandle_t gateway_status_rx_task_handle = NULL;
+TaskHandle_t command_status_auto_clear_task_handle = NULL;
 
 static spi_device_handle_t lcd_spi = NULL;
 static uint8_t mavlink_tx_seq = 0;
@@ -1147,8 +1150,9 @@ void command_status_set(command_status_t new_status, const char *reason)
 
     if (command_status != new_status)
     {
-        command_status = new_status;
-        changed = 1;
+command_status = new_status;
+command_status_last_change_tick = xTaskGetTickCount();
+changed = 1;
     }
 
     taskEXIT_CRITICAL(&state_mux);
@@ -1172,6 +1176,32 @@ command_status_t command_status_get(void)
 
     return snapshot;
 }
+
+static void command_status_auto_clear_task(void *pvParameters)
+{
+    while (1)
+    {
+        command_status_t status;
+        TickType_t last_change;
+
+        taskENTER_CRITICAL(&state_mux);
+        status = command_status;
+        last_change = command_status_last_change_tick;
+        taskEXIT_CRITICAL(&state_mux);
+
+        TickType_t now = xTaskGetTickCount();
+
+        if ((status == COMMAND_STATUS_DENIED ||
+             status == COMMAND_STATUS_TIMEOUT) &&
+            (now - last_change) > pdMS_TO_TICKS(COMMAND_STATUS_MESSAGE_CLEAR_MS))
+        {
+            command_status_set(COMMAND_STATUS_IDLE, "temporary command status auto-cleared");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+}
+
 rc_state_t drone_command_get(void)
 {
     rc_state_t snapshot;
@@ -3215,7 +3245,7 @@ static void gateway_status_apply_to_remote(const gateway_status_packet_t *status
     switch ((gateway_action_t)status->last_action)
     {
     case GATEWAY_ACTION_ARM_REAL_SENT:
-        if (op_status == COMMAND_STATUS_ARMING || command_state == RC_ARMED)
+        if (op_status == COMMAND_STATUS_ARMING)
         {
             command_status_set(COMMAND_STATUS_ARMING, "gateway sent real ARM command");
         }
@@ -4660,6 +4690,7 @@ void app_main(void)
     printf("[BOOT] Direct MAVLink tasks disabled in secure gateway mode\n");
 #endif
     create_task_checked(system_health_task, "system_health_task", 4096, NULL, 2, &system_health_task_handle);
+    create_task_checked(command_status_auto_clear_task, "command_status_auto_clear_task", 3072, NULL, 2, &command_status_auto_clear_task_handle);
     create_task_checked(link_mode_task, "link_mode_task", 4096, NULL, 3, &link_mode_task_handle);
     create_task_checked(arm_safety_task, "arm_safety_task", 4096, NULL, 5, &arm_safety_task_handle);
     create_task_checked(lcd_task, "lcd_task", 4096, NULL, 2, &lcd_task_handle);

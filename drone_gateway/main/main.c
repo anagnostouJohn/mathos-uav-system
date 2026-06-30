@@ -68,8 +68,8 @@
     Never enable these for flight yet.
     Bench only. Props off.
 */
-#define GATEWAY_ARM_DISARM_REAL_ENABLE 1
-#define GATEWAY_ALLOW_REAL_ARM_BENCH_TEST 1
+#define GATEWAY_ARM_DISARM_REAL_ENABLE 0
+#define GATEWAY_ALLOW_REAL_ARM_BENCH_TEST 0
 
 #if GATEWAY_ARM_DISARM_REAL_ENABLE && !GATEWAY_ALLOW_REAL_ARM_BENCH_TEST
 #error "Real ARM/DISARM requires GATEWAY_ALLOW_REAL_ARM_BENCH_TEST=1"
@@ -103,6 +103,8 @@
 
 #define GATEWAY_STATUS_TX_ENABLE 1
 #define GATEWAY_STATUS_TX_PERIOD_MS 200
+
+#define GATEWAY_ACTION_STATUS_REPEAT_COUNT 5
 
 #define MATHOS_GATEWAY_ID 2
 #define MATHOS_LINK_ID_STATUS 0
@@ -180,13 +182,51 @@ static volatile uint32_t gateway_rx_replay_count = 0;
 
 static volatile rc_state_t gateway_last_remote_state = RC_DISARMED;
 static volatile uint8_t gateway_last_action = GATEWAY_ACTION_NONE;
+static volatile uint8_t gateway_last_action_repeat_remaining = 0;
 static volatile TickType_t gateway_last_remote_packet_tick = 0;
+
 
 static volatile uint8_t gateway_arm_pending = 0;
 static volatile uint8_t gateway_disarm_pending = 0;
 
 static volatile TickType_t gateway_arm_pending_start_tick = 0;
 static volatile TickType_t gateway_disarm_pending_start_tick = 0;
+
+static void gateway_action_publish(gateway_action_t action)
+{
+    gateway_last_action = (uint8_t)action;
+
+    if (action == GATEWAY_ACTION_NONE)
+    {
+        gateway_last_action_repeat_remaining = 0;
+        return;
+    }
+
+    gateway_last_action_repeat_remaining = GATEWAY_ACTION_STATUS_REPEAT_COUNT;
+}
+
+static void gateway_action_tick_after_status_send(int send_ok)
+{
+    if (!send_ok)
+    {
+        return;
+    }
+
+    if (gateway_last_action == GATEWAY_ACTION_NONE)
+    {
+        return;
+    }
+
+    if (gateway_last_action_repeat_remaining > 0)
+    {
+        gateway_last_action_repeat_remaining--;
+    }
+
+    if (gateway_last_action_repeat_remaining == 0)
+    {
+        gateway_last_action = GATEWAY_ACTION_NONE;
+    }
+}
 
 static uint8_t gateway_fc_heartbeat_is_fresh(void)
 {
@@ -399,8 +439,8 @@ static void gateway_arm_disarm_dry_run(const rc_packet_t *packet)
 
     if (packet->state == RC_ARMED)
     {
-        gateway_last_action = GATEWAY_ACTION_ARM_DRY_RUN;
-
+        
+gateway_action_publish(GATEWAY_ACTION_ARM_DRY_RUN);
         printf("[GATEWAY ARM DRY RUN] remote changed to ARMED packet_id=%lu fc=%s fc_fresh=%u ACTION=PRINT_ONLY\n",
                (unsigned long)packet->packet_id,
                gateway_fc_arm_state_to_string(gateway_fc_is_armed),
@@ -408,8 +448,8 @@ static void gateway_arm_disarm_dry_run(const rc_packet_t *packet)
     }
     else if (packet->state == RC_DISARMED)
     {
-        gateway_last_action = GATEWAY_ACTION_DISARM_DRY_RUN;
 
+gateway_action_publish(GATEWAY_ACTION_DISARM_DRY_RUN);
         printf("[GATEWAY DISARM DRY RUN] remote changed to DISARMED packet_id=%lu fc=%s fc_fresh=%u ACTION=PRINT_ONLY\n",
                (unsigned long)packet->packet_id,
                gateway_fc_arm_state_to_string(gateway_fc_is_armed),
@@ -417,8 +457,7 @@ static void gateway_arm_disarm_dry_run(const rc_packet_t *packet)
     }
     else if (packet->state == RC_FAILSAFE)
     {
-        gateway_last_action = GATEWAY_ACTION_FAILSAFE_DRY_RUN;
-
+gateway_action_publish(GATEWAY_ACTION_FAILSAFE_DRY_RUN);
         printf("[GATEWAY FAILSAFE DRY RUN] remote changed to FAILSAFE packet_id=%lu fc=%s fc_fresh=%u ACTION=PRINT_ONLY\n",
                (unsigned long)packet->packet_id,
                gateway_fc_arm_state_to_string(gateway_fc_is_armed),
@@ -462,25 +501,25 @@ static void gateway_arm_disarm_real_if_enabled(const rc_packet_t *packet)
         if (!fc_fresh)
         {
             printf("[GATEWAY ARM REAL] BLOCKED: FC heartbeat stale\n");
-            gateway_last_action = GATEWAY_ACTION_ARM_DENIED;
+            gateway_action_publish(GATEWAY_ACTION_ARM_DENIED);
         }
         else if (gateway_fc_is_armed)
         {
             printf("[GATEWAY ARM REAL] ignored: FC already ARMED\n");
-            gateway_last_action = GATEWAY_ACTION_ARM_CONFIRMED;
+           gateway_action_publish(GATEWAY_ACTION_ARM_CONFIRMED);
         }
         else if (gateway_mavlink_send_arm_disarm(1))
         {
             gateway_arm_pending = 1;
             gateway_disarm_pending = 0;
             gateway_arm_pending_start_tick = xTaskGetTickCount();
-            gateway_last_action = GATEWAY_ACTION_ARM_REAL_SENT;
-
+gateway_action_publish(GATEWAY_ACTION_ARM_REAL_SENT);
             printf("[GATEWAY ARM REAL] ARM command sent to FC\n");
         }
         else
         {
-            gateway_last_action = GATEWAY_ACTION_ARM_DENIED;
+            gateway_action_publish(GATEWAY_ACTION_ARM_DENIED);
+
             printf("[GATEWAY ARM REAL] FAILED to send ARM command\n");
         }
     }
@@ -489,25 +528,26 @@ static void gateway_arm_disarm_real_if_enabled(const rc_packet_t *packet)
         if (!fc_fresh)
         {
             printf("[GATEWAY DISARM REAL] BLOCKED: FC heartbeat stale\n");
-            gateway_last_action = GATEWAY_ACTION_DISARM_DENIED;
+            
+gateway_action_publish(GATEWAY_ACTION_DISARM_DENIED);
+
         }
         else if (!gateway_fc_is_armed)
         {
             printf("[GATEWAY DISARM REAL] ignored: FC already DISARMED\n");
-            gateway_last_action = GATEWAY_ACTION_DISARM_CONFIRMED;
+            gateway_action_publish(GATEWAY_ACTION_DISARM_CONFIRMED);
         }
         else if (gateway_mavlink_send_arm_disarm(0))
         {
             gateway_disarm_pending = 1;
             gateway_arm_pending = 0;
             gateway_disarm_pending_start_tick = xTaskGetTickCount();
-            gateway_last_action = GATEWAY_ACTION_DISARM_REAL_SENT;
-
+gateway_action_publish(GATEWAY_ACTION_DISARM_REAL_SENT);
             printf("[GATEWAY DISARM REAL] DISARM command sent to FC\n");
         }
         else
         {
-            gateway_last_action = GATEWAY_ACTION_DISARM_DENIED;
+            gateway_action_publish(GATEWAY_ACTION_DISARM_DENIED);
             printf("[GATEWAY DISARM REAL] FAILED to send DISARM command\n");
         }
     }
@@ -885,7 +925,7 @@ if (autopilot == MAV_AUTOPILOT_INVALID)
     {
         gateway_arm_pending = 0;
         gateway_disarm_pending = 0;
-        gateway_last_action = GATEWAY_ACTION_ARM_CONFIRMED;
+        gateway_action_publish(GATEWAY_ACTION_ARM_CONFIRMED);
 
         printf("[GATEWAY ARM] FC heartbeat confirmed ARMED\n");
     }
@@ -894,8 +934,7 @@ if (autopilot == MAV_AUTOPILOT_INVALID)
     {
         gateway_disarm_pending = 0;
         gateway_arm_pending = 0;
-        gateway_last_action = GATEWAY_ACTION_DISARM_CONFIRMED;
-
+gateway_action_publish(GATEWAY_ACTION_DISARM_CONFIRMED);
         printf("[GATEWAY DISARM] FC heartbeat confirmed DISARMED\n");
     }
     if (gateway_fc_heartbeat_count == 1 ||
@@ -942,11 +981,11 @@ static void gateway_handle_fc_command_ack(
     {
         if (gateway_arm_pending)
         {
-            gateway_last_action = GATEWAY_ACTION_ARM_DENIED;
+            gateway_action_publish(GATEWAY_ACTION_ARM_DENIED);
         }
         else if (gateway_disarm_pending)
         {
-            gateway_last_action = GATEWAY_ACTION_DISARM_DENIED;
+            gateway_action_publish(GATEWAY_ACTION_DISARM_DENIED);
         }
 
         gateway_arm_pending = 0;
@@ -1587,8 +1626,7 @@ static void gateway_arm_disarm_pending_timeout_check(void)
         (now - gateway_arm_pending_start_tick) > pdMS_TO_TICKS(GATEWAY_ARM_PENDING_TIMEOUT_MS))
     {
         gateway_arm_pending = 0;
-        gateway_last_action = GATEWAY_ACTION_ARM_TIMEOUT;
-
+gateway_action_publish(GATEWAY_ACTION_ARM_TIMEOUT);
         printf("[GATEWAY ARM] TIMEOUT waiting for FC armed heartbeat\n");
     }
 
@@ -1596,8 +1634,7 @@ static void gateway_arm_disarm_pending_timeout_check(void)
         (now - gateway_disarm_pending_start_tick) > pdMS_TO_TICKS(GATEWAY_ARM_PENDING_TIMEOUT_MS))
     {
         gateway_disarm_pending = 0;
-        gateway_last_action = GATEWAY_ACTION_DISARM_TIMEOUT;
-
+gateway_action_publish(GATEWAY_ACTION_DISARM_TIMEOUT);
         printf("[GATEWAY DISARM] TIMEOUT waiting for FC disarmed heartbeat\n");
     }
 
@@ -1613,25 +1650,26 @@ static void gateway_status_tx_task(void *pvParameters)
     while (1)
     {
         gateway_arm_disarm_pending_timeout_check();
-        int ok = gateway_status_send_once();
-        
+int ok = gateway_status_send_once();
 
-        print_counter++;
+print_counter++;
 
-        if (print_counter == 1 || (print_counter % 10) == 0)
-        {
-            printf("[GATEWAY STATUS TX] %s fc=%s fc_fresh=%u remote=%s action=%s ok_count=%lu bad_count=%lu replay_count=%lu\n",
-                   ok ? "OK" : "FAILED",
-                   gateway_fc_arm_state_to_string(gateway_fc_is_armed),
-                   gateway_fc_heartbeat_is_fresh(),
-                   state_to_string(gateway_last_remote_state),
-                   gateway_action_to_string(gateway_last_action),
-                   (unsigned long)gateway_rx_ok_count,
-                   (unsigned long)gateway_rx_bad_count,
-                   (unsigned long)gateway_rx_replay_count);
-        }
+if (print_counter == 1 || (print_counter % 10) == 0)
+{
+    printf("[GATEWAY STATUS TX] %s fc=%s fc_fresh=%u remote=%s action=%s ok_count=%lu bad_count=%lu replay_count=%lu\n",
+           ok ? "OK" : "FAILED",
+           gateway_fc_arm_state_to_string(gateway_fc_is_armed),
+           gateway_fc_heartbeat_is_fresh(),
+           state_to_string(gateway_last_remote_state),
+           gateway_action_to_string(gateway_last_action),
+           (unsigned long)gateway_rx_ok_count,
+           (unsigned long)gateway_rx_bad_count,
+           (unsigned long)gateway_rx_replay_count);
+}
 
-        vTaskDelay(pdMS_TO_TICKS(GATEWAY_STATUS_TX_PERIOD_MS));
+gateway_action_tick_after_status_send(ok);
+
+vTaskDelay(pdMS_TO_TICKS(GATEWAY_STATUS_TX_PERIOD_MS));
     }
 }
 void app_main(void)
