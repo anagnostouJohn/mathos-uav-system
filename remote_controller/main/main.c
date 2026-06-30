@@ -1115,6 +1115,28 @@ const char *link_mode_to_string(link_mode_t mode)
         return "UNKNOWN";
     }
 }
+
+rc_state_t drone_command_get(void)
+{
+    rc_state_t snapshot;
+
+    taskENTER_CRITICAL(&state_mux);
+    snapshot = drone_command_state;
+    taskEXIT_CRITICAL(&state_mux);
+
+    return snapshot;
+}
+
+rc_state_t drone_get_state(void)
+{
+    rc_state_t snapshot;
+
+    taskENTER_CRITICAL(&state_mux);
+    snapshot = drone_state;
+    taskEXIT_CRITICAL(&state_mux);
+
+    return snapshot;
+}
 const char *command_status_to_string(command_status_t status)
 {
     switch (status)
@@ -1191,38 +1213,31 @@ static void command_status_auto_clear_task(void *pvParameters)
 
         TickType_t now = xTaskGetTickCount();
 
-        if ((status == COMMAND_STATUS_DENIED ||
-             status == COMMAND_STATUS_TIMEOUT) &&
-            (now - last_change) > pdMS_TO_TICKS(COMMAND_STATUS_MESSAGE_CLEAR_MS))
-        {
-            command_status_set(COMMAND_STATUS_IDLE, "temporary command status auto-cleared");
-        }
+if ((status == COMMAND_STATUS_DENIED ||
+     status == COMMAND_STATUS_TIMEOUT) &&
+    (now - last_change) > pdMS_TO_TICKS(COMMAND_STATUS_MESSAGE_CLEAR_MS))
+{
+    rc_state_t command_state = drone_command_get();
+    rc_state_t actual_state = drone_get_state();
+
+    /*
+        Do not hide a failed DISARM while the gateway/FC still reports ARMED.
+        Keep DENIED/TIMEOUT visible until the state changes.
+    */
+    if (command_state == RC_DISARMED && actual_state == RC_ARMED)
+    {
+        vTaskDelay(pdMS_TO_TICKS(250));
+        continue;
+    }
+
+    command_status_set(COMMAND_STATUS_IDLE, "temporary command status auto-cleared");
+}
 
         vTaskDelay(pdMS_TO_TICKS(250));
     }
 }
 
-rc_state_t drone_command_get(void)
-{
-    rc_state_t snapshot;
 
-    taskENTER_CRITICAL(&state_mux);
-    snapshot = drone_command_state;
-    taskEXIT_CRITICAL(&state_mux);
-
-    return snapshot;
-}
-
-rc_state_t drone_get_state(void)
-{
-    rc_state_t snapshot;
-
-    taskENTER_CRITICAL(&state_mux);
-    snapshot = drone_state;
-    taskEXIT_CRITICAL(&state_mux);
-
-    return snapshot;
-}
 
 static void frame_put_u32_le(uint8_t *buffer, int *index, uint32_t value)
 {

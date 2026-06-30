@@ -31,7 +31,18 @@
 #define GATEWAY_FC_UART_BAUD 115200
 
 #define GATEWAY_MAVLINK_HEARTBEAT_ENABLE 1
-#define GATEWAY_MAVLINK_MANUAL_CONTROL_ENABLE 0
+#define GATEWAY_MAVLINK_MANUAL_CONTROL_ENABLE 1
+
+#define GATEWAY_MANUAL_CONTROL_PERIOD_MS 20
+#define GATEWAY_CONTROL_LINK_FRESH_MS 250
+
+/*
+    Bench safety:
+    Keep this 0.
+    If 1, gateway may pass pitch/roll/yaw while FC is disarmed.
+    Do NOT enable unless props are off and you only test in Mission Planner.
+*/
+#define GATEWAY_MANUAL_CONTROL_DISARMED_BENCH_TEST 0
 
 #define MAVLINK2_STX 0xFD
 
@@ -49,6 +60,10 @@
 #define MAVLINK_VERSION_FIELD 3
 #define MAVLINK1_STX 0xFE
 #define MAVLINK_MAX_FRAME_LEN (10 + 255 + 2 + 13)
+
+#define MAVLINK_MSG_ID_MANUAL_CONTROL 69
+#define MAVLINK_MSG_MANUAL_CONTROL_LEN 11
+#define MAVLINK_MSG_MANUAL_CONTROL_CRC_EXTRA 243
 
 #define MAV_MODE_FLAG_SAFETY_ARMED 0x80
 #define GATEWAY_FC_HEARTBEAT_PRINT_EVERY 1
@@ -109,6 +124,9 @@
 #define MATHOS_GATEWAY_ID 2
 #define MATHOS_LINK_ID_STATUS 0
 #define MATHOS_PAYLOAD_TYPE_GATEWAY_STATUS 2
+
+#define MATHOS_REMOTE_CONTROLLER_ID 1
+#define MATHOS_PAYLOAD_TYPE_RC 1
 
 #define GATEWAY_REMOTE_LINK_FRESH_MS 1000
 
@@ -191,6 +209,20 @@ static volatile uint8_t gateway_disarm_pending = 0;
 
 static volatile TickType_t gateway_arm_pending_start_tick = 0;
 static volatile TickType_t gateway_disarm_pending_start_tick = 0;
+
+static portMUX_TYPE gateway_rc_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static rc_packet_t gateway_latest_rc_packet = {
+    .packet_id = 0,
+    .state = RC_DISARMED,
+    .throttle = 0,
+    .yaw = 0,
+    .pitch = 0,
+    .roll = 0,
+};
+
+static volatile uint8_t gateway_latest_rc_valid = 0;
+static volatile TickType_t gateway_latest_rc_tick = 0;
 
 static void gateway_action_publish(gateway_action_t action)
 {
@@ -353,6 +385,60 @@ static int gateway_rc_packet_is_valid(const rc_packet_t *packet)
     }
 
     if (packet->roll < -1000 || packet->roll > 1000)
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
+static void gateway_latest_rc_update(const rc_packet_t *packet)
+{
+    if (packet == NULL)
+    {
+        return;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+
+    taskENTER_CRITICAL(&gateway_rc_mux);
+
+    gateway_latest_rc_packet = *packet;
+    gateway_latest_rc_valid = 1;
+    gateway_latest_rc_tick = now;
+
+    taskEXIT_CRITICAL(&gateway_rc_mux);
+}
+
+static void gateway_latest_rc_get(
+    rc_packet_t *packet,
+    TickType_t *last_tick,
+    uint8_t *valid)
+{
+    if (packet == NULL || last_tick == NULL || valid == NULL)
+    {
+        return;
+    }
+
+    taskENTER_CRITICAL(&gateway_rc_mux);
+
+    *packet = gateway_latest_rc_packet;
+    *last_tick = gateway_latest_rc_tick;
+    *valid = gateway_latest_rc_valid;
+
+    taskEXIT_CRITICAL(&gateway_rc_mux);
+}
+
+static uint8_t gateway_remote_control_is_fresh(TickType_t last_tick, uint8_t valid)
+{
+    if (!valid || last_tick == 0)
+    {
+        return 0;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+
+    if ((now - last_tick) > pdMS_TO_TICKS(GATEWAY_CONTROL_LINK_FRESH_MS))
     {
         return 0;
     }
@@ -611,6 +697,43 @@ gateway_rx_bad_count = bad_count;
         return;
     }
 
+
+    if (packet.controller_id != MATHOS_REMOTE_CONTROLLER_ID)
+{
+    bad_count++;
+    gateway_rx_bad_count = bad_count;
+
+    printf("[GATEWAY] bad controller_id=%u expected=%u\n",
+           packet.controller_id,
+           MATHOS_REMOTE_CONTROLLER_ID);
+
+    return;
+}
+
+if (packet.payload_type != MATHOS_PAYLOAD_TYPE_RC)
+{
+    bad_count++;
+    gateway_rx_bad_count = bad_count;
+
+    printf("[GATEWAY] bad payload_type=%u expected=%u\n",
+           packet.payload_type,
+           MATHOS_PAYLOAD_TYPE_RC);
+
+    return;
+}
+
+if (packet.payload_len != sizeof(rc_packet_t))
+{
+    bad_count++;
+    gateway_rx_bad_count = bad_count;
+
+    printf("[GATEWAY] invalid RC payload size. got=%u expected=%u seq=%lu\n",
+           packet.payload_len,
+           (unsigned int)sizeof(rc_packet_t),
+           (unsigned long)packet.sequence);
+
+    return;
+}
     /*
         DEV MODE:
         packet.timestamp_ms is currently used as session_id.
@@ -646,42 +769,38 @@ gateway_rx_replay_count = replay_count;
 
         return;
     }
-
     last_sequence = packet.sequence;
-    ok_count++;
+
+rc_packet_t rc_packet;
+memset(&rc_packet, 0, sizeof(rc_packet));
+
+memcpy(&rc_packet, packet.payload, sizeof(rc_packet_t));
+
+if (!gateway_rc_packet_is_valid(&rc_packet))
+{
+    bad_count++;
+    gateway_rx_bad_count = bad_count;
+
+    printf("[GATEWAY] decrypted RC INVALID packet_id=%lu state=%d throttle=%d yaw=%d pitch=%d roll=%d seq=%lu\n",
+           (unsigned long)rc_packet.packet_id,
+           rc_packet.state,
+           rc_packet.throttle,
+           rc_packet.yaw,
+           rc_packet.pitch,
+           rc_packet.roll,
+           (unsigned long)packet.sequence);
+
+    return;
+}
+
+ok_count++;
 gateway_rx_ok_count = ok_count;
-gateway_last_remote_packet_tick = xTaskGetTickCount();
-    rc_packet_t rc_packet;
-    memset(&rc_packet, 0, sizeof(rc_packet));
 
-    if (packet.payload_len == sizeof(rc_packet_t))
-    {
-        memcpy(&rc_packet, packet.payload, sizeof(rc_packet_t));
-    }
-    else
-    {
-        printf("[GATEWAY] invalid RC payload size. got=%u expected=%u seq=%lu\n",
-               packet.payload_len,
-               (unsigned int)sizeof(rc_packet_t),
-               (unsigned long)packet.sequence);
-
-        return;
-    }
-
-    if (!gateway_rc_packet_is_valid(&rc_packet))
-    {
-        printf("[GATEWAY] decrypted RC INVALID packet_id=%lu state=%d throttle=%d yaw=%d pitch=%d roll=%d seq=%lu\n",
-               (unsigned long)rc_packet.packet_id,
-               rc_packet.state,
-               rc_packet.throttle,
-               rc_packet.yaw,
-               rc_packet.pitch,
-               rc_packet.roll,
-               (unsigned long)packet.sequence);
-
-        return;
-    }
 gateway_last_remote_state = rc_packet.state;
+gateway_last_remote_packet_tick = xTaskGetTickCount();
+
+gateway_latest_rc_update(&rc_packet);
+
 
 gateway_arm_disarm_dry_run(&rc_packet);
 gateway_arm_disarm_real_if_enabled(&rc_packet);
@@ -840,6 +959,11 @@ static void gateway_mav_put_u16_le(uint8_t *buffer, int *index, uint16_t value)
 {
     buffer[(*index)++] = (uint8_t)((value >> 0) & 0xFF);
     buffer[(*index)++] = (uint8_t)((value >> 8) & 0xFF);
+}
+
+static void gateway_mav_put_i16_le(uint8_t *buffer, int *index, int16_t value)
+{
+    gateway_mav_put_u16_le(buffer, index, (uint16_t)value);
 }
 
 static void gateway_mav_put_float_le(uint8_t *buffer, int *index, float value)
@@ -1344,7 +1468,104 @@ static int gateway_mavlink_send_message(
 
 #endif
 }
+static int gateway_mavlink_send_manual_control(
+    const rc_packet_t *packet,
+    uint8_t remote_fresh)
+{
+#if GATEWAY_MAVLINK_MANUAL_CONTROL_ENABLE
 
+    uint8_t payload[MAVLINK_MSG_MANUAL_CONTROL_LEN];
+    int p = 0;
+
+    int16_t x_pitch = 0;
+    int16_t y_roll = 0;
+    int16_t z_throttle = 0;
+    int16_t r_yaw = 0;
+
+    uint16_t buttons = 0;
+
+    uint8_t fc_fresh = gateway_fc_heartbeat_is_fresh();
+
+    if (packet != NULL &&
+        remote_fresh &&
+        fc_fresh &&
+        packet->state == RC_ARMED)
+    {
+#if GATEWAY_MANUAL_CONTROL_DISARMED_BENCH_TEST
+        /*
+            Bench only:
+            allows visible stick movement in Mission Planner while FC is disarmed.
+        */
+        x_pitch = gateway_clamp_i16(packet->pitch, -1000, 1000);
+        y_roll = gateway_clamp_i16(packet->roll, -1000, 1000);
+        z_throttle = gateway_clamp_i16(packet->throttle, 0, 1000);
+        r_yaw = gateway_clamp_i16(packet->yaw, -1000, 1000);
+#else
+        /*
+            Normal safety:
+            only pass real control if FC is actually armed.
+        */
+        if (gateway_fc_is_armed)
+        {
+            x_pitch = gateway_clamp_i16(packet->pitch, -1000, 1000);
+            y_roll = gateway_clamp_i16(packet->roll, -1000, 1000);
+            z_throttle = gateway_clamp_i16(packet->throttle, 0, 1000);
+            r_yaw = gateway_clamp_i16(packet->yaw, -1000, 1000);
+        }
+#endif
+    }
+
+    /*
+        MANUAL_CONTROL payload order:
+        int16 x
+        int16 y
+        int16 z
+        int16 r
+        uint16 buttons
+        uint8 target
+    */
+    gateway_mav_put_i16_le(payload, &p, x_pitch);
+    gateway_mav_put_i16_le(payload, &p, y_roll);
+    gateway_mav_put_i16_le(payload, &p, z_throttle);
+    gateway_mav_put_i16_le(payload, &p, r_yaw);
+    gateway_mav_put_u16_le(payload, &p, buttons);
+
+    payload[p++] = MAVLINK_TARGET_SYS_ID;
+
+    if (p != MAVLINK_MSG_MANUAL_CONTROL_LEN)
+    {
+        return 0;
+    }
+
+    static uint32_t manual_print_counter = 0;
+
+    manual_print_counter++;
+
+    if (manual_print_counter == 1 || (manual_print_counter % 50) == 0)
+    {
+        printf("[GATEWAY MAVLINK TX] MANUAL_CONTROL remote_fresh=%u fc_fresh=%u fc=%s remote=%s x_pitch=%d y_roll=%d z_throttle=%d r_yaw=%d\n",
+               remote_fresh,
+               fc_fresh,
+               gateway_fc_arm_state_to_string(gateway_fc_is_armed),
+               packet ? state_to_string(packet->state) : "NONE",
+               x_pitch,
+               y_roll,
+               z_throttle,
+               r_yaw);
+    }
+
+    return gateway_mavlink_send_message(
+        MAVLINK_MSG_ID_MANUAL_CONTROL,
+        payload,
+        MAVLINK_MSG_MANUAL_CONTROL_LEN,
+        MAVLINK_MSG_MANUAL_CONTROL_CRC_EXTRA);
+
+#else
+
+    return 1;
+
+#endif
+}
 
 static int gateway_mavlink_send_arm_disarm(int arm)
 {
@@ -1641,6 +1862,34 @@ gateway_action_publish(GATEWAY_ACTION_DISARM_TIMEOUT);
 #endif
 }
 
+
+static void gateway_mavlink_manual_control_task(void *pvParameters)
+{
+    TickType_t last_wake = xTaskGetTickCount();
+    const TickType_t period = pdMS_TO_TICKS(GATEWAY_MANUAL_CONTROL_PERIOD_MS);
+
+    printf("[GATEWAY MAVLINK] MANUAL_CONTROL task started period=%d ms\n",
+           GATEWAY_MANUAL_CONTROL_PERIOD_MS);
+
+    while (1)
+    {
+        rc_packet_t packet;
+        TickType_t last_tick;
+        uint8_t valid;
+
+        gateway_latest_rc_get(&packet, &last_tick, &valid);
+
+        uint8_t remote_fresh = gateway_remote_control_is_fresh(last_tick, valid);
+
+        if (!gateway_mavlink_send_manual_control(&packet, remote_fresh))
+        {
+            printf("[GATEWAY MAVLINK TX] MANUAL_CONTROL send FAILED\n");
+        }
+
+        vTaskDelayUntil(&last_wake, period);
+    }
+}
+
 static void gateway_status_tx_task(void *pvParameters)
 {
     uint32_t print_counter = 0;
@@ -1713,4 +1962,8 @@ printf("[GATEWAY STATUS] session_id=0x%08lx\n",
     xTaskCreate(gateway_mavlink_heartbeat_task, "gateway_mavlink_heartbeat_task", 4096, NULL, 3, NULL);
     xTaskCreate(gateway_fc_mavlink_rx_task, "gateway_fc_mavlink_rx_task", 4096, NULL, 4, NULL);
     xTaskCreate(gateway_status_tx_task, "gateway_status_tx_task", 4096, NULL, 3, NULL);
+
+    #if GATEWAY_MAVLINK_MANUAL_CONTROL_ENABLE
+    xTaskCreate(gateway_mavlink_manual_control_task, "gateway_manual_control_task", 4096, NULL, 4, NULL);
+#endif
 }
