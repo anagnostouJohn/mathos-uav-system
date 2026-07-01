@@ -38,7 +38,7 @@
 #define TEST_FIXED_ROLL -300
 
 #define JOYSTICK_RAW_DIAGNOSTIC 0
-#define JOYSTICK_DIAG_PRINT_EVERY 200
+#define JOYSTICK_DIAG_PRINT_EVERY 100
 
 #define BUTTON_PIN_ARM 12
 #define BUTTON_PIN_FAILSAFE 13 //<<<<<<<<<<<<<<<<<<<
@@ -169,13 +169,28 @@
 #define DEBUG_SECURITY_TIMING 1
 #define DEBUG_HEARTBEAT_TX 0
 #define DEBUG_MAVLINK_RX_CRC 0
-#define DEBUG_SECURE_WIRE_TEST 1
+#define DEBUG_SECURE_WIRE_TEST 0
 #define SECURE_WIRE_TEST_PRINT_EVERY 100
+#define DEBUG_RC_PACKET_TX 1
+#define RC_PACKET_TX_PRINT_EVERY 50
 ///////////////////FEATURE FLAGS//////////////////
 #define FEATURE_SECURITY_SKELETON 1
 #define FEATURE_WIFI_TELEMETRY 0
 #define FEATURE_SECURE_GATEWAY_MODE 1
 #define FEATURE_DIRECT_MAVLINK_MODE 0
+
+/*
+    Bench mode only.
+
+    When gateway real ARM/DISARM is disabled, the gateway sends
+    ARM_DRY_RUN / DISARM_DRY_RUN instead of real FC confirmation.
+
+    This lets the remote clear ARMING / DISARMING during bench tests,
+    so we can verify joystick packet flow through the gateway.
+
+    Set this to 0 before real ARM/DISARM testing.
+*/
+#define FEATURE_TREAT_GATEWAY_DRY_RUN_AS_CONFIRMED 1
 
 #if FEATURE_DIRECT_MAVLINK_MODE && FEATURE_SECURE_GATEWAY_MODE
 #error "Only one control mode can be enabled: DIRECT MAVLINK or SECURE GATEWAY"
@@ -255,6 +270,9 @@ typedef enum
     RC_ARMED = 1,
     RC_FAILSAFE = 2
 } rc_state_t;
+
+rc_state_t drone_command_get(void);
+rc_state_t drone_get_state(void);
 
 typedef enum
 {
@@ -1115,28 +1133,6 @@ const char *link_mode_to_string(link_mode_t mode)
         return "UNKNOWN";
     }
 }
-
-rc_state_t drone_command_get(void)
-{
-    rc_state_t snapshot;
-
-    taskENTER_CRITICAL(&state_mux);
-    snapshot = drone_command_state;
-    taskEXIT_CRITICAL(&state_mux);
-
-    return snapshot;
-}
-
-rc_state_t drone_get_state(void)
-{
-    rc_state_t snapshot;
-
-    taskENTER_CRITICAL(&state_mux);
-    snapshot = drone_state;
-    taskEXIT_CRITICAL(&state_mux);
-
-    return snapshot;
-}
 const char *command_status_to_string(command_status_t status)
 {
     switch (status)
@@ -1172,9 +1168,9 @@ void command_status_set(command_status_t new_status, const char *reason)
 
     if (command_status != new_status)
     {
-command_status = new_status;
-command_status_last_change_tick = xTaskGetTickCount();
-changed = 1;
+        command_status = new_status;
+        command_status_last_change_tick = xTaskGetTickCount();
+        changed = 1;
     }
 
     taskEXIT_CRITICAL(&state_mux);
@@ -1213,31 +1209,51 @@ static void command_status_auto_clear_task(void *pvParameters)
 
         TickType_t now = xTaskGetTickCount();
 
-if ((status == COMMAND_STATUS_DENIED ||
-     status == COMMAND_STATUS_TIMEOUT) &&
-    (now - last_change) > pdMS_TO_TICKS(COMMAND_STATUS_MESSAGE_CLEAR_MS))
+        if ((status == COMMAND_STATUS_DENIED ||
+             status == COMMAND_STATUS_TIMEOUT) &&
+            (now - last_change) > pdMS_TO_TICKS(COMMAND_STATUS_MESSAGE_CLEAR_MS))
+        {
+            rc_state_t command_state = drone_command_get();
+            rc_state_t actual_state = drone_get_state();
+
+            /*
+                Do not hide a failed DISARM while the gateway/FC still reports ARMED.
+                Keep DENIED/TIMEOUT visible until the state changes.
+            */
+            if (command_state == RC_DISARMED && actual_state == RC_ARMED)
+            {
+                vTaskDelay(pdMS_TO_TICKS(250));
+                continue;
+            }
+
+            command_status_set(COMMAND_STATUS_IDLE, "temporary command status auto-cleared");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+}
+
+rc_state_t drone_command_get(void)
 {
-    rc_state_t command_state = drone_command_get();
-    rc_state_t actual_state = drone_get_state();
+    rc_state_t snapshot;
 
-    /*
-        Do not hide a failed DISARM while the gateway/FC still reports ARMED.
-        Keep DENIED/TIMEOUT visible until the state changes.
-    */
-    if (command_state == RC_DISARMED && actual_state == RC_ARMED)
-    {
-        vTaskDelay(pdMS_TO_TICKS(250));
-        continue;
-    }
+    taskENTER_CRITICAL(&state_mux);
+    snapshot = drone_command_state;
+    taskEXIT_CRITICAL(&state_mux);
 
-    command_status_set(COMMAND_STATUS_IDLE, "temporary command status auto-cleared");
+    return snapshot;
 }
 
-        vTaskDelay(pdMS_TO_TICKS(250));
-    }
+rc_state_t drone_get_state(void)
+{
+    rc_state_t snapshot;
+
+    taskENTER_CRITICAL(&state_mux);
+    snapshot = drone_state;
+    taskEXIT_CRITICAL(&state_mux);
+
+    return snapshot;
 }
-
-
 
 static void frame_put_u32_le(uint8_t *buffer, int *index, uint32_t value)
 {
@@ -2859,7 +2875,28 @@ void system_health_task(void *pvParameters)
         {
             fault_clear(FAULT_HEAP_LOW);
         }
+#if FEATURE_SECURE_GATEWAY_MODE
+        int gateway_fresh = gateway_status_is_fresh();
 
+        if (!gateway_fresh)
+        {
+            fault_set(FAULT_TELEMETRY_STALE);
+            fault_set(FAULT_DRONE_LINK_BAD);
+        }
+        else
+        {
+            fault_clear(FAULT_TELEMETRY_STALE);
+            fault_clear(FAULT_DRONE_LINK_BAD);
+        }
+
+        if (command_state == RC_ARMED && !gateway_fresh)
+        {
+            enter_failsafe("gateway status stale while armed");
+            command_state = RC_FAILSAFE;
+
+            printf("[HEALTH] FAILSAFE: gateway status stale while ARMED\n");
+        }
+#endif
 #if FEATURE_DIRECT_MAVLINK_MODE
 
         if (command_state == RC_ARMED && !telemetry_fresh)
@@ -3259,24 +3296,58 @@ static void gateway_status_apply_to_remote(const gateway_status_packet_t *status
 
     switch ((gateway_action_t)status->last_action)
     {
-    case GATEWAY_ACTION_ARM_REAL_SENT:
+            case GATEWAY_ACTION_ARM_DRY_RUN:
+#if FEATURE_TREAT_GATEWAY_DRY_RUN_AS_CONFIRMED
+        if (op_status == COMMAND_STATUS_ARMING)
+        {
+            /*
+                Bench only:
+                Gateway accepted the ARM request in dry-run mode.
+
+                We do NOT mark the real drone/FC as armed here.
+                status->fc_is_armed is still the truth for the real FC.
+
+                We only clear ARMING so radio_tx_task can send real
+                joystick values to the gateway for bench verification.
+            */
+            drone_command_set(RC_ARMED, "gateway ARM dry-run accepted");
+            command_status_set(COMMAND_STATUS_IDLE, "gateway ARM dry-run accepted");
+
+            printf("[REMOTE BENCH] ARM DRY RUN accepted by gateway\n");
+        }
+#endif
+        break;
+
+    case GATEWAY_ACTION_DISARM_DRY_RUN:
+#if FEATURE_TREAT_GATEWAY_DRY_RUN_AS_CONFIRMED
+        if (op_status == COMMAND_STATUS_DISARMING)
+        {
+            drone_command_set(RC_DISARMED, "gateway DISARM dry-run accepted");
+            drone_set_state(RC_DISARMED, "gateway DISARM dry-run accepted");
+            command_status_set(COMMAND_STATUS_IDLE, "gateway DISARM dry-run accepted");
+
+            printf("[REMOTE BENCH] DISARM DRY RUN accepted by gateway\n");
+        }
+#endif
+        break;
+    case GATEWAY_ACTION_ARM_REAL_SENT: //<<<<<<<<<<<<<<<<<<<<<<<<<<<<
         if (op_status == COMMAND_STATUS_ARMING)
         {
             command_status_set(COMMAND_STATUS_ARMING, "gateway sent real ARM command");
         }
         break;
 
-case GATEWAY_ACTION_ARM_CONFIRMED:
-    if (status->fc_is_armed &&
-        op_status == COMMAND_STATUS_ARMING)
-    {
-        drone_command_set(RC_ARMED, "gateway confirmed FC armed");
-        drone_set_state(RC_ARMED, "gateway confirmed FC armed");
-        command_status_set(COMMAND_STATUS_IDLE, "gateway confirmed FC armed");
+    case GATEWAY_ACTION_ARM_CONFIRMED:
+        if (status->fc_is_armed &&
+            op_status == COMMAND_STATUS_ARMING)
+        {
+            drone_command_set(RC_ARMED, "gateway confirmed FC armed");
+            drone_set_state(RC_ARMED, "gateway confirmed FC armed");
+            command_status_set(COMMAND_STATUS_IDLE, "gateway confirmed FC armed");
 
-        printf("[REMOTE] ARM CONFIRMED by gateway/FC\n");
-    }
-    break;
+            printf("[REMOTE] ARM CONFIRMED by gateway/FC\n");
+        }
+        break;
 
     case GATEWAY_ACTION_ARM_DENIED:
         if (op_status == COMMAND_STATUS_ARMING)
@@ -3719,9 +3790,9 @@ void controller_task(void *pvParameters)
                 Button does nothing.
                 arm_safety_task handles emergency if it was armed.
             */
-            if (!master_enabled)
+            if (!master_enabled && event.type == EVENT_BUTTON_ARM_PRESS)
             {
-                printf("[CONTROLLER] Button ignored: MASTER switch is OFF\n");
+                printf("[CONTROLLER] ARM ignored: MASTER switch is OFF\n");
                 continue;
             }
 
@@ -3943,6 +4014,7 @@ void radio_tx_task(void *pvParameters)
 
         rc_state_t command_state = drone_command_get();
         command_status_t op_status = command_status_get();
+        int input_fresh = rc_input_is_fresh();
 
 #if TEST_FIXED_MANUAL_CONTROL
 
@@ -3964,7 +4036,7 @@ void radio_tx_task(void *pvParameters)
         if (command_state != RC_ARMED ||
             op_status == COMMAND_STATUS_ARMING ||
             op_status == COMMAND_STATUS_DISARMING ||
-            !rc_input_is_fresh())
+            !input_fresh)
         {
             throttle_to_send = 0;
             yaw_to_send = 0;
@@ -3982,6 +4054,42 @@ void radio_tx_task(void *pvParameters)
             .pitch = pitch_to_send,
             .roll = roll_to_send,
         };
+#if DEBUG_RC_PACKET_TX
+        static uint32_t rc_tx_print_counter = 0;
+        static rc_state_t last_print_state = (rc_state_t)-1;
+        static command_status_t last_print_status = (command_status_t)-1;
+
+        int print_now = 0;
+
+        rc_tx_print_counter++;
+
+        if (rc_tx_print_counter >= RC_PACKET_TX_PRINT_EVERY)
+        {
+            rc_tx_print_counter = 0;
+            print_now = 1;
+        }
+
+        if (last_print_state != packet.state ||
+            last_print_status != op_status)
+        {
+            last_print_state = packet.state;
+            last_print_status = op_status;
+            print_now = 1;
+        }
+
+        if (print_now)
+        {
+            printf("[RC TX] packet_id=%lu state=%s op=%s input=%s throttle=%d yaw=%d pitch=%d roll=%d\n",
+                (unsigned long)packet.packet_id,
+                state_to_string(packet.state),
+                command_status_to_string(op_status),
+                input_fresh ? "FRESH" : "STALE",
+                packet.throttle,
+                packet.yaw,
+                packet.pitch,
+                packet.roll);
+        }
+#endif
 #if SECURITY_SKELETON_DIAGNOSTIC
 
         int64_t security_start_us = esp_timer_get_time();
@@ -3996,108 +4104,132 @@ void radio_tx_task(void *pvParameters)
 
             security_status =
                 security_verify_packet_basic(&secure_packet, &security_test_last_sequence);
-
-            int64_t security_work_us = esp_timer_get_time() - security_start_us;
-#if DEBUG_SECURE_WIRE_TEST
-            static uint32_t wire_print_counter = 0;
-            static uint32_t wire_last_accepted_sequence = 0;
+//////////////////////////////////////////////
 
             mathos_secure_packet_t wire_packet;
-            mathos_secure_packet_t decoded_wire_packet;
-            mathos_secure_status_t encrypt_status = MATHOS_SECURE_STATUS_BAD_ARGUMENT;
-            mathos_secure_status_t decrypt_status = MATHOS_SECURE_STATUS_BAD_ARGUMENT;
-            int payload_match = 0;
-            secure_packet_t decoded_secure_packet;
-
             uint8_t wire_frame[MATHOS_WIRE_MAX_FRAME_LEN];
             size_t wire_frame_len = 0;
 
+            mathos_secure_status_t encrypt_status = MATHOS_SECURE_STATUS_BAD_ARGUMENT;
             mathos_status_t encode_status = MATHOS_STATUS_BAD_ARGUMENT;
-            mathos_status_t decode_status = MATHOS_STATUS_BAD_ARGUMENT;
-            security_status_t decoded_security_status = SECURITY_STATUS_BAD_ARGUMENT;
-            if (mathos_from_local_secure_packet(&secure_packet, &wire_packet))
+
+            int link_send_ok = 0;
+
+            if (security_status == SECURITY_STATUS_OK &&
+                mathos_from_local_secure_packet(&secure_packet, &wire_packet))
             {
                 encrypt_status = mathos_secure_encrypt_packet(&wire_packet);
 
                 if (encrypt_status == MATHOS_SECURE_STATUS_OK)
                 {
-                    mathos_secure_packet_t packet_to_send;
-                    memcpy(&packet_to_send, &wire_packet, sizeof(packet_to_send));
-
-#if DEBUG_CRYPTO_TAMPER_TEST
-                    if ((packet_to_send.sequence % CRYPTO_TAMPER_EVERY) == 0 &&
-                        packet_to_send.payload_len > 0)
-                    {
-                        packet_to_send.payload[0] ^= 0x01;
-
-                        printf("[TAMPER TEST] damaged encrypted payload byte seq=%lu\n",
-                               (unsigned long)packet_to_send.sequence);
-                    }
-#endif
-
                     encode_status = mathos_wire_encode(
-                        &packet_to_send,
+                        &wire_packet,
                         wire_frame,
                         sizeof(wire_frame),
                         &wire_frame_len);
-                    // if (encrypt_status == MATHOS_SECURE_STATUS_OK)
-                    // {
-                    //     encode_status = mathos_wire_encode(
-                    //         &wire_packet,
-                    //         wire_frame,
-                    //         sizeof(wire_frame),
-                    //         &wire_frame_len);
 
-                    if (encode_status == MATHOS_STATUS_OK)
+                if (encode_status == MATHOS_STATUS_OK)
+                {
+                #if FEATURE_LINK_UART_TX
+                    link_send_ok = link_uart_send_frame(wire_frame, wire_frame_len);
+
+                    static uint32_t link_uart_ok_count = 0;
+
+                    if (link_send_ok)
                     {
-#if FEATURE_LINK_UART_TX
-                        if (!link_uart_send_frame(wire_frame, wire_frame_len))
+                        link_uart_ok_count++;
+
+                        if ((link_uart_ok_count % 50) == 1)
                         {
-                            static uint32_t link_uart_fail_count = 0;
-                            link_uart_fail_count++;
-
-                            if ((link_uart_fail_count % 50) == 1)
-                            {
-                                printf("[LINK UART] TX FAILED count=%lu\n",
-                                       (unsigned long)link_uart_fail_count);
-                            }
+                            printf("[LINK UART] TX OK count=%lu len=%u seq=%lu\n",
+                                (unsigned long)link_uart_ok_count,
+                                (unsigned int)wire_frame_len,
+                                (unsigned long)secure_packet.sequence);
                         }
-#endif
-
-                        decode_status = mathos_wire_decode(
-                            wire_frame,
-                            wire_frame_len,
-                            &decoded_wire_packet);
-
-                        if (decode_status == MATHOS_STATUS_OK)
-                        {
-                            decrypt_status = mathos_secure_decrypt_packet(&decoded_wire_packet);
-
-                            if (decrypt_status == MATHOS_SECURE_STATUS_OK &&
-                                decoded_wire_packet.payload_len == secure_packet.payload_len &&
-                                memcmp(decoded_wire_packet.payload,
-                                       secure_packet.payload,
-                                       secure_packet.payload_len) == 0)
-                            {
-                                payload_match = 1;
-                            }
-                        }
+                    }
+            #else
+                        link_send_ok = 1;
+            #endif
                     }
                 }
             }
 
-            if (++wire_print_counter >= SECURE_WIRE_TEST_PRINT_EVERY)
+            if (!link_send_ok)
             {
-                wire_print_counter = 0;
+                static uint32_t link_encode_fail_count = 0;
+                link_encode_fail_count++;
 
-                printf("[WIRE TEST] len=%u encode=%s decode=%s verify=%s seq=%lu\n",
-                       (unsigned int)wire_frame_len,
-                       mathos_status_to_string(encode_status),
-                       mathos_status_to_string(decode_status),
-                       security_status_to_string(decoded_security_status),
-                       (unsigned long)secure_packet.sequence);
+                if ((link_encode_fail_count % 50) == 1)
+                {
+                    printf("[LINK UART] SEND BLOCKED security=%s encrypt=%s encode=%s frame_len=%u count=%lu\n",
+                        security_status_to_string(security_status),
+                        mathos_secure_status_to_string(encrypt_status),
+                        mathos_status_to_string(encode_status),
+                        (unsigned int)wire_frame_len,
+                        (unsigned long)link_encode_fail_count);
+                }
+            }
+
+            #if DEBUG_SECURE_WIRE_TEST
+            {
+                static uint32_t wire_print_counter = 0;
+
+                mathos_secure_packet_t decoded_wire_packet;
+                mathos_secure_status_t decrypt_status = MATHOS_SECURE_STATUS_BAD_ARGUMENT;
+                mathos_status_t decode_status = MATHOS_STATUS_BAD_ARGUMENT;
+
+                security_status_t decoded_security_status = SECURITY_STATUS_BAD_ARGUMENT;
+                int payload_match = 0;
+
+                if (encode_status == MATHOS_STATUS_OK)
+                {
+                    decode_status = mathos_wire_decode(
+                        wire_frame,
+                        wire_frame_len,
+                        &decoded_wire_packet);
+
+                    if (decode_status == MATHOS_STATUS_OK)
+                    {
+                        decrypt_status = mathos_secure_decrypt_packet(&decoded_wire_packet);
+
+                        if (decrypt_status == MATHOS_SECURE_STATUS_OK &&
+                            decoded_wire_packet.payload_len == secure_packet.payload_len &&
+                            memcmp(decoded_wire_packet.payload,
+                                secure_packet.payload,
+                                secure_packet.payload_len) == 0)
+                        {
+                            payload_match = 1;
+                            decoded_security_status = SECURITY_STATUS_OK;
+                        }
+                        else if (decrypt_status == MATHOS_SECURE_STATUS_OK)
+                        {
+                            decoded_security_status = SECURITY_STATUS_BAD_TAG;
+                        }
+                    }
+                }
+
+                if (++wire_print_counter >= SECURE_WIRE_TEST_PRINT_EVERY)
+                {
+                    wire_print_counter = 0;
+
+                    printf("[WIRE TEST] len=%u encode=%s decode=%s decrypt=%s verify=%s match=%d seq=%lu\n",
+                        (unsigned int)wire_frame_len,
+                        mathos_status_to_string(encode_status),
+                        mathos_status_to_string(decode_status),
+                        mathos_secure_status_to_string(decrypt_status),
+                        security_status_to_string(decoded_security_status),
+                        payload_match,
+                        (unsigned long)secure_packet.sequence);
+                }
             }
 #endif
+
+
+////////////////////
+
+                
+            int64_t security_work_us = esp_timer_get_time() - security_start_us;
+
             security_timing_update(security_work_us, security_status);
             security_timing_print_if_needed();
 

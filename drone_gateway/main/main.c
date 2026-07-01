@@ -20,7 +20,7 @@
 #define GATEWAY_RX_BUFFER_SIZE 256
 #define GATEWAY_PRINT_EVERY 50
 #define DEBUG_GATEWAY_RX_BYTES 0
-#define GATEWAY_MAVLINK_DRY_RUN 1
+#define GATEWAY_MAVLINK_DRY_RUN 0
 #define GATEWAY_DRY_RUN_PRINT_EVERY 50
 
 #define GATEWAY_FC_UART_ENABLE 1
@@ -42,7 +42,7 @@
     If 1, gateway may pass pitch/roll/yaw while FC is disarmed.
     Do NOT enable unless props are off and you only test in Mission Planner.
 */
-#define GATEWAY_MANUAL_CONTROL_DISARMED_BENCH_TEST 0
+#define GATEWAY_MANUAL_CONTROL_DISARMED_BENCH_TEST 1
 
 #define MAVLINK2_STX 0xFD
 
@@ -128,7 +128,7 @@
 #define MATHOS_REMOTE_CONTROLLER_ID 1
 #define MATHOS_PAYLOAD_TYPE_RC 1
 
-#define GATEWAY_REMOTE_LINK_FRESH_MS 1000
+#define GATEWAY_REMOTE_LINK_FRESH_MS 300
 
 static uint8_t gateway_mavlink_tx_seq = 0;
 
@@ -756,20 +756,19 @@ if (packet.payload_len != sizeof(rc_packet_t))
         last_sequence = 0;
         has_session = 1;
     }
+if (packet.sequence <= last_sequence)
+{
+    replay_count++;
+    gateway_rx_replay_count = replay_count;
 
-    if (packet.sequence <= last_sequence)
-    {
-        replay_count++;
-gateway_rx_replay_count = replay_count;
-        printf("[GATEWAY] REPLAY/OLD session=0x%08lx seq=%lu last=%lu replay_count=%lu\n",
-               (unsigned long)session_id,
-               (unsigned long)packet.sequence,
-               (unsigned long)last_sequence,
-               (unsigned long)replay_count);
+    printf("[GATEWAY] REPLAY/OLD session=0x%08lx seq=%lu last=%lu replay_count=%lu\n",
+           (unsigned long)session_id,
+           (unsigned long)packet.sequence,
+           (unsigned long)last_sequence,
+           (unsigned long)replay_count);
 
-        return;
-    }
-    last_sequence = packet.sequence;
+    return;
+}
 
 rc_packet_t rc_packet;
 memset(&rc_packet, 0, sizeof(rc_packet));
@@ -793,9 +792,10 @@ if (!gateway_rc_packet_is_valid(&rc_packet))
     return;
 }
 
+last_sequence = packet.sequence;
+
 ok_count++;
 gateway_rx_ok_count = ok_count;
-
 gateway_last_remote_state = rc_packet.state;
 gateway_last_remote_packet_tick = xTaskGetTickCount();
 
