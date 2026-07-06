@@ -321,12 +321,19 @@ typedef struct
 typedef enum
 {
     GATEWAY_ACTION_NONE = 0,
+
     GATEWAY_ACTION_ARM_DRY_RUN,
     GATEWAY_ACTION_DISARM_DRY_RUN,
     GATEWAY_ACTION_FAILSAFE_DRY_RUN,
 
     GATEWAY_ACTION_ARM_REAL_SENT,
     GATEWAY_ACTION_DISARM_REAL_SENT,
+
+    GATEWAY_ACTION_RTL_SENT,
+    GATEWAY_ACTION_RTL_CONFIRMED,
+    GATEWAY_ACTION_RTL_DENIED,
+    GATEWAY_ACTION_RTL_TIMEOUT,
+
     GATEWAY_ACTION_ARM_CONFIRMED,
     GATEWAY_ACTION_DISARM_CONFIRMED,
     GATEWAY_ACTION_ARM_DENIED,
@@ -3451,6 +3458,18 @@ static const char *gateway_action_to_string(uint8_t action)
     case GATEWAY_ACTION_RECOVER_CONFIRMED:
         return "RECOVER_CONFIRMED";
 
+    case GATEWAY_ACTION_RTL_SENT:
+        return "RTL_SENT";
+
+    case GATEWAY_ACTION_RTL_CONFIRMED:
+        return "RTL_CONFIRMED";
+
+    case GATEWAY_ACTION_RTL_DENIED:
+        return "RTL_DENIED";
+
+    case GATEWAY_ACTION_RTL_TIMEOUT:
+        return "RTL_TIMEOUT";
+
     default:
         return "UNKNOWN";
     }
@@ -3617,6 +3636,12 @@ static void gateway_status_apply_to_remote(const gateway_status_packet_t *status
             printf("[REMOTE] DISARM TIMEOUT from gateway/FC\n");
         }
         break;
+
+    case GATEWAY_ACTION_RTL_SENT:
+    case GATEWAY_ACTION_RTL_CONFIRMED:
+    case GATEWAY_ACTION_RTL_DENIED:
+    case GATEWAY_ACTION_RTL_TIMEOUT:
+    break;
 
     default:
         break;
