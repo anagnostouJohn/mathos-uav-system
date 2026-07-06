@@ -41,9 +41,25 @@
 #define JOYSTICK_DIAG_PRINT_EVERY 100
 
 #define BUTTON_PIN_ARM 12
-#define BUTTON_PIN_FAILSAFE 13 //<<<<<<<<<<<<<<<<<<<
+#define BUTTON_PIN_FAILSAFE 13
 #define BUTTON_PIN_DISARM 14
+#define BUTTON_PIN_RECOVER 11 //<<<<<<<<<<<<<<<<<<<
+/*
+    RECOVER is long-press only.
+    It is used to resume pilot control after FAILSAFE when the link is back.
+*/
+#define RECOVER_HOLD_MS 1800
 
+/*
+    Bench only.
+
+    In real flight, RECOVER must require FC armed.
+    But during current dry-run tests the FC reports DISARMED, so this lets us
+    test the remote state-machine path.
+
+    Set this to 0 before real ARM/DISARM or flight testing.
+*/
+#define FEATURE_RECOVER_BENCH_ALLOW_FC_DISARMED 1
 #define RGB_LED_PIN 48
 #define RGB_LED_COUNT 1
 
@@ -287,7 +303,8 @@ typedef enum
 {
     EVENT_BUTTON_ARM_PRESS = 0,
     EVENT_BUTTON_DISARM_PRESS,
-    EVENT_BUTTON_FAILSAFE_PRESS
+    EVENT_BUTTON_FAILSAFE_PRESS,
+    EVENT_BUTTON_RECOVER_PRESS
 } rc_event_type_t;
 
 typedef struct
@@ -315,7 +332,10 @@ typedef enum
     GATEWAY_ACTION_ARM_DENIED,
     GATEWAY_ACTION_DISARM_DENIED,
     GATEWAY_ACTION_ARM_TIMEOUT,
-    GATEWAY_ACTION_DISARM_TIMEOUT
+    GATEWAY_ACTION_DISARM_TIMEOUT,
+
+    GATEWAY_ACTION_RECOVER_DRY_RUN,
+    GATEWAY_ACTION_RECOVER_CONFIRMED
 } gateway_action_t;
 
 typedef struct __attribute__((packed))
@@ -461,6 +481,7 @@ portMUX_TYPE gateway_status_mux = portMUX_INITIALIZER_UNLOCKED;
 SemaphoreHandle_t button_semaphore_arm = NULL;
 SemaphoreHandle_t button_semaphore_failsafe = NULL;
 SemaphoreHandle_t button_semaphore_disarm = NULL;
+SemaphoreHandle_t button_semaphore_recover = NULL;
 
 QueueHandle_t rc_event_queue = NULL;
 
@@ -468,6 +489,7 @@ TaskHandle_t status_led_task_handle = NULL;
 TaskHandle_t button_task_arm_handle = NULL;
 TaskHandle_t button_task_disarm_handle = NULL;
 TaskHandle_t button_task_failsafe_handle = NULL;
+TaskHandle_t button_task_recover_handle = NULL;
 TaskHandle_t controller_task_handle = NULL;
 TaskHandle_t radio_tx_task_handle = NULL;
 TaskHandle_t joystick_adc_task_handle = NULL;
@@ -816,6 +838,33 @@ static int gateway_status_is_fresh(void)
     }
 
     return 1;
+}
+
+static int gateway_control_link_is_ok(void)
+{
+    int valid;
+    TickType_t last_update;
+    uint8_t gateway_link_ok;
+
+    taskENTER_CRITICAL(&gateway_status_mux);
+    valid = gateway_status_valid;
+    last_update = gateway_status_last_update_tick;
+    gateway_link_ok = gateway_status_snapshot.gateway_link_ok;
+    taskEXIT_CRITICAL(&gateway_status_mux);
+
+    if (!valid)
+    {
+        return 0;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+
+    if ((now - last_update) > pdMS_TO_TICKS(GATEWAY_STATUS_FRESH_MS))
+    {
+        return 0;
+    }
+
+    return gateway_link_ok ? 1 : 0;
 }
 
 static void lcd_draw_char(int x, int y, char c, int scale, uint16_t text_color, uint16_t bg_color)
@@ -2766,6 +2815,11 @@ link_mode_t read_link_mode_switch(void)
 
 arm_status_t get_arm_status(void)
 {
+    if (drone_command_get() == RC_FAILSAFE)
+    {
+        return ARM_STATUS_DRONE_FAILSAFE;
+    }
+
     if (!master_switch_enabled())
     {
         return ARM_STATUS_MASTER_OFF;
@@ -2814,7 +2868,7 @@ arm_status_t get_arm_status(void)
     }
 #endif
 #if FEATURE_SECURE_GATEWAY_MODE
-    if (!gateway_status_is_fresh())
+    if (!gateway_control_link_is_ok())
     {
         return ARM_STATUS_LINK_BAD;
     }
@@ -2876,9 +2930,10 @@ void system_health_task(void *pvParameters)
             fault_clear(FAULT_HEAP_LOW);
         }
 #if FEATURE_SECURE_GATEWAY_MODE
-        int gateway_fresh = gateway_status_is_fresh();
 
-        if (!gateway_fresh)
+        int gateway_control_ok = gateway_control_link_is_ok();
+
+        if (!gateway_control_ok)
         {
             fault_set(FAULT_TELEMETRY_STALE);
             fault_set(FAULT_DRONE_LINK_BAD);
@@ -2889,12 +2944,12 @@ void system_health_task(void *pvParameters)
             fault_clear(FAULT_DRONE_LINK_BAD);
         }
 
-        if (command_state == RC_ARMED && !gateway_fresh)
+        if (command_state == RC_ARMED && !gateway_control_ok)
         {
-            enter_failsafe("gateway status stale while armed");
+            enter_failsafe("gateway control link bad while armed");
             command_state = RC_FAILSAFE;
 
-            printf("[HEALTH] FAILSAFE: gateway status stale while ARMED\n");
+            printf("[HEALTH] FAILSAFE: gateway control link bad while ARMED\n");
         }
 #endif
 #if FEATURE_DIRECT_MAVLINK_MODE
@@ -2947,14 +3002,14 @@ void system_health_task(void *pvParameters)
         }
 #else
 
-        fault_clear(FAULT_TELEMETRY_STALE);
-        fault_clear(FAULT_DRONE_LINK_BAD);
-
         /*
             In secure gateway mode, remote link status comes from
             encrypted gateway status packets.
+
+            Do NOT clear FAULT_TELEMETRY_STALE / FAULT_DRONE_LINK_BAD here.
+            Those are already handled above by gateway_fresh.
         */
-        drone_link_ok = gateway_status_is_fresh();
+        drone_link_ok = gateway_control_link_is_ok();
 
 #endif
         if (command_state == RC_FAILSAFE || drone_state_snapshot == RC_FAILSAFE)
@@ -2975,6 +3030,7 @@ void system_health_task(void *pvParameters)
             stack_problem |= print_stack_watermark("button_task_arm", button_task_arm_handle);
             stack_problem |= print_stack_watermark("button_task_disarm", button_task_disarm_handle);
             stack_problem |= print_stack_watermark("button_task_failsafe", button_task_failsafe_handle);
+            stack_problem |= print_stack_watermark("button_task_recover", button_task_recover_handle);
             stack_problem |= print_stack_watermark("controller_task", controller_task_handle);
             stack_problem |= print_stack_watermark("radio_tx_task", radio_tx_task_handle);
             stack_problem |= print_stack_watermark("gateway_status_rx_task", gateway_status_rx_task_handle);
@@ -3220,6 +3276,129 @@ int prearm_checks_pass(void)
     printf("[PREARM] PASS\n");
     return 1;
 }
+
+static int recover_checks_pass(void)
+{
+    if (drone_command_get() != RC_FAILSAFE)
+    {
+        printf("[RECOVER] BLOCKED: command is not FAILSAFE\n");
+        return 0;
+    }
+
+    if (!master_switch_enabled())
+    {
+        printf("[RECOVER] BLOCKED: MASTER switch is OFF\n");
+        return 0;
+    }
+
+    if (!arm_permission_enabled())
+    {
+        printf("[RECOVER] BLOCKED: ARM permission switch is LOCKED\n");
+        return 0;
+    }
+
+    if (!gateway_status_is_fresh())
+    {
+        printf("[RECOVER] BLOCKED: gateway status stale\n");
+        return 0;
+    }
+
+    if (!gateway_control_link_is_ok())
+    {
+        printf("[RECOVER] BLOCKED: gateway control link bad\n");
+        return 0;
+    }
+
+    if (!rc_input_is_fresh())
+    {
+        printf("[RECOVER] BLOCKED: joystick input stale\n");
+        return 0;
+    }
+
+    rc_input_t input_snapshot;
+    TickType_t input_last_update;
+
+    rc_input_get_snapshot(&input_snapshot, &input_last_update);
+    (void)input_last_update;
+    if (abs(input_snapshot.roll) > ARM_STICK_MAX ||
+        abs(input_snapshot.pitch) > ARM_STICK_MAX ||
+        abs(input_snapshot.yaw) > ARM_STICK_MAX)
+    {
+        printf("[RECOVER] BLOCKED: sticks not centered roll=%d pitch=%d yaw=%d\n",
+               input_snapshot.roll,
+               input_snapshot.pitch,
+               input_snapshot.yaw);
+        return 0;
+    }
+
+    if (input_snapshot.throttle > ARM_THROTTLE_MAX)
+    {
+        printf("[RECOVER] BLOCKED: throttle too high throttle=%d\n",
+               input_snapshot.throttle);
+        return 0;
+    }
+
+#if FEATURE_SECURE_GATEWAY_MODE
+
+    gateway_status_packet_t status;
+    int valid;
+    TickType_t last_update;
+
+    taskENTER_CRITICAL(&gateway_status_mux);
+    status = gateway_status_snapshot;
+    valid = gateway_status_valid;
+    last_update = gateway_status_last_update_tick;
+    taskEXIT_CRITICAL(&gateway_status_mux);
+
+    if (!valid)
+    {
+        printf("[RECOVER] BLOCKED: no gateway status snapshot\n");
+        return 0;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+
+    if ((now - last_update) > pdMS_TO_TICKS(GATEWAY_STATUS_FRESH_MS))
+    {
+        printf("[RECOVER] BLOCKED: gateway status snapshot stale\n");
+        return 0;
+    }
+
+    if (!status.fc_heartbeat_fresh)
+    {
+        printf("[RECOVER] BLOCKED: FC heartbeat stale\n");
+        return 0;
+    }
+
+    if (!status.fc_is_armed)
+    {
+#if FEATURE_RECOVER_BENCH_ALLOW_FC_DISARMED
+        printf("[RECOVER] BENCH: FC reports DISARMED, allowing recovery test because FEATURE_RECOVER_BENCH_ALLOW_FC_DISARMED=1\n");
+#else
+        printf("[RECOVER] BLOCKED: FC is not armed\n");
+        return 0;
+#endif
+    }
+
+#endif
+
+    uint32_t blocking_faults = fault_get_snapshot() &
+                               ~(FAULT_DRONE_FAILSAFE |
+                                 FAULT_ARM_SWITCH_OFF |
+                                 FAULT_MASTER_SWITCH_OFF |
+                                 FAULT_TELEMETRY_STALE |
+                                 FAULT_DRONE_LINK_BAD);
+
+    if (blocking_faults != FAULT_NONE)
+    {
+        print_fault_snapshot("[RECOVER] BLOCKED faults=", blocking_faults);
+        return 0;
+    }
+
+    printf("[RECOVER] PASS\n");
+    return 1;
+}
+
 static uint16_t link_get_u16_le(const uint8_t *buffer)
 {
     return ((uint16_t)buffer[0] << 0) |
@@ -3266,6 +3445,12 @@ static const char *gateway_action_to_string(uint8_t action)
     case GATEWAY_ACTION_DISARM_TIMEOUT:
         return "DISARM_TIMEOUT";
 
+    case GATEWAY_ACTION_RECOVER_DRY_RUN:
+        return "RECOVER_DRY_RUN";
+
+    case GATEWAY_ACTION_RECOVER_CONFIRMED:
+        return "RECOVER_CONFIRMED";
+
     default:
         return "UNKNOWN";
     }
@@ -3296,7 +3481,7 @@ static void gateway_status_apply_to_remote(const gateway_status_packet_t *status
 
     switch ((gateway_action_t)status->last_action)
     {
-            case GATEWAY_ACTION_ARM_DRY_RUN:
+    case GATEWAY_ACTION_ARM_DRY_RUN:
 #if FEATURE_TREAT_GATEWAY_DRY_RUN_AS_CONFIRMED
         if (op_status == COMMAND_STATUS_ARMING)
         {
@@ -3877,6 +4062,36 @@ void controller_task(void *pvParameters)
                 printf("[CONTROLLER] FAILSAFE button complete,  command=%s\n",
                        state_to_string(drone_command_get()));
             }
+            else if (event.type == EVENT_BUTTON_RECOVER_PRESS)
+            {
+                if (command_state != RC_FAILSAFE)
+                {
+                    printf("[CONTROLLER] RECOVER ignored: command is %s, not FAILSAFE\n",
+                           state_to_string(command_state));
+                }
+                else if (recover_checks_pass())
+                {
+                    /*
+                        Important:
+                        RECOVER does NOT send MAVLink ARM.
+                        It only restores remote control authority.
+
+                        In real flight, FC should already be armed.
+                    */
+                    drone_command_set(RC_ARMED, "manual recover from failsafe");
+                    command_status_set(COMMAND_STATUS_IDLE, "manual recover from failsafe");
+
+                    printf("[CONTROLLER] FAILSAFE RECOVERED: pilot control resumed\n");
+                }
+                else
+                {
+                    printf("[CONTROLLER] RECOVER blocked, command=%s\n",
+                           state_to_string(drone_command_get()));
+                }
+
+                printf("[CONTROLLER] RECOVER button complete, command=%s\n",
+                       state_to_string(drone_command_get()));
+            }
             else if (event.type == EVENT_BUTTON_DISARM_PRESS)
             {
                 if (fc_arm_pending)
@@ -4080,14 +4295,14 @@ void radio_tx_task(void *pvParameters)
         if (print_now)
         {
             printf("[RC TX] packet_id=%lu state=%s op=%s input=%s throttle=%d yaw=%d pitch=%d roll=%d\n",
-                (unsigned long)packet.packet_id,
-                state_to_string(packet.state),
-                command_status_to_string(op_status),
-                input_fresh ? "FRESH" : "STALE",
-                packet.throttle,
-                packet.yaw,
-                packet.pitch,
-                packet.roll);
+                   (unsigned long)packet.packet_id,
+                   state_to_string(packet.state),
+                   command_status_to_string(op_status),
+                   input_fresh ? "FRESH" : "STALE",
+                   packet.throttle,
+                   packet.yaw,
+                   packet.pitch,
+                   packet.roll);
         }
 #endif
 #if SECURITY_SKELETON_DIAGNOSTIC
@@ -4104,7 +4319,7 @@ void radio_tx_task(void *pvParameters)
 
             security_status =
                 security_verify_packet_basic(&secure_packet, &security_test_last_sequence);
-//////////////////////////////////////////////
+            //////////////////////////////////////////////
 
             mathos_secure_packet_t wire_packet;
             uint8_t wire_frame[MATHOS_WIRE_MAX_FRAME_LEN];
@@ -4128,28 +4343,28 @@ void radio_tx_task(void *pvParameters)
                         sizeof(wire_frame),
                         &wire_frame_len);
 
-                if (encode_status == MATHOS_STATUS_OK)
-                {
-                #if FEATURE_LINK_UART_TX
-                    link_send_ok = link_uart_send_frame(wire_frame, wire_frame_len);
-
-                    static uint32_t link_uart_ok_count = 0;
-
-                    if (link_send_ok)
+                    if (encode_status == MATHOS_STATUS_OK)
                     {
-                        link_uart_ok_count++;
+#if FEATURE_LINK_UART_TX
+                        link_send_ok = link_uart_send_frame(wire_frame, wire_frame_len);
 
-                        if ((link_uart_ok_count % 50) == 1)
+                        static uint32_t link_uart_ok_count = 0;
+
+                        if (link_send_ok)
                         {
-                            printf("[LINK UART] TX OK count=%lu len=%u seq=%lu\n",
-                                (unsigned long)link_uart_ok_count,
-                                (unsigned int)wire_frame_len,
-                                (unsigned long)secure_packet.sequence);
+                            link_uart_ok_count++;
+
+                            if ((link_uart_ok_count % 50) == 1)
+                            {
+                                printf("[LINK UART] TX OK count=%lu len=%u seq=%lu\n",
+                                       (unsigned long)link_uart_ok_count,
+                                       (unsigned int)wire_frame_len,
+                                       (unsigned long)secure_packet.sequence);
+                            }
                         }
-                    }
-            #else
+#else
                         link_send_ok = 1;
-            #endif
+#endif
                     }
                 }
             }
@@ -4162,15 +4377,15 @@ void radio_tx_task(void *pvParameters)
                 if ((link_encode_fail_count % 50) == 1)
                 {
                     printf("[LINK UART] SEND BLOCKED security=%s encrypt=%s encode=%s frame_len=%u count=%lu\n",
-                        security_status_to_string(security_status),
-                        mathos_secure_status_to_string(encrypt_status),
-                        mathos_status_to_string(encode_status),
-                        (unsigned int)wire_frame_len,
-                        (unsigned long)link_encode_fail_count);
+                           security_status_to_string(security_status),
+                           mathos_secure_status_to_string(encrypt_status),
+                           mathos_status_to_string(encode_status),
+                           (unsigned int)wire_frame_len,
+                           (unsigned long)link_encode_fail_count);
                 }
             }
 
-            #if DEBUG_SECURE_WIRE_TEST
+#if DEBUG_SECURE_WIRE_TEST
             {
                 static uint32_t wire_print_counter = 0;
 
@@ -4195,8 +4410,8 @@ void radio_tx_task(void *pvParameters)
                         if (decrypt_status == MATHOS_SECURE_STATUS_OK &&
                             decoded_wire_packet.payload_len == secure_packet.payload_len &&
                             memcmp(decoded_wire_packet.payload,
-                                secure_packet.payload,
-                                secure_packet.payload_len) == 0)
+                                   secure_packet.payload,
+                                   secure_packet.payload_len) == 0)
                         {
                             payload_match = 1;
                             decoded_security_status = SECURITY_STATUS_OK;
@@ -4213,21 +4428,19 @@ void radio_tx_task(void *pvParameters)
                     wire_print_counter = 0;
 
                     printf("[WIRE TEST] len=%u encode=%s decode=%s decrypt=%s verify=%s match=%d seq=%lu\n",
-                        (unsigned int)wire_frame_len,
-                        mathos_status_to_string(encode_status),
-                        mathos_status_to_string(decode_status),
-                        mathos_secure_status_to_string(decrypt_status),
-                        security_status_to_string(decoded_security_status),
-                        payload_match,
-                        (unsigned long)secure_packet.sequence);
+                           (unsigned int)wire_frame_len,
+                           mathos_status_to_string(encode_status),
+                           mathos_status_to_string(decode_status),
+                           mathos_secure_status_to_string(decrypt_status),
+                           security_status_to_string(decoded_security_status),
+                           payload_match,
+                           (unsigned long)secure_packet.sequence);
                 }
             }
 #endif
 
+            ////////////////////
 
-////////////////////
-
-                
             int64_t security_work_us = esp_timer_get_time() - security_start_us;
 
             security_timing_update(security_work_us, security_status);
@@ -4319,6 +4532,56 @@ void radio_tx_task(void *pvParameters)
         }
 
         vTaskDelayUntil(&last_wake, period);
+    }
+}
+void button_task_recover(void *pvParameters)
+{
+    while (1)
+    {
+        if (xSemaphoreTake(button_semaphore_recover, portMAX_DELAY) == pdTRUE)
+        {
+            /*
+                Debounce.
+            */
+            vTaskDelay(pdMS_TO_TICKS(50));
+
+            /*
+                Pull-up logic:
+                pressed  = 0
+                released = 1
+            */
+            if (gpio_get_level(BUTTON_PIN_RECOVER) != 0)
+            {
+                continue;
+            }
+
+            TickType_t press_start = xTaskGetTickCount();
+
+            printf("[BUTTON] RECOVER pressed\n");
+
+            while (gpio_get_level(BUTTON_PIN_RECOVER) == 0)
+            {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+
+            TickType_t press_end = xTaskGetTickCount();
+            uint32_t held_ms = pdTICKS_TO_MS(press_end - press_start);
+
+            if (held_ms < RECOVER_HOLD_MS)
+            {
+                printf("[BUTTON] RECOVER short press ignored held=%lu ms required=%d ms\n",
+                       (unsigned long)held_ms,
+                       RECOVER_HOLD_MS);
+                continue;
+            }
+
+            printf("[BUTTON] RECOVER long press accepted held=%lu ms\n",
+                   (unsigned long)held_ms);
+
+            rc_event_t event;
+            event.type = EVENT_BUTTON_RECOVER_PRESS;
+            xQueueSend(rc_event_queue, &event, portMAX_DELAY);
+        }
     }
 }
 
@@ -4572,16 +4835,16 @@ void lcd_task(void *pvParameters)
             /*
                 Main state
             */
-            if (master_off)
-            {
-                lcd_draw_text_centered(65, "CTRL OFF", 3, COLOR_WHITE, COLOR_BLACK);
-            }
-            else if (state == RC_FAILSAFE)
+            if (state == RC_FAILSAFE)
             {
                 lcd_draw_text_centered(65, "FAILSAFE", 3, COLOR_RED, COLOR_BLACK);
             }
-            else if (op_status == COMMAND_STATUS_ARMING)
+            else if (master_off)
+            {
+                lcd_draw_text_centered(65, "CTRL OFF", 3, COLOR_WHITE, COLOR_BLACK);
+            }
 
+            else if (op_status == COMMAND_STATUS_ARMING)
             {
                 lcd_draw_text_centered(65, "ARMING", 3, COLOR_YELLOW, COLOR_BLACK);
             }
@@ -4637,17 +4900,17 @@ void lcd_task(void *pvParameters)
             /*
                 Bottom status
             */
-            if (master_off)
-            {
-                lcd_draw_text_centered(185, "MASTER OFF", 2, COLOR_WHITE, COLOR_BLACK);
-            }
-            else if (state == RC_FAILSAFE && arm_locked)
+            if (state == RC_FAILSAFE && arm_locked)
             {
                 lcd_draw_text_centered(185, "ARM OFF", 3, COLOR_RED, COLOR_BLACK);
             }
             else if (state == RC_FAILSAFE)
             {
                 lcd_draw_text_centered(185, "FAILSAFE", 3, COLOR_RED, COLOR_BLACK);
+            }
+            else if (master_off)
+            {
+                lcd_draw_text_centered(185, "MASTER OFF", 2, COLOR_WHITE, COLOR_BLACK);
             }
             else if (op_status == COMMAND_STATUS_ARMING)
             {
@@ -4700,7 +4963,12 @@ void app_main(void)
     button_semaphore_arm = xSemaphoreCreateBinary();
     button_semaphore_failsafe = xSemaphoreCreateBinary();
     button_semaphore_disarm = xSemaphoreCreateBinary();
-    if (button_semaphore_arm == NULL || button_semaphore_failsafe == NULL || button_semaphore_disarm == NULL)
+    button_semaphore_recover = xSemaphoreCreateBinary();
+
+    if (button_semaphore_arm == NULL ||
+        button_semaphore_failsafe == NULL ||
+        button_semaphore_disarm == NULL ||
+        button_semaphore_recover == NULL)
     {
         printf("[FATAL] failed to create button semaphores\n");
         return;
@@ -4753,7 +5021,10 @@ void app_main(void)
     led_strip_refresh(strip);
 
     gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << BUTTON_PIN_ARM) | (1ULL << BUTTON_PIN_FAILSAFE) | (1ULL << BUTTON_PIN_DISARM),
+        .pin_bit_mask = (1ULL << BUTTON_PIN_ARM) |
+                        (1ULL << BUTTON_PIN_FAILSAFE) |
+                        (1ULL << BUTTON_PIN_DISARM) |
+                        (1ULL << BUTTON_PIN_RECOVER),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -4791,6 +5062,7 @@ void app_main(void)
     gpio_isr_handler_add(BUTTON_PIN_ARM, button_isr_handler, button_semaphore_arm);
     gpio_isr_handler_add(BUTTON_PIN_DISARM, button_isr_handler, button_semaphore_disarm);
     gpio_isr_handler_add(BUTTON_PIN_FAILSAFE, button_isr_handler, button_semaphore_failsafe);
+    gpio_isr_handler_add(BUTTON_PIN_RECOVER, button_isr_handler, button_semaphore_recover);
     adc_oneshot_unit_init_cfg_t init_config = {
         .unit_id = ADC_UNIT_1,
     };
@@ -4827,6 +5099,7 @@ void app_main(void)
     create_task_checked(button_task_arm, "button_task_arm", 4096, NULL, 5, &button_task_arm_handle);
     create_task_checked(button_task_disarm, "button_task_disarm", 4096, NULL, 5, &button_task_disarm_handle);
     create_task_checked(button_task_failsafe, "button_task_failsafe", 4096, NULL, 5, &button_task_failsafe_handle);
+    create_task_checked(button_task_recover, "button_task_recover", 4096, NULL, 5, &button_task_recover_handle);
     create_task_checked(controller_task, "controller_task", 4096, NULL, 5, &controller_task_handle);
     create_task_checked(radio_tx_task, "radio_tx_task", 4096, NULL, 3, &radio_tx_task_handle);
     create_task_checked(gateway_status_rx_task, "gateway_status_rx_task", 4096, NULL, 3, &gateway_status_rx_task_handle);

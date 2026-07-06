@@ -3,8 +3,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 set(EXTRA_COMPONENT_DIRS
-    "../common_components/mathos_protocol"
-    "../common_components/mathos_secure"
+    "${CMAKE_CURRENT_LIST_DIR}/../common_components"
 )
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)

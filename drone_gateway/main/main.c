@@ -171,7 +171,10 @@ typedef enum
     GATEWAY_ACTION_ARM_DENIED,
     GATEWAY_ACTION_DISARM_DENIED,
     GATEWAY_ACTION_ARM_TIMEOUT,
-    GATEWAY_ACTION_DISARM_TIMEOUT
+    GATEWAY_ACTION_DISARM_TIMEOUT,
+
+    GATEWAY_ACTION_RECOVER_DRY_RUN,
+    GATEWAY_ACTION_RECOVER_CONFIRMED
 } gateway_action_t;
 
 typedef struct __attribute__((packed))
@@ -523,39 +526,68 @@ static void gateway_arm_disarm_dry_run(const rc_packet_t *packet)
 
     uint8_t fc_fresh = gateway_fc_heartbeat_is_fresh();
 
-    if (packet->state == RC_ARMED)
+    /*
+        Important distinction:
+
+        DISARMED -> ARMED:
+            normal ARM request
+
+        FAILSAFE -> ARMED:
+            RECOVER / resume pilot control
+            NOT an ARM request
+    */
+    if (last_remote_state == RC_DISARMED &&
+        packet->state == RC_ARMED)
     {
-        
-gateway_action_publish(GATEWAY_ACTION_ARM_DRY_RUN);
-        printf("[GATEWAY ARM DRY RUN] remote changed to ARMED packet_id=%lu fc=%s fc_fresh=%u ACTION=PRINT_ONLY\n",
+        gateway_action_publish(GATEWAY_ACTION_ARM_DRY_RUN);
+
+        printf("[GATEWAY ARM DRY RUN] DISARMED -> ARMED packet_id=%lu fc=%s fc_fresh=%u ACTION=PRINT_ONLY\n",
+               (unsigned long)packet->packet_id,
+               gateway_fc_arm_state_to_string(gateway_fc_is_armed),
+               fc_fresh);
+    }
+    else if (last_remote_state == RC_FAILSAFE &&
+             packet->state == RC_ARMED)
+    {
+        gateway_action_publish(GATEWAY_ACTION_RECOVER_DRY_RUN);
+
+        printf("[GATEWAY RECOVER DRY RUN] FAILSAFE -> ARMED packet_id=%lu fc=%s fc_fresh=%u ACTION=RESUME_CONTROL_ONLY\n",
                (unsigned long)packet->packet_id,
                gateway_fc_arm_state_to_string(gateway_fc_is_armed),
                fc_fresh);
     }
     else if (packet->state == RC_DISARMED)
     {
+        gateway_action_publish(GATEWAY_ACTION_DISARM_DRY_RUN);
 
-gateway_action_publish(GATEWAY_ACTION_DISARM_DRY_RUN);
-        printf("[GATEWAY DISARM DRY RUN] remote changed to DISARMED packet_id=%lu fc=%s fc_fresh=%u ACTION=PRINT_ONLY\n",
+        printf("[GATEWAY DISARM DRY RUN] remote changed to DISARMED packet_id=%lu previous=%s fc=%s fc_fresh=%u ACTION=PRINT_ONLY\n",
                (unsigned long)packet->packet_id,
+               state_to_string(last_remote_state),
                gateway_fc_arm_state_to_string(gateway_fc_is_armed),
                fc_fresh);
     }
     else if (packet->state == RC_FAILSAFE)
     {
-gateway_action_publish(GATEWAY_ACTION_FAILSAFE_DRY_RUN);
-        printf("[GATEWAY FAILSAFE DRY RUN] remote changed to FAILSAFE packet_id=%lu fc=%s fc_fresh=%u ACTION=PRINT_ONLY\n",
+        gateway_action_publish(GATEWAY_ACTION_FAILSAFE_DRY_RUN);
+
+        printf("[GATEWAY FAILSAFE DRY RUN] remote changed to FAILSAFE packet_id=%lu previous=%s fc=%s fc_fresh=%u ACTION=PRINT_ONLY\n",
                (unsigned long)packet->packet_id,
+               state_to_string(last_remote_state),
                gateway_fc_arm_state_to_string(gateway_fc_is_armed),
                fc_fresh);
+    }
+    else
+    {
+        printf("[GATEWAY STATE DRY RUN] transition %s -> %s packet_id=%lu no ARM/DISARM action\n",
+               state_to_string(last_remote_state),
+               state_to_string(packet->state),
+               (unsigned long)packet->packet_id);
     }
 
     last_remote_state = packet->state;
 
 #endif
 }
-
-
 static void gateway_arm_disarm_real_if_enabled(const rc_packet_t *packet)
 {
 #if GATEWAY_ARM_DISARM_REAL_ENABLE
@@ -582,7 +614,16 @@ static void gateway_arm_disarm_real_if_enabled(const rc_packet_t *packet)
 
     uint8_t fc_fresh = gateway_fc_heartbeat_is_fresh();
 
-    if (packet->state == RC_ARMED)
+    /*
+        DISARMED -> ARMED:
+            real ARM request
+
+        FAILSAFE -> ARMED:
+            RECOVER / resume control
+            do NOT send MAVLink ARM
+    */
+    if (last_remote_state == RC_DISARMED &&
+        packet->state == RC_ARMED)
     {
         if (!fc_fresh)
         {
@@ -592,15 +633,17 @@ static void gateway_arm_disarm_real_if_enabled(const rc_packet_t *packet)
         else if (gateway_fc_is_armed)
         {
             printf("[GATEWAY ARM REAL] ignored: FC already ARMED\n");
-           gateway_action_publish(GATEWAY_ACTION_ARM_CONFIRMED);
+            gateway_action_publish(GATEWAY_ACTION_ARM_CONFIRMED);
         }
         else if (gateway_mavlink_send_arm_disarm(1))
         {
             gateway_arm_pending = 1;
             gateway_disarm_pending = 0;
             gateway_arm_pending_start_tick = xTaskGetTickCount();
-gateway_action_publish(GATEWAY_ACTION_ARM_REAL_SENT);
-            printf("[GATEWAY ARM REAL] ARM command sent to FC\n");
+
+            gateway_action_publish(GATEWAY_ACTION_ARM_REAL_SENT);
+
+            printf("[GATEWAY ARM REAL] DISARMED -> ARMED, ARM command sent to FC\n");
         }
         else
         {
@@ -609,14 +652,50 @@ gateway_action_publish(GATEWAY_ACTION_ARM_REAL_SENT);
             printf("[GATEWAY ARM REAL] FAILED to send ARM command\n");
         }
     }
+    else if (last_remote_state == RC_FAILSAFE &&
+             packet->state == RC_ARMED)
+    {
+        /*
+            RECOVER path.
+
+            Do not send ARM here.
+            The FC should already be armed if this is a real in-air recovery.
+        */
+        if (!fc_fresh)
+        {
+            printf("[GATEWAY RECOVER REAL] BLOCKED: FC heartbeat stale\n");
+            gateway_action_publish(GATEWAY_ACTION_ARM_DENIED);
+        }
+        else if (!gateway_fc_is_armed)
+        {
+            printf("[GATEWAY RECOVER REAL] BLOCKED: FC is DISARMED, cannot recover control\n");
+            gateway_action_publish(GATEWAY_ACTION_ARM_DENIED);
+        }
+        else
+        {
+            gateway_arm_pending = 0;
+            gateway_disarm_pending = 0;
+
+            gateway_action_publish(GATEWAY_ACTION_RECOVER_CONFIRMED);
+
+            printf("[GATEWAY RECOVER REAL] FAILSAFE -> ARMED, control resumed. No MAVLink ARM sent\n");
+        }
+    }
     else if (packet->state == RC_DISARMED || packet->state == RC_FAILSAFE)
     {
+        /*
+            In real mode:
+            DISARMED means real DISARM request.
+            FAILSAFE should NOT automatically disarm in future flight logic.
+
+            For now this branch preserves current behavior, but before real
+            flight we may split FAILSAFE handling further depending on ArduPilot
+            failsafe strategy.
+        */
         if (!fc_fresh)
         {
             printf("[GATEWAY DISARM REAL] BLOCKED: FC heartbeat stale\n");
-            
-gateway_action_publish(GATEWAY_ACTION_DISARM_DENIED);
-
+            gateway_action_publish(GATEWAY_ACTION_DISARM_DENIED);
         }
         else if (!gateway_fc_is_armed)
         {
@@ -628,14 +707,24 @@ gateway_action_publish(GATEWAY_ACTION_DISARM_DENIED);
             gateway_disarm_pending = 1;
             gateway_arm_pending = 0;
             gateway_disarm_pending_start_tick = xTaskGetTickCount();
-gateway_action_publish(GATEWAY_ACTION_DISARM_REAL_SENT);
+
+            gateway_action_publish(GATEWAY_ACTION_DISARM_REAL_SENT);
+
             printf("[GATEWAY DISARM REAL] DISARM command sent to FC\n");
         }
         else
         {
             gateway_action_publish(GATEWAY_ACTION_DISARM_DENIED);
+
             printf("[GATEWAY DISARM REAL] FAILED to send DISARM command\n");
         }
+    }
+    else
+    {
+        printf("[GATEWAY STATE REAL] transition %s -> %s packet_id=%lu no ARM/DISARM action\n",
+               state_to_string(last_remote_state),
+               state_to_string(packet->state),
+               (unsigned long)packet->packet_id);
     }
 
     last_remote_state = packet->state;
@@ -1741,6 +1830,12 @@ static const char *gateway_action_to_string(uint8_t action)
     case GATEWAY_ACTION_DISARM_TIMEOUT:
         return "DISARM_TIMEOUT";
 
+    case GATEWAY_ACTION_RECOVER_DRY_RUN:
+        return "RECOVER_DRY_RUN";
+
+    case GATEWAY_ACTION_RECOVER_CONFIRMED:
+        return "RECOVER_CONFIRMED";
+
     default:
         return "UNKNOWN";
     }
@@ -1923,6 +2018,7 @@ vTaskDelay(pdMS_TO_TICKS(GATEWAY_STATUS_TX_PERIOD_MS));
 }
 void app_main(void)
 {
+    printf("\n\n=== NEW GATEWAY BUILD TEST 12345 ===\n\n");
     if (!gateway_fc_uart_init())
     {
         printf("[FATAL] gateway FC UART init failed\n");
