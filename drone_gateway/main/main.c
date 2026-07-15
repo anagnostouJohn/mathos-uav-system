@@ -45,7 +45,19 @@ static const char *TAG = "DRONE_GATEWAY";
 #define MAVLINK_SEND_PERIOD_MS 50
 #define HEARTBEAT_PERIOD_MS    1000
 #define HEALTH_PERIOD_MS       1000
+/*
+   ============================================================
+   MAVLink telemetry stream requests
 
+   Gateway asks ArduPilot to send useful telemetry messages.
+   This does not affect ARM/DISARM/failsafe.
+   ============================================================
+*/
+#define TELEMETRY_REQUEST_REPEAT_MS          10000
+#define TELEMETRY_REQUEST_FAST_INTERVAL_US   200000    // 5 Hz
+#define TELEMETRY_REQUEST_MED_INTERVAL_US    500000    // 2 Hz
+#define TELEMETRY_REQUEST_SLOW_INTERVAL_US   1000000   // 1 Hz
+#define TELEMETRY_REQUEST_ROUNDS             3
 #define FC_TARGET_SYS_ID       0
 #define FC_TARGET_COMP_ID      0
 
@@ -57,9 +69,12 @@ static const char *TAG = "DRONE_GATEWAY";
 #define LINK_RX_BUFFER_SIZE           128
 
 #define GATEWAY_STATUS_TX_PERIOD_MS 200
+#define GATEWAY_TELEMETRY_TX_PERIOD_MS 200
+#define GATEWAY_TELEMETRY_FRESH_MS 1500
 
 #define SECURITY_GATEWAY_ID                 2
 #define SECURITY_PAYLOAD_TYPE_GATEWAY_STATUS 2
+#define SECURITY_PAYLOAD_TYPE_GATEWAY_TELEMETRY 3
 #define GATEWAY_STATUS_LINK_ID              0
 
 #define GATEWAY_ACTION_STATUS_REPEAT_COUNT  5
@@ -139,6 +154,8 @@ static const char *TAG = "DRONE_GATEWAY";
 #define FC_COMMAND_TARGET_SYS_ID_FALLBACK   1
 #define FC_COMMAND_TARGET_COMP_ID_FALLBACK  1
 
+
+
 typedef enum {
     RC_DISARMED = 0,
     RC_ARMED    = 1,
@@ -205,6 +222,38 @@ typedef struct __attribute__((packed))
     uint32_t rx_replay_count;
 } gateway_status_packet_t;
 
+#define GATEWAY_TELEMETRY_FLAG_BATTERY_FRESH  (1u << 0)
+#define GATEWAY_TELEMETRY_FLAG_GPS_FRESH      (1u << 1)
+#define GATEWAY_TELEMETRY_FLAG_POSITION_FRESH (1u << 2)
+#define GATEWAY_TELEMETRY_FLAG_ATTITUDE_FRESH (1u << 3)
+
+typedef struct __attribute__((packed))
+{
+    uint32_t packet_id;
+    uint32_t sample_time_ms;
+
+    uint16_t battery_voltage_mv;
+    int16_t battery_current_ca;
+    int8_t battery_remaining;
+
+    uint8_t gps_fix_type;
+    uint8_t satellites_visible;
+    uint8_t telemetry_flags;
+
+    int32_t latitude_e7;
+    int32_t longitude_e7;
+    int32_t altitude_mm;
+    int32_t relative_altitude_mm;
+
+    int16_t roll_cd;
+    int16_t pitch_cd;
+    int16_t yaw_cd;
+
+    uint8_t fc_is_armed;
+    uint8_t system_status;
+    uint8_t reserved[2];
+} gateway_telemetry_packet_t;
+
 static QueueHandle_t rc_packet_queue = NULL;
 
 static volatile uint32_t rx_packets = 0;
@@ -252,7 +301,45 @@ static volatile uint8_t fc_seen_comp_id = 0;
    copy the RC version here exactly.
 */
 
+/*
+   ============================================================
+   FC TELEMETRY SNAPSHOT
 
+   Gateway receives MAVLink telemetry from ArduPilot.
+   This is read-only for now.
+
+   Later:
+   - pack this into encrypted Mathos telemetry packet
+   - send it to RC
+   - RC forwards selected telemetry to API/server
+   ============================================================
+*/
+
+static volatile bool fc_tel_sys_status_seen = false;
+static volatile bool fc_tel_gps_seen = false;
+static volatile bool fc_tel_position_seen = false;
+static volatile bool fc_tel_attitude_seen = false;
+
+static volatile int64_t fc_tel_battery_update_us = 0;
+static volatile int64_t fc_tel_gps_update_us = 0;
+static volatile int64_t fc_tel_position_update_us = 0;
+static volatile int64_t fc_tel_attitude_update_us = 0;
+static volatile uint8_t fc_tel_system_status = 0;
+
+static volatile uint16_t fc_tel_battery_voltage_mv = 0;
+static volatile int16_t fc_tel_battery_current_ca = -1;
+static volatile int8_t fc_tel_battery_remaining = -1;
+
+static volatile uint8_t fc_tel_gps_fix_type = 0;
+static volatile uint8_t fc_tel_satellites_visible = 0;
+static volatile int32_t fc_tel_lat = 0;
+static volatile int32_t fc_tel_lon = 0;
+static volatile int32_t fc_tel_alt_mm = 0;
+static volatile int32_t fc_tel_relative_alt_mm = 0;
+
+static volatile float fc_tel_roll_rad = 0.0f;
+static volatile float fc_tel_pitch_rad = 0.0f;
+static volatile float fc_tel_yaw_rad = 0.0f;
 
 static int16_t clamp_i16(int16_t value, int16_t min, int16_t max)
 {
@@ -470,10 +557,21 @@ static void gateway_arm_disarm_timeout_check(void);
 static const char *gateway_mav_result_to_string(uint8_t result);
 static void gateway_process_rc_state_action(const rc_packet_t *packet);
 static bool gateway_status_send_once(void);
+static bool gateway_telemetry_send_once(void);
 static const char *rc_state_to_string(rc_state_t state);
 static bool gateway_send_rtl_command(void);
 static bool gateway_start_rtl_for_safety(const char *reason);
 static void gateway_rtl_timeout_check(void);
+static const char *gateway_gps_fix_to_string(uint8_t fix_type);
+static void gateway_print_fc_telemetry(void);
+static bool gateway_send_message_interval_request(
+    uint32_t message_id,
+    int32_t interval_us,
+    const char *name
+);
+
+static void gateway_request_telemetry_streams_once(void);
+static void telemetry_request_task(void *arg);
 
 static void handle_valid_rc_packet(const rc_packet_t *packet, bool new_session)
 {
@@ -1007,7 +1105,6 @@ static void gateway_failsafe_safety_check(void)
     if (gateway_safety_disarm_latched) {
         return;
     }
-
     if (rc_requested_failsafe) {
         gateway_safety_disarm_latched = true;
 
@@ -1017,7 +1114,7 @@ static void gateway_failsafe_safety_check(void)
         );
 #elif GATEWAY_FAILSAFE_ACTION_MODE == GATEWAY_FAILSAFE_ACTION_FLIGHT_RTL
         gateway_start_rtl_for_safety(
-            "FC heartbeat timeout"
+            "RC state FAILSAFE"
         );
 #endif
 
@@ -1034,7 +1131,7 @@ static void gateway_failsafe_safety_check(void)
         );
 #elif GATEWAY_FAILSAFE_ACTION_MODE == GATEWAY_FAILSAFE_ACTION_FLIGHT_RTL
         gateway_start_rtl_for_safety(
-            "RC state FAILSAFE"
+            "RC link timeout"
         );
 #endif
 
@@ -1042,20 +1139,22 @@ static void gateway_failsafe_safety_check(void)
     }
 
     if (fc_heartbeat_lost) {
+        gateway_last_remote_state = RC_FAILSAFE;
         gateway_safety_disarm_latched = true;
 
 #if GATEWAY_FAILSAFE_ACTION_MODE == GATEWAY_FAILSAFE_ACTION_BENCH_DISARM
         gateway_start_real_disarm_for_safety(
-            "RC link timeout"
+            "FC heartbeat timeout"
         );
 #elif GATEWAY_FAILSAFE_ACTION_MODE == GATEWAY_FAILSAFE_ACTION_FLIGHT_RTL
         gateway_start_rtl_for_safety(
-            "RC state FAILSAFE"
+            "FC heartbeat timeout"
         );
 #endif
 
         return;
     }
+
 #endif
 }
 
@@ -1616,6 +1715,222 @@ static void heartbeat_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(HEARTBEAT_PERIOD_MS));
     }
 }
+static const char *gateway_gps_fix_to_string(uint8_t fix_type)
+{
+    switch (fix_type) {
+    case GPS_FIX_TYPE_NO_GPS:
+        return "NO_GPS";
+
+    case GPS_FIX_TYPE_NO_FIX:
+        return "NO_FIX";
+
+    case GPS_FIX_TYPE_2D_FIX:
+        return "2D";
+
+    case GPS_FIX_TYPE_3D_FIX:
+        return "3D";
+
+    case GPS_FIX_TYPE_DGPS:
+        return "DGPS";
+
+    case GPS_FIX_TYPE_RTK_FLOAT:
+        return "RTK_FLOAT";
+
+    case GPS_FIX_TYPE_RTK_FIXED:
+        return "RTK_FIXED";
+
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static void gateway_print_fc_telemetry(void)
+{
+    float battery_v = fc_tel_battery_voltage_mv / 1000.0f;
+    float battery_a = 0.0f;
+
+    if (fc_tel_battery_current_ca >= 0) {
+        battery_a = fc_tel_battery_current_ca / 100.0f;
+    }
+
+    double lat_deg = fc_tel_lat / 10000000.0;
+    double lon_deg = fc_tel_lon / 10000000.0;
+
+    float alt_m = fc_tel_alt_mm / 1000.0f;
+    float rel_alt_m = fc_tel_relative_alt_mm / 1000.0f;
+
+    float roll_deg = fc_tel_roll_rad * 57.2957795f;
+    float pitch_deg = fc_tel_pitch_rad * 57.2957795f;
+    float yaw_deg = fc_tel_yaw_rad * 57.2957795f;
+
+    ESP_LOGI(
+        TAG,
+        "FC TELEMETRY batt=%.2fV current=%.2fA rem=%d%% gps=%s sats=%u "
+        "lat=%.7f lon=%.7f alt=%.1fm rel=%.1fm roll=%.1f pitch=%.1f yaw=%.1f",
+        battery_v,
+        battery_a,
+        fc_tel_battery_remaining,
+        gateway_gps_fix_to_string(fc_tel_gps_fix_type),
+        fc_tel_satellites_visible,
+        lat_deg,
+        lon_deg,
+        alt_m,
+        rel_alt_m,
+        roll_deg,
+        pitch_deg,
+        yaw_deg
+    );
+}
+static bool gateway_send_message_interval_request(
+    uint32_t message_id,
+    int32_t interval_us,
+    const char *name
+)
+{
+    mavlink_message_t msg;
+
+    uint8_t target_sys = fc_seen_sys_id;
+    uint8_t target_comp = fc_seen_comp_id;
+
+    if (target_sys == 0) {
+        target_sys = FC_COMMAND_TARGET_SYS_ID_FALLBACK;
+    }
+
+    if (target_comp == 0) {
+        target_comp = FC_COMMAND_TARGET_COMP_ID_FALLBACK;
+    }
+
+    /*
+       MAV_CMD_SET_MESSAGE_INTERVAL
+
+       param1 = MAVLink message ID
+       param2 = interval in microseconds
+                -1 disables
+                 0 restores default
+                >0 requested interval
+    */
+    mavlink_msg_command_long_pack(
+        GATEWAY_MAV_SYS_ID,
+        GATEWAY_MAV_COMP_ID,
+        &msg,
+
+        target_sys,
+        target_comp,
+
+        MAV_CMD_SET_MESSAGE_INTERVAL,
+        0,
+
+        (float)message_id,
+        (float)interval_us,
+        0.0f,
+        0.0f,
+        0.0f,
+        0.0f,
+        0.0f
+    );
+
+    mavlink_send_message(&msg);
+
+    ESP_LOGW(
+        TAG,
+        "TELEMETRY REQUEST %s msg_id=%" PRIu32
+        " interval_us=%" PRId32
+        " target_sys=%u target_comp=%u",
+        name ? name : "UNKNOWN",
+        message_id,
+        interval_us,
+        target_sys,
+        target_comp
+    );
+
+    return true;
+}
+
+static void gateway_request_telemetry_streams_once(void)
+{
+    /*
+       Core health / battery.
+    */
+    gateway_send_message_interval_request(
+        MAVLINK_MSG_ID_SYS_STATUS,
+        TELEMETRY_REQUEST_SLOW_INTERVAL_US,
+        "SYS_STATUS"
+    );
+
+    gateway_send_message_interval_request(
+        MAVLINK_MSG_ID_BATTERY_STATUS,
+        TELEMETRY_REQUEST_SLOW_INTERVAL_US,
+        "BATTERY_STATUS"
+    );
+
+    /*
+       GPS / position.
+    */
+    gateway_send_message_interval_request(
+        MAVLINK_MSG_ID_GPS_RAW_INT,
+        TELEMETRY_REQUEST_SLOW_INTERVAL_US,
+        "GPS_RAW_INT"
+    );
+
+    gateway_send_message_interval_request(
+        MAVLINK_MSG_ID_GLOBAL_POSITION_INT,
+        TELEMETRY_REQUEST_MED_INTERVAL_US,
+        "GLOBAL_POSITION_INT"
+    );
+
+    /*
+       Attitude and flight information.
+    */
+    gateway_send_message_interval_request(
+        MAVLINK_MSG_ID_ATTITUDE,
+        TELEMETRY_REQUEST_FAST_INTERVAL_US,
+        "ATTITUDE"
+    );
+
+    gateway_send_message_interval_request(
+        MAVLINK_MSG_ID_VFR_HUD,
+        TELEMETRY_REQUEST_MED_INTERVAL_US,
+        "VFR_HUD"
+    );
+
+    gateway_send_message_interval_request(
+        MAVLINK_MSG_ID_EXTENDED_SYS_STATE,
+        TELEMETRY_REQUEST_SLOW_INTERVAL_US,
+        "EXTENDED_SYS_STATE"
+    );
+}
+
+static void telemetry_request_task(void *arg)
+{
+    int request_round = 0;
+
+    /*
+       Wait until the gateway has seen the FC heartbeat.
+       That gives us real target sysid/compid.
+    */
+    while (!fc_heartbeat_is_fresh()) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    ESP_LOGW(TAG, "FC heartbeat fresh. Starting telemetry stream requests.");
+
+    while (true) {
+        gateway_request_telemetry_streams_once();
+
+        request_round++;
+
+        /*
+           First few rounds repeat more often to make sure ArduPilot accepts
+           the requested stream rates. After that, refresh once per minute.
+        */
+        if (request_round < TELEMETRY_REQUEST_ROUNDS) {
+            vTaskDelay(pdMS_TO_TICKS(TELEMETRY_REQUEST_REPEAT_MS));
+        }
+        else {
+            vTaskDelay(pdMS_TO_TICKS(60000));
+        }
+    }
+}
 
 static void mavlink_rx_task(void *arg)
 {
@@ -1665,6 +1980,7 @@ static void mavlink_rx_task(void *arg)
             fc_seen_comp_id = msg.compid;
 
             fc_is_armed = (heartbeat.base_mode & MAV_MODE_FLAG_SAFETY_ARMED) ? 1 : 0;
+            fc_tel_system_status = heartbeat.system_status;
 
 #if FEATURE_REAL_MAVLINK_ARMING
             if (fc_is_armed && gateway_arm_pending) {
@@ -1686,6 +2002,7 @@ static void mavlink_rx_task(void *arg)
             }
 #endif
         }
+
         else if (msg.msgid == MAVLINK_MSG_ID_COMMAND_ACK) {
             mavlink_command_ack_t ack;
             mavlink_msg_command_ack_decode(&msg, &ack);
@@ -1720,7 +2037,6 @@ static void mavlink_rx_task(void *arg)
 #endif
             }
 
-
             if (ack.command == MAV_CMD_NAV_RETURN_TO_LAUNCH) {
                 ESP_LOGW(
                     TAG,
@@ -1729,7 +2045,7 @@ static void mavlink_rx_task(void *arg)
                     ack.result
                 );
 
-            #if FEATURE_REAL_MAVLINK_ARMING
+#if FEATURE_REAL_MAVLINK_ARMING
                 if (ack.result == MAV_RESULT_ACCEPTED ||
                     ack.result == MAV_RESULT_IN_PROGRESS) {
                     gateway_action_publish(GATEWAY_ACTION_RTL_CONFIRMED);
@@ -1743,13 +2059,95 @@ static void mavlink_rx_task(void *arg)
 
                     ESP_LOGW(TAG, "REAL RTL denied by FC");
                 }
-            #endif
+#endif
             }
 
+            if (ack.command == MAV_CMD_SET_MESSAGE_INTERVAL) {
+                ESP_LOGW(
+                    TAG,
+                    "FC COMMAND_ACK SET_MESSAGE_INTERVAL result=%s raw=%u",
+                    gateway_mav_result_to_string(ack.result),
+                    ack.result
+                );
+            }
+        }
 
+        else if (msg.msgid == MAVLINK_MSG_ID_SYS_STATUS) {
+            mavlink_sys_status_t sys_status;
+            mavlink_msg_sys_status_decode(&msg, &sys_status);
+
+            fc_tel_sys_status_seen = true;
+            fc_tel_battery_voltage_mv = sys_status.voltage_battery;
+            fc_tel_battery_current_ca = sys_status.current_battery;
+            fc_tel_battery_remaining = sys_status.battery_remaining;
+            fc_tel_battery_update_us = esp_timer_get_time();
+        }
+
+        else if (msg.msgid == MAVLINK_MSG_ID_BATTERY_STATUS) {
+            mavlink_battery_status_t battery;
+            mavlink_msg_battery_status_decode(&msg, &battery);
+
+            /*
+               BATTERY_STATUS current is in centi-amps.
+               battery_remaining is percent, or -1 if unknown.
+            */
+            fc_tel_battery_current_ca = battery.current_battery;
+            fc_tel_battery_remaining = battery.battery_remaining;
+            fc_tel_battery_update_us = esp_timer_get_time();
+        }
+
+        else if (msg.msgid == MAVLINK_MSG_ID_GPS_RAW_INT) {
+            mavlink_gps_raw_int_t gps;
+            mavlink_msg_gps_raw_int_decode(&msg, &gps);
+
+            fc_tel_gps_seen = true;
+            fc_tel_gps_fix_type = gps.fix_type;
+            fc_tel_satellites_visible = gps.satellites_visible;
+
+            /*
+               GPS_RAW_INT:
+               lat/lon = degrees * 1E7
+               alt     = millimeters MSL
+            */
+            fc_tel_lat = gps.lat;
+            fc_tel_lon = gps.lon;
+            fc_tel_alt_mm = gps.alt;
+            fc_tel_gps_update_us = esp_timer_get_time();
+        }
+
+        else if (msg.msgid == MAVLINK_MSG_ID_GLOBAL_POSITION_INT) {
+            mavlink_global_position_int_t pos;
+            mavlink_msg_global_position_int_decode(&msg, &pos);
+
+            fc_tel_position_seen = true;
+
+            /*
+               GLOBAL_POSITION_INT:
+               lat/lon      = degrees * 1E7
+               alt          = millimeters MSL
+               relative_alt = millimeters above home
+            */
+            fc_tel_lat = pos.lat;
+            fc_tel_lon = pos.lon;
+            fc_tel_alt_mm = pos.alt;
+            fc_tel_relative_alt_mm = pos.relative_alt;
+            fc_tel_position_update_us = esp_timer_get_time();
+        }
+
+        else if (msg.msgid == MAVLINK_MSG_ID_ATTITUDE) {
+            mavlink_attitude_t attitude;
+            mavlink_msg_attitude_decode(&msg, &attitude);
+
+            fc_tel_attitude_seen = true;
+
+            fc_tel_roll_rad = attitude.roll;
+            fc_tel_pitch_rad = attitude.pitch;
+            fc_tel_yaw_rad = attitude.yaw;
+            fc_tel_attitude_update_us = esp_timer_get_time();
         }
     }
 }
+
 static void gateway_status_tx_task(void *arg)
 {
     uint32_t print_counter = 0;
@@ -1758,6 +2156,7 @@ static void gateway_status_tx_task(void *arg)
 
     while (true) {
         bool ok = gateway_status_send_once();
+        bool telemetry_ok = gateway_telemetry_send_once();
 
         gateway_action_tick_after_status_send(ok);
         gateway_arm_disarm_timeout_check();
@@ -1768,8 +2167,9 @@ static void gateway_status_tx_task(void *arg)
         if (print_counter == 1 || (print_counter % 10) == 0) {
             ESP_LOGI(
                 TAG,
-                "Gateway status TX %s fc_fresh=%u fc=%s remote=%s link=%u action=%s ok=%" PRIu32 " bad=%" PRIu32 " replay=%" PRIu32,
+                "Gateway status TX %s telemetry=%s fc_fresh=%u fc=%s remote=%s link=%u action=%s ok=%" PRIu32 " bad=%" PRIu32 " replay=%" PRIu32,
                 ok ? "OK" : "FAILED",
+                telemetry_ok ? "OK" : "FAILED",
                 fc_heartbeat_is_fresh() ? 1 : 0,
                 fc_is_armed ? "ARMED" : "DISARMED",
                 rc_state_to_string(gateway_last_remote_state),
@@ -1865,6 +2265,159 @@ static bool gateway_status_send_once(void)
 
     return written == wire_frame_len;
 }
+static int16_t gateway_radians_to_centidegrees(float radians)
+{
+    float degrees = radians * 57.2957795f;
+    int32_t centidegrees = (int32_t)(degrees * 100.0f);
+
+    if (centidegrees > INT16_MAX) {
+        centidegrees = INT16_MAX;
+    }
+    else if (centidegrees < INT16_MIN) {
+        centidegrees = INT16_MIN;
+    }
+
+    return (int16_t)centidegrees;
+}
+
+static bool gateway_telemetry_value_is_fresh(int64_t update_us, int64_t now_us)
+{
+    if (update_us <= 0) {
+        return false;
+    }
+
+    return ((now_us - update_us) / 1000) <= GATEWAY_TELEMETRY_FRESH_MS;
+}
+
+static bool gateway_telemetry_send_once(void)
+{
+    gateway_telemetry_packet_t telemetry;
+    memset(&telemetry, 0, sizeof(telemetry));
+
+    uint32_t seq = gateway_status_tx_sequence++;
+    int64_t now_us = esp_timer_get_time();
+
+    telemetry.packet_id = seq;
+    telemetry.sample_time_ms = (uint32_t)(now_us / 1000);
+
+    telemetry.battery_voltage_mv = fc_tel_battery_voltage_mv;
+    telemetry.battery_current_ca = fc_tel_battery_current_ca;
+    telemetry.battery_remaining = fc_tel_battery_remaining;
+
+    telemetry.gps_fix_type = fc_tel_gps_fix_type;
+    telemetry.satellites_visible = fc_tel_satellites_visible;
+
+    telemetry.latitude_e7 = fc_tel_lat;
+    telemetry.longitude_e7 = fc_tel_lon;
+    telemetry.altitude_mm = fc_tel_alt_mm;
+    telemetry.relative_altitude_mm = fc_tel_relative_alt_mm;
+
+    telemetry.roll_cd = gateway_radians_to_centidegrees(fc_tel_roll_rad);
+    telemetry.pitch_cd = gateway_radians_to_centidegrees(fc_tel_pitch_rad);
+    telemetry.yaw_cd = gateway_radians_to_centidegrees(fc_tel_yaw_rad);
+
+    telemetry.fc_is_armed = fc_is_armed ? 1 : 0;
+    telemetry.system_status = fc_tel_system_status;
+
+    if (gateway_telemetry_value_is_fresh(fc_tel_battery_update_us, now_us)) {
+        telemetry.telemetry_flags |= GATEWAY_TELEMETRY_FLAG_BATTERY_FRESH;
+    }
+
+    if (gateway_telemetry_value_is_fresh(fc_tel_gps_update_us, now_us)) {
+        telemetry.telemetry_flags |= GATEWAY_TELEMETRY_FLAG_GPS_FRESH;
+    }
+
+    if (gateway_telemetry_value_is_fresh(fc_tel_position_update_us, now_us)) {
+        telemetry.telemetry_flags |= GATEWAY_TELEMETRY_FLAG_POSITION_FRESH;
+    }
+
+    if (gateway_telemetry_value_is_fresh(fc_tel_attitude_update_us, now_us)) {
+        telemetry.telemetry_flags |= GATEWAY_TELEMETRY_FLAG_ATTITUDE_FRESH;
+    }
+
+    mathos_secure_packet_t packet;
+    memset(&packet, 0, sizeof(packet));
+
+    packet.sequence = seq;
+    packet.timestamp_ms = gateway_status_session_id;
+    packet.controller_id = SECURITY_GATEWAY_ID;
+    packet.link_id = GATEWAY_STATUS_LINK_ID;
+    packet.payload_type = SECURITY_PAYLOAD_TYPE_GATEWAY_TELEMETRY;
+    packet.payload_len = sizeof(gateway_telemetry_packet_t);
+
+    if (packet.payload_len > MATHOS_PAYLOAD_MAX_LEN) {
+        ESP_LOGE(
+            TAG,
+            "Gateway telemetry payload too large: %u max=%u",
+            packet.payload_len,
+            MATHOS_PAYLOAD_MAX_LEN
+        );
+        return false;
+    }
+
+    memcpy(packet.payload, &telemetry, sizeof(telemetry));
+
+    mathos_secure_status_t crypto_status = mathos_secure_encrypt_packet(&packet);
+
+    if (crypto_status != MATHOS_SECURE_STATUS_OK) {
+        ESP_LOGW(
+            TAG,
+            "Gateway telemetry encrypt failed: %s",
+            mathos_secure_status_to_string(crypto_status)
+        );
+        return false;
+    }
+
+    uint8_t wire_frame[MATHOS_WIRE_MAX_FRAME_LEN];
+    size_t wire_frame_len = 0;
+
+    mathos_status_t encode_status = mathos_wire_encode(
+        &packet,
+        wire_frame,
+        sizeof(wire_frame),
+        &wire_frame_len
+    );
+
+    if (encode_status != MATHOS_STATUS_OK) {
+        ESP_LOGW(
+            TAG,
+            "Gateway telemetry encode failed: %s",
+            mathos_status_to_string(encode_status)
+        );
+        return false;
+    }
+
+    int written = uart_write_bytes(
+        LINK_UART_NUM,
+        (const char *)wire_frame,
+        wire_frame_len
+    );
+
+    static uint32_t print_counter = 0;
+    print_counter++;
+
+    if (print_counter == 1 || (print_counter % 25) == 0) {
+        ESP_LOGI(
+            TAG,
+            "GATEWAY TELEMETRY TX packet=%" PRIu32
+            " flags=0x%02X batt=%umV rem=%d%% gps=%u sats=%u"
+            " rel_alt=%" PRId32 "mm roll=%dcd pitch=%dcd yaw=%dcd",
+            telemetry.packet_id,
+            telemetry.telemetry_flags,
+            telemetry.battery_voltage_mv,
+            telemetry.battery_remaining,
+            telemetry.gps_fix_type,
+            telemetry.satellites_visible,
+            telemetry.relative_altitude_mm,
+            telemetry.roll_cd,
+            telemetry.pitch_cd,
+            telemetry.yaw_cd
+        );
+    }
+
+    return written == wire_frame_len;
+}
+
 static void health_task(void *arg)
 {
     while (true) {
@@ -1893,7 +2446,13 @@ static void health_task(void *arg)
             rc_age_ms,
             fc_hb_age_ms
         );
+        static uint32_t telemetry_print_counter = 0;
 
+        telemetry_print_counter++;
+
+        if ((telemetry_print_counter % 5) == 0) {
+            gateway_print_fc_telemetry();
+        }
         vTaskDelay(pdMS_TO_TICKS(HEALTH_PERIOD_MS));
     }
 }
@@ -1939,5 +2498,6 @@ ESP_LOGI(
     xTaskCreate(mavlink_rx_task, "mavlink_rx_task", 4096, NULL, 6, NULL);
     xTaskCreate(health_task, "health_task", 4096, NULL, 4, NULL);
     xTaskCreate(gateway_status_tx_task, "gateway_status_tx_task", 4096, NULL, 5, NULL);
+    xTaskCreate(telemetry_request_task, "telemetry_request_task", 4096, NULL, 4, NULL);
     ESP_LOGI(TAG, "Drone gateway started");
 }

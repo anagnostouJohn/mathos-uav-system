@@ -59,7 +59,7 @@
 
     Set this to 0 before real ARM/DISARM or flight testing.
 */
-#define FEATURE_RECOVER_BENCH_ALLOW_FC_DISARMED 1
+#define FEATURE_RECOVER_BENCH_ALLOW_FC_DISARMED 0
 #define RGB_LED_PIN 48
 #define RGB_LED_COUNT 1
 
@@ -206,7 +206,7 @@
 
     Set this to 0 before real ARM/DISARM testing.
 */
-#define FEATURE_TREAT_GATEWAY_DRY_RUN_AS_CONFIRMED 1
+#define FEATURE_TREAT_GATEWAY_DRY_RUN_AS_CONFIRMED 0
 
 #if FEATURE_DIRECT_MAVLINK_MODE && FEATURE_SECURE_GATEWAY_MODE
 #error "Only one control mode can be enabled: DIRECT MAVLINK or SECURE GATEWAY"
@@ -228,9 +228,11 @@
 #define SECURITY_PAYLOAD_TYPE_RC 1
 #define SECURITY_GATEWAY_ID 2
 #define SECURITY_PAYLOAD_TYPE_GATEWAY_STATUS 2
+#define SECURITY_PAYLOAD_TYPE_GATEWAY_TELEMETRY 3
 
 #define LINK_RX_BUFFER_SIZE 128
 #define GATEWAY_STATUS_FRESH_MS 1000
+#define GATEWAY_TELEMETRY_FRESH_MS 1000
 #define SECURITY_PAYLOAD_MAX_LEN 64
 #define SECURITY_AUTH_TAG_LEN 16
 #define SECURITY_TIMING_DIAGNOSTIC DEBUG_SECURITY_TIMING
@@ -363,6 +365,38 @@ typedef struct __attribute__((packed))
     uint32_t rx_replay_count;
 } gateway_status_packet_t;
 
+#define GATEWAY_TELEMETRY_FLAG_BATTERY_FRESH (1u << 0)
+#define GATEWAY_TELEMETRY_FLAG_GPS_FRESH (1u << 1)
+#define GATEWAY_TELEMETRY_FLAG_POSITION_FRESH (1u << 2)
+#define GATEWAY_TELEMETRY_FLAG_ATTITUDE_FRESH (1u << 3)
+
+typedef struct __attribute__((packed))
+{
+    uint32_t packet_id;
+    uint32_t sample_time_ms;
+
+    uint16_t battery_voltage_mv;
+    int16_t battery_current_ca;
+    int8_t battery_remaining;
+
+    uint8_t gps_fix_type;
+    uint8_t satellites_visible;
+    uint8_t telemetry_flags;
+
+    int32_t latitude_e7;
+    int32_t longitude_e7;
+    int32_t altitude_mm;
+    int32_t relative_altitude_mm;
+
+    int16_t roll_cd;
+    int16_t pitch_cd;
+    int16_t yaw_cd;
+
+    uint8_t fc_is_armed;
+    uint8_t system_status;
+    uint8_t reserved[2];
+} gateway_telemetry_packet_t;
+
 typedef struct
 {
     uint32_t sequence;
@@ -445,6 +479,7 @@ volatile TickType_t telemetry_last_update_tick = 0;
 volatile TickType_t fc_arm_pending_start_tick = 0;
 volatile TickType_t fc_disarm_pending_start_tick = 0;
 volatile TickType_t gateway_status_last_update_tick = 0;
+volatile TickType_t gateway_telemetry_last_update_tick = 0;
 volatile rc_state_t drone_state = RC_DISARMED;
 volatile rc_state_t drone_command_state = RC_DISARMED;
 volatile command_status_t command_status = COMMAND_STATUS_IDLE;
@@ -459,6 +494,7 @@ volatile int fc_arm_pending = 0;
 volatile int fc_disarm_pending = 0;
 
 volatile int gateway_status_valid = 0;
+volatile int gateway_telemetry_valid = 0;
 
 volatile uint8_t fc_system_id = 0;
 volatile uint8_t fc_component_id = 0;
@@ -469,6 +505,7 @@ volatile uint8_t fc_system_status = 0;
 volatile uint32_t fc_custom_mode = 0;
 static uint32_t mathos_session_id = 1;
 static gateway_status_packet_t gateway_status_snapshot = {0};
+static gateway_telemetry_packet_t gateway_telemetry_snapshot = {0};
 volatile rc_input_t rc_input = {
     .throttle = 0,
     .yaw = 0,
@@ -484,6 +521,7 @@ portMUX_TYPE state_mux = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE heartbeat_mux = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE security_mux = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE gateway_status_mux = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE gateway_telemetry_mux = portMUX_INITIALIZER_UNLOCKED;
 
 SemaphoreHandle_t button_semaphore_arm = NULL;
 SemaphoreHandle_t button_semaphore_failsafe = NULL;
@@ -802,7 +840,44 @@ static void lcd_draw_rect(int x, int y, int w, int h, uint16_t color)
         lcd_send_color(color);
     }
 }
+static void lcd_clear_region(int y, int height)
+{
+    if (y < 0 ||
+        height <= 0 ||
+        (y + height) > LCD_H)
+    {
+        return;
+    }
 
+    /*
+        One complete black LCD row.
+
+        Static memory prevents this 480-byte buffer
+        from being placed on the LCD task stack.
+    */
+    static uint8_t black_line[LCD_W * 2] = {0};
+
+    lcd_set_window(
+        0,
+        y,
+        LCD_W - 1,
+        y + height - 1);
+
+    gpio_set_level(LCD_DC, 1);
+
+    /*
+        Send one complete row per SPI transaction.
+
+        For a 195-pixel-high region this performs 195
+        transactions instead of 46,800 transactions.
+    */
+    for (int row = 0; row < height; row++)
+    {
+        lcd_spi_send_bytes(
+            black_line,
+            sizeof(black_line));
+    }
+}
 static const uint8_t *get_font(char c)
 {
     if (c >= 'a' && c <= 'z')
@@ -3641,7 +3716,7 @@ static void gateway_status_apply_to_remote(const gateway_status_packet_t *status
     case GATEWAY_ACTION_RTL_CONFIRMED:
     case GATEWAY_ACTION_RTL_DENIED:
     case GATEWAY_ACTION_RTL_TIMEOUT:
-    break;
+        break;
 
     default:
         break;
@@ -3662,6 +3737,173 @@ static void gateway_status_update(const gateway_status_packet_t *status)
     gateway_status_valid = 1;
 
     taskEXIT_CRITICAL(&gateway_status_mux);
+}
+
+static int gateway_telemetry_is_fresh(void)
+{
+    int valid;
+    TickType_t last_update;
+
+    taskENTER_CRITICAL(&gateway_telemetry_mux);
+    valid = gateway_telemetry_valid;
+    last_update = gateway_telemetry_last_update_tick;
+    taskEXIT_CRITICAL(&gateway_telemetry_mux);
+
+    if (!valid)
+    {
+        return 0;
+    }
+
+    return (xTaskGetTickCount() - last_update) <=
+           pdMS_TO_TICKS(GATEWAY_TELEMETRY_FRESH_MS);
+}
+
+static void gateway_telemetry_update(const gateway_telemetry_packet_t *telemetry)
+{
+    if (telemetry == NULL)
+    {
+        return;
+    }
+
+    taskENTER_CRITICAL(&gateway_telemetry_mux);
+    gateway_telemetry_snapshot = *telemetry;
+    gateway_telemetry_last_update_tick = xTaskGetTickCount();
+    gateway_telemetry_valid = 1;
+    taskEXIT_CRITICAL(&gateway_telemetry_mux);
+}
+
+
+static int gateway_telemetry_get_snapshot(
+    gateway_telemetry_packet_t *snapshot,
+    int *fresh)
+{
+    if (snapshot == NULL || fresh == NULL)
+    {
+        return 0;
+    }
+
+    int valid;
+    TickType_t last_update;
+
+    taskENTER_CRITICAL(&gateway_telemetry_mux);
+
+    *snapshot = gateway_telemetry_snapshot;
+    valid = gateway_telemetry_valid;
+    last_update = gateway_telemetry_last_update_tick;
+
+    taskEXIT_CRITICAL(&gateway_telemetry_mux);
+
+    if (!valid)
+    {
+        *fresh = 0;
+        return 0;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+
+    *fresh =
+        (now - last_update) <=
+        pdMS_TO_TICKS(GATEWAY_TELEMETRY_FRESH_MS);
+
+    return 1;
+}
+
+static const char *gateway_gps_fix_to_string(uint8_t fix_type)
+{
+    switch (fix_type)
+    {
+    case 0:
+        return "NO_GPS";
+    case 1:
+        return "NO_FIX";
+    case 2:
+        return "2D";
+    case 3:
+        return "3D";
+    case 4:
+        return "DGPS";
+    case 5:
+        return "RTK_FLOAT";
+    case 6:
+        return "RTK_FIXED";
+    default:
+        return "UNKNOWN";
+    }
+}
+static const char *gateway_gps_fix_to_lcd_text(uint8_t fix_type)
+{
+    switch (fix_type)
+    {
+    case 0:
+        return "NO GPS";
+
+    case 1:
+        return "NO FIX";
+
+    case 2:
+        return "2D";
+
+    case 3:
+        return "3D";
+
+    case 4:
+        return "DGPS";
+
+    case 5:
+        return "RTK FLT";
+
+    case 6:
+        return "RTK FIX";
+
+    default:
+        return "UNKNOWN";
+    }
+}
+static void gateway_telemetry_handle_packet(const mathos_secure_packet_t *packet)
+{
+    if (packet == NULL ||
+        packet->payload_len != sizeof(gateway_telemetry_packet_t))
+    {
+        printf("[GATEWAY TELEMETRY RX] bad payload_len=%u expected=%u\n",
+               packet ? packet->payload_len : 0,
+               (unsigned int)sizeof(gateway_telemetry_packet_t));
+        return;
+    }
+
+    gateway_telemetry_packet_t telemetry;
+    memset(&telemetry, 0, sizeof(telemetry));
+    memcpy(&telemetry, packet->payload, sizeof(telemetry));
+
+    gateway_telemetry_update(&telemetry);
+
+    static uint32_t print_counter = 0;
+    print_counter++;
+
+    if (print_counter == 1 || (print_counter % 25) == 0)
+    {
+        printf(
+            "[GATEWAY TELEMETRY RX] packet=%lu fresh=%d flags=0x%02X "
+            "batt=%.2fV current=%.2fA rem=%d%% gps=%s sats=%u "
+            "lat=%.7f lon=%.7f alt=%.1fm rel=%.1fm "
+            "roll=%.2f pitch=%.2f yaw=%.2f armed=%u status=%u\n",
+            (unsigned long)telemetry.packet_id,
+            gateway_telemetry_is_fresh(),
+            telemetry.telemetry_flags,
+            telemetry.battery_voltage_mv / 1000.0f,
+            telemetry.battery_current_ca / 100.0f,
+            telemetry.battery_remaining,
+            gateway_gps_fix_to_string(telemetry.gps_fix_type),
+            telemetry.satellites_visible,
+            telemetry.latitude_e7 / 10000000.0,
+            telemetry.longitude_e7 / 10000000.0,
+            telemetry.altitude_mm / 1000.0f,
+            telemetry.relative_altitude_mm / 1000.0f,
+            telemetry.roll_cd / 100.0f,
+            telemetry.pitch_cd / 100.0f,
+            telemetry.yaw_cd / 100.0f,
+            telemetry.fc_is_armed,
+            telemetry.system_status);
+    }
 }
 
 static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
@@ -3692,12 +3934,11 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
 
         if ((bad_count % 20) == 1)
         {
-            printf("[GATEWAY STATUS RX] wire BAD status=%s bad_count=%lu len=%u\n",
+            printf("[GATEWAY RX] wire BAD status=%s bad_count=%lu len=%u\n",
                    mathos_status_to_string(decode_status),
                    (unsigned long)bad_count,
                    (unsigned int)frame_len);
         }
-
         return;
     }
 
@@ -3709,42 +3950,20 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
 
         if ((bad_count % 20) == 1)
         {
-            printf("[GATEWAY STATUS RX] crypto BAD status=%s bad_count=%lu len=%u\n",
+            printf("[GATEWAY RX] crypto BAD status=%s bad_count=%lu len=%u\n",
                    mathos_secure_status_to_string(crypto_status),
                    (unsigned long)bad_count,
                    (unsigned int)frame_len);
         }
-
         return;
     }
 
     if (packet.controller_id != SECURITY_GATEWAY_ID)
     {
         bad_count++;
-
-        printf("[GATEWAY STATUS RX] bad controller_id=%u expected=%u\n",
+        printf("[GATEWAY RX] bad controller_id=%u expected=%u\n",
                packet.controller_id,
                SECURITY_GATEWAY_ID);
-        return;
-    }
-
-    if (packet.payload_type != SECURITY_PAYLOAD_TYPE_GATEWAY_STATUS)
-    {
-        bad_count++;
-
-        printf("[GATEWAY STATUS RX] bad payload_type=%u expected=%u\n",
-               packet.payload_type,
-               SECURITY_PAYLOAD_TYPE_GATEWAY_STATUS);
-        return;
-    }
-
-    if (packet.payload_len != sizeof(gateway_status_packet_t))
-    {
-        bad_count++;
-
-        printf("[GATEWAY STATUS RX] bad payload_len=%u expected=%u\n",
-               packet.payload_len,
-               (unsigned int)sizeof(gateway_status_packet_t));
         return;
     }
 
@@ -3752,7 +3971,7 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
 
     if (!has_session || session_id != last_session_id)
     {
-        printf("[GATEWAY STATUS RX] NEW SESSION old=0x%08lx new=0x%08lx reset last_sequence\n",
+        printf("[GATEWAY RX] NEW SESSION old=0x%08lx new=0x%08lx reset last_sequence\n",
                (unsigned long)last_session_id,
                (unsigned long)session_id);
 
@@ -3765,55 +3984,83 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
     {
         replay_count++;
 
-        printf("[GATEWAY STATUS RX] REPLAY/OLD session=0x%08lx seq=%lu last=%lu replay_count=%lu\n",
+        printf("[GATEWAY RX] REPLAY/OLD session=0x%08lx seq=%lu last=%lu replay_count=%lu\n",
                (unsigned long)session_id,
                (unsigned long)packet.sequence,
                (unsigned long)last_sequence,
                (unsigned long)replay_count);
-
         return;
     }
 
     last_sequence = packet.sequence;
 
-    gateway_status_packet_t status;
-    memset(&status, 0, sizeof(status));
-
-    memcpy(&status, packet.payload, sizeof(status));
-
-    gateway_status_update(&status);
-    gateway_status_apply_to_remote(&status);
-
-    ok_count++;
-
-    static uint32_t print_counter = 0;
-    static uint8_t last_fc_armed = 255;
-    static uint8_t last_fc_fresh = 255;
-    static uint8_t last_action = 255;
-
-    print_counter++;
-
-    int changed =
-        (last_fc_armed != status.fc_is_armed) ||
-        (last_fc_fresh != status.fc_heartbeat_fresh) ||
-        (last_action != status.last_action);
-
-    if (changed || print_counter == 1 || (print_counter % 10) == 0)
+    if (packet.payload_type == SECURITY_PAYLOAD_TYPE_GATEWAY_STATUS)
     {
-        last_fc_armed = status.fc_is_armed;
-        last_fc_fresh = status.fc_heartbeat_fresh;
-        last_action = status.last_action;
+        if (packet.payload_len != sizeof(gateway_status_packet_t))
+        {
+            bad_count++;
+            printf("[GATEWAY STATUS RX] bad payload_len=%u expected=%u\n",
+                   packet.payload_len,
+                   (unsigned int)sizeof(gateway_status_packet_t));
+            return;
+        }
 
-        printf("[GATEWAY STATUS RX] packet_id=%lu fc=%s fc_fresh=%u remote=%s link=%u action=%s ok=%lu bad=%lu replay=%lu\n",
-               (unsigned long)status.packet_id,
-               status.fc_is_armed ? "ARMED" : "DISARMED",
-               status.fc_heartbeat_fresh,
-               state_to_string((rc_state_t)status.remote_state),
-               status.gateway_link_ok,
-               gateway_action_to_string(status.last_action),
-               (unsigned long)status.rx_ok_count,
-               (unsigned long)status.rx_bad_count,
-               (unsigned long)status.rx_replay_count);
+        gateway_status_packet_t status;
+        memset(&status, 0, sizeof(status));
+        memcpy(&status, packet.payload, sizeof(status));
+
+        gateway_status_update(&status);
+        gateway_status_apply_to_remote(&status);
+        ok_count++;
+
+        static uint32_t print_counter = 0;
+        static uint8_t last_fc_armed = 255;
+        static uint8_t last_fc_fresh = 255;
+        static uint8_t last_action = 255;
+
+        print_counter++;
+
+        int changed =
+            (last_fc_armed != status.fc_is_armed) ||
+            (last_fc_fresh != status.fc_heartbeat_fresh) ||
+            (last_action != status.last_action);
+
+        if (changed || print_counter == 1 || (print_counter % 10) == 0)
+        {
+            last_fc_armed = status.fc_is_armed;
+            last_fc_fresh = status.fc_heartbeat_fresh;
+            last_action = status.last_action;
+
+            printf("[GATEWAY STATUS RX] packet_id=%lu fc=%s fc_fresh=%u remote=%s link=%u action=%s ok=%lu bad=%lu replay=%lu\n",
+                   (unsigned long)status.packet_id,
+                   status.fc_is_armed ? "ARMED" : "DISARMED",
+                   status.fc_heartbeat_fresh,
+                   state_to_string((rc_state_t)status.remote_state),
+                   status.gateway_link_ok,
+                   gateway_action_to_string(status.last_action),
+                   (unsigned long)status.rx_ok_count,
+                   (unsigned long)status.rx_bad_count,
+                   (unsigned long)status.rx_replay_count);
+        }
+    }
+    else if (packet.payload_type == SECURITY_PAYLOAD_TYPE_GATEWAY_TELEMETRY)
+    {
+        if (packet.payload_len != sizeof(gateway_telemetry_packet_t))
+        {
+            bad_count++;
+            printf("[GATEWAY TELEMETRY RX] bad payload_len=%u expected=%u\n",
+                   packet.payload_len,
+                   (unsigned int)sizeof(gateway_telemetry_packet_t));
+            return;
+        }
+
+        gateway_telemetry_handle_packet(&packet);
+        ok_count++;
+    }
+    else
+    {
+        bad_count++;
+        printf("[GATEWAY RX] unsupported payload_type=%u\n", packet.payload_type);
     }
 }
 
@@ -4813,8 +5060,26 @@ void lcd_task(void *pvParameters)
     int last_arm_locked = -1;
     int last_ready_to_arm = -1;
     int last_boot_lock = -1;
+    int last_telemetry_display_state = -1;
+    int last_battery_data_valid = -1;
+    uint16_t last_battery_display_mv = UINT16_MAX;
+    int last_gps_data_fresh = -1;
+    uint8_t last_gps_fix_type = UINT8_MAX;
+    uint8_t last_satellites_visible = UINT8_MAX;
+    int last_altitude_data_valid = -1;
+    int32_t last_relative_altitude_m = INT32_MAX;
+    int last_battery_percent_valid = -1;
+    int last_battery_percent = -1;
     lcd_fill_color(COLOR_BLACK);
 
+
+
+    lcd_draw_text_centered(
+    15,
+    "REMOTE",
+    3,
+    COLOR_WHITE,
+    COLOR_BLACK);
     while (1)
     {
         heartbeat_mark(HB_LCD);
@@ -4830,7 +5095,119 @@ void lcd_task(void *pvParameters)
         int boot_lock = arm_boot_latch_is_active();
         arm_status_t arm_status = get_arm_status();
         uint32_t real_faults = faults & ~(FAULT_ARM_SWITCH_OFF | FAULT_MASTER_SWITCH_OFF);
+        gateway_telemetry_packet_t telemetry_snapshot;
+        int telemetry_fresh = 0;
 
+        int telemetry_available =
+            gateway_telemetry_get_snapshot(
+                &telemetry_snapshot,
+                &telemetry_fresh);
+
+        int telemetry_display_state = 0;
+
+        if (telemetry_available)
+        {
+            telemetry_display_state =
+                telemetry_fresh ? 2 : 1;
+        }
+/*
+    Battery data is usable only when:
+
+    1. A telemetry packet exists.
+    2. The complete telemetry packet is fresh.
+    3. The gateway says the battery MAVLink message is fresh.
+    4. The FC reports a voltage greater than zero.
+*/
+        int battery_data_valid =
+            telemetry_available &&
+            telemetry_fresh &&
+            (telemetry_snapshot.telemetry_flags &
+            GATEWAY_TELEMETRY_FLAG_BATTERY_FRESH) &&
+            telemetry_snapshot.battery_voltage_mv > 0;
+
+        /*
+            Round down to the nearest 100 mV.
+
+            Example:
+                15847 mV becomes 15800 mV.
+
+            This prevents tiny voltage changes from redrawing
+            the LCD five times per second.
+        */
+        uint16_t battery_display_mv = 0;
+
+        if (battery_data_valid)
+        {
+            battery_display_mv =
+                (telemetry_snapshot.battery_voltage_mv / 100U) * 100U;
+        }
+        /*
+    MAVLink battery_remaining uses:
+
+    0 to 100 = valid percentage
+    -1       = unknown
+*/
+        int battery_percent_valid =
+            battery_data_valid &&
+            telemetry_snapshot.battery_remaining >= 0 &&
+            telemetry_snapshot.battery_remaining <= 100;
+
+        int battery_percent = -1;
+
+        if (battery_percent_valid)
+        {
+            battery_percent =
+                telemetry_snapshot.battery_remaining;
+        }
+        /*
+    GPS data is fresh when:
+
+    1. A telemetry packet exists.
+    2. The telemetry packet is fresh.
+    3. The gateway reports a fresh GPS_RAW_INT message.
+*/
+        int gps_data_fresh =
+            telemetry_available &&
+            telemetry_fresh &&
+            (telemetry_snapshot.telemetry_flags &
+            GATEWAY_TELEMETRY_FLAG_GPS_FRESH);
+
+        uint8_t gps_fix_type = UINT8_MAX;
+        uint8_t satellites_visible = UINT8_MAX;
+
+        if (gps_data_fresh)
+        {
+            gps_fix_type = telemetry_snapshot.gps_fix_type;
+            satellites_visible = telemetry_snapshot.satellites_visible;
+        }
+        /*
+            Used to redraw the telemetry line when the larger
+            status area has just been cleared.
+        */
+       /*
+    Relative altitude is valid only when the gateway reports
+    a fresh GLOBAL_POSITION_INT message.
+*/
+        int altitude_data_valid =
+            telemetry_available &&
+            telemetry_fresh &&
+            (telemetry_snapshot.telemetry_flags &
+            GATEWAY_TELEMETRY_FLAG_POSITION_FRESH);
+
+        int32_t relative_altitude_m = 0;
+
+        if (altitude_data_valid)
+        {
+            /*
+                Convert millimetres to whole metres.
+
+                Updating only when the whole-metre value changes
+                avoids excessive LCD redraws.
+            */
+            relative_altitude_m =
+                telemetry_snapshot.relative_altitude_mm / 1000;
+        }
+        int status_redrawn = 0;
         if (state != last_state ||
             link_mode != last_link_mode ||
             op_status != last_command_status ||
@@ -4850,13 +5227,13 @@ void lcd_task(void *pvParameters)
             last_ready_to_arm = ready_to_arm;
             last_boot_lock = boot_lock;
             last_arm_status = arm_status;
-            lcd_fill_color(COLOR_BLACK);
-
             /*
-                Title
-            */
-            lcd_draw_text_centered(15, "REMOTE", 3, COLOR_WHITE, COLOR_BLACK);
+                Keep the static title at the top.
 
+                Clear only the dynamic display area below it.
+            */
+            lcd_clear_region(45,LCD_H - 45);
+            status_redrawn = 1; 
             /*
                 Main state
             */
@@ -4978,7 +5355,221 @@ void lcd_task(void *pvParameters)
                 lcd_draw_text_centered(185, "FAULT", 3, COLOR_RED, COLOR_BLACK);
             }
         }
+        /*
+            Telemetry health line.
 
+            This region updates independently from the main
+            controller status display.
+        */
+        if (status_redrawn ||
+            telemetry_display_state != last_telemetry_display_state ||
+            battery_data_valid != last_battery_data_valid ||
+            battery_display_mv != last_battery_display_mv ||
+            gps_data_fresh != last_gps_data_fresh ||
+            gps_fix_type != last_gps_fix_type ||
+            satellites_visible != last_satellites_visible ||
+            altitude_data_valid != last_altitude_data_valid ||
+            relative_altitude_m != last_relative_altitude_m ||
+            battery_percent_valid != last_battery_percent_valid ||
+            battery_percent != last_battery_percent)
+        {
+            last_telemetry_display_state = telemetry_display_state;
+            last_battery_data_valid = battery_data_valid;
+            last_battery_display_mv = battery_display_mv;
+            last_gps_data_fresh = gps_data_fresh;
+            last_gps_fix_type = gps_fix_type;
+            last_satellites_visible = satellites_visible;
+            last_altitude_data_valid = altitude_data_valid;
+            last_relative_altitude_m = relative_altitude_m;
+            last_battery_percent_valid = battery_percent_valid;
+            last_battery_percent = battery_percent;
+
+            /*
+                Keep all the existing LCD drawing code here:
+                lcd_clear_region(...)
+                battery text
+                GPS text
+            */
+        
+/*
+    Clear only the two small telemetry lines.
+
+    Battery line:   Y = 210
+    Health line:    Y = 225
+*/
+        lcd_clear_region(
+            208,
+            27);
+
+        /*
+            First telemetry value: battery voltage.
+        */
+      
+
+        char battery_text[40];
+
+        if (battery_data_valid && altitude_data_valid)
+        {
+
+            if (relative_altitude_m < 0)
+            {
+                if (battery_percent_valid)
+                {
+                    snprintf(
+                        battery_text,
+                        sizeof(battery_text),
+                        "BAT %uMV %dP ALT N%ldM",
+                        (unsigned int)battery_display_mv,
+                        battery_percent,
+                        (long)(-relative_altitude_m));
+                }
+                else
+                {
+                    snprintf(
+                        battery_text,
+                        sizeof(battery_text),
+                        "BAT %uMV ALT N%ldM",
+                        (unsigned int)battery_display_mv,
+                        (long)(-relative_altitude_m));
+                }
+            }
+            else
+            {
+                if (battery_percent_valid)
+                {
+                    snprintf(
+                        battery_text,
+                        sizeof(battery_text),
+                        "BAT %uMV %dP ALT %ldM",
+                        (unsigned int)battery_display_mv,
+                        battery_percent,
+                        (long)relative_altitude_m);
+                }
+                else
+                {
+                    snprintf(
+                        battery_text,
+                        sizeof(battery_text),
+                        "BAT %uMV ALT %ldM",
+                        (unsigned int)battery_display_mv,
+                        (long)relative_altitude_m);
+                }
+            }
+        }
+        else if (battery_data_valid)
+        {
+            if (battery_percent_valid)
+            {
+                snprintf(
+                    battery_text,
+                    sizeof(battery_text),
+                    "BAT %uMV %dP ALT NO DATA",
+                    (unsigned int)battery_display_mv,
+                    battery_percent);
+            }
+            else
+            {
+                snprintf(
+                    battery_text,
+                    sizeof(battery_text),
+                    "BAT %uMV ALT NO DATA",
+                    (unsigned int)battery_display_mv);
+            }
+        }
+        else if (altitude_data_valid)
+        {
+            if (relative_altitude_m < 0)
+            {
+                snprintf(
+                    battery_text,
+                    sizeof(battery_text),
+                    "BAT NO DATA ALT N%ldM",
+                    (long)(-relative_altitude_m));
+            }
+            else
+            {
+                snprintf(
+                    battery_text,
+                    sizeof(battery_text),
+                    "BAT NO DATA ALT %ldM",
+                    (long)relative_altitude_m);
+            }
+        }
+        else
+        {
+            snprintf(
+                battery_text,
+                sizeof(battery_text),
+                "BAT NO DATA ALT NO DATA");
+        }
+
+        lcd_draw_text_centered(
+            210,
+            battery_text,
+            1,
+            battery_data_valid ? COLOR_BLUE : COLOR_RED,
+            COLOR_BLACK);
+
+        /*
+            Telemetry link health remains visible underneath.
+        */
+        if (telemetry_display_state == 2)
+        {
+            char telemetry_text[32];
+
+            if (gps_data_fresh)
+            {
+                snprintf(
+                    telemetry_text,
+                    sizeof(telemetry_text),
+                    "TEL OK GPS %s S%u",
+                    gateway_gps_fix_to_lcd_text(gps_fix_type),
+                    (unsigned int)satellites_visible);
+            }
+            else
+            {
+                snprintf(
+                    telemetry_text,
+                    sizeof(telemetry_text),
+                    "TEL OK GPS STALE");
+            }
+
+            uint16_t gps_color = COLOR_YELLOW;
+
+            /*
+                GPS fix type 2 or higher means at least a 2D fix.
+            */
+            if (gps_data_fresh && gps_fix_type >= 2)
+            {
+                gps_color = COLOR_BLUE;
+            }
+
+            lcd_draw_text_centered(
+                225,
+                telemetry_text,
+                1,
+                gps_color,
+                COLOR_BLACK);
+        }
+        else if (telemetry_display_state == 1)
+        {
+            lcd_draw_text_centered(
+                225,
+                "TEL STALE",
+                1,
+                COLOR_RED,
+                COLOR_BLACK);
+        }
+        else
+        {
+            lcd_draw_text_centered(
+                225,
+                "NO TEL",
+                1,
+                COLOR_RED,
+                COLOR_BLACK);
+        }
+    }
         vTaskDelay(pdMS_TO_TICKS(250));
     }
 }
