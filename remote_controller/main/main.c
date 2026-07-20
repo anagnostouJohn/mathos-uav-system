@@ -370,10 +370,19 @@ typedef struct __attribute__((packed))
 #define GATEWAY_TELEMETRY_FLAG_POSITION_FRESH (1u << 2)
 #define GATEWAY_TELEMETRY_FLAG_ATTITUDE_FRESH (1u << 3)
 
+
 typedef struct __attribute__((packed))
 {
     uint32_t packet_id;
     uint32_t sample_time_ms;
+
+    /*
+       Raw ArduPilot mode from MAVLink HEARTBEAT.custom_mode.
+
+       The remote will later convert this number into text such as:
+       MANUAL, FBWA, QHOVER, RTL, etc.
+    */
+    uint32_t fc_custom_mode;
 
     uint16_t battery_voltage_mv;
     int16_t battery_current_ca;
@@ -394,8 +403,37 @@ typedef struct __attribute__((packed))
 
     uint8_t fc_is_armed;
     uint8_t system_status;
-    uint8_t reserved[2];
+
+    /*
+       MAVLink HEARTBEAT.type.
+
+       This tells the remote which mode table should be used,
+       for example Plane/QuadPlane versus Copter.
+    */
+    uint8_t fc_vehicle_type;
+
+    uint8_t reserved;
 } gateway_telemetry_packet_t;
+
+_Static_assert(
+    sizeof(rc_state_t) == 4,
+    "rc_state_t size changed"
+);
+
+_Static_assert(
+    sizeof(rc_packet_t) == 24,
+    "rc_packet_t size mismatch"
+);
+
+_Static_assert(
+    sizeof(gateway_status_packet_t) == 28,
+    "gateway_status_packet_t size mismatch"
+);
+
+_Static_assert(
+    sizeof(gateway_telemetry_packet_t) == 46,
+    "gateway_telemetry_packet_t size mismatch"
+);
 
 typedef struct
 {
@@ -921,7 +959,43 @@ static int gateway_status_is_fresh(void)
 
     return 1;
 }
+/*
+    Returns true only when:
 
+    1. Gateway status packets are arriving.
+    2. The latest gateway status packet is fresh.
+    3. The gateway reports a fresh FC heartbeat.
+*/
+static int gateway_fc_heartbeat_is_fresh(void)
+{
+    int valid;
+    TickType_t last_update;
+    uint8_t fc_heartbeat_fresh;
+
+    taskENTER_CRITICAL(&gateway_status_mux);
+
+    valid = gateway_status_valid;
+    last_update = gateway_status_last_update_tick;
+    fc_heartbeat_fresh =
+        gateway_status_snapshot.fc_heartbeat_fresh;
+
+    taskEXIT_CRITICAL(&gateway_status_mux);
+
+    if (!valid)
+    {
+        return 0;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+
+    if ((now - last_update) >
+        pdMS_TO_TICKS(GATEWAY_STATUS_FRESH_MS))
+    {
+        return 0;
+    }
+
+    return fc_heartbeat_fresh ? 1 : 0;
+}
 static int gateway_control_link_is_ok(void)
 {
     int valid;
@@ -3713,9 +3787,23 @@ static void gateway_status_apply_to_remote(const gateway_status_packet_t *status
         break;
 
     case GATEWAY_ACTION_RTL_SENT:
+        printf(
+            "[REMOTE] RTL request sent by gateway. Waiting for FC mode.\n");
+        break;
+
     case GATEWAY_ACTION_RTL_CONFIRMED:
+        printf(
+            "[REMOTE] RTL CONFIRMED by FC heartbeat mode\n");
+        break;
+
     case GATEWAY_ACTION_RTL_DENIED:
+        printf(
+            "[REMOTE] RTL DENIED by flight controller\n");
+        break;
+
     case GATEWAY_ACTION_RTL_TIMEOUT:
+        printf(
+            "[REMOTE] RTL TIMEOUT: FC did not report RTL/QRTL\n");
         break;
 
     default:
@@ -3859,6 +3947,100 @@ static const char *gateway_gps_fix_to_lcd_text(uint8_t fix_type)
         return "UNKNOWN";
     }
 }
+
+/*
+   Convert ArduPlane / QuadPlane HEARTBEAT.custom_mode
+   into text for logs and the LCD.
+*/
+static const char *ardupilot_plane_mode_to_string(
+    uint32_t custom_mode)
+{
+    switch (custom_mode)
+    {
+    case 0:
+        return "MANUAL";
+
+    case 1:
+        return "CIRCLE";
+
+    case 2:
+        return "STABILIZE";
+
+    case 3:
+        return "TRAINING";
+
+    case 4:
+        return "ACRO";
+
+    case 5:
+        return "FBWA";
+
+    case 6:
+        return "FBWB";
+
+    case 7:
+        return "CRUISE";
+
+    case 8:
+        return "AUTOTUNE";
+
+    case 10:
+        return "AUTO";
+
+    case 11:
+        return "RTL";
+
+    case 12:
+        return "LOITER";
+
+    case 13:
+        return "TAKEOFF";
+
+    case 14:
+        return "AVOID ADSB";
+
+    case 15:
+        return "GUIDED";
+
+    case 16:
+        return "INITIALISING";
+
+    case 17:
+        return "QSTABILIZE";
+
+    case 18:
+        return "QHOVER";
+
+    case 19:
+        return "QLOITER";
+
+    case 20:
+        return "QLAND";
+
+    case 21:
+        return "QRTL";
+
+    case 22:
+        return "QAUTOTUNE";
+
+    case 23:
+        return "QACRO";
+
+    case 24:
+        return "THERMAL";
+
+    case 25:
+        return "LOITER QLAND";
+
+    case 26:
+        return "AUTOLAND";
+
+    default:
+        return "UNKNOWN";
+    }
+}
+
+
 static void gateway_telemetry_handle_packet(const mathos_secure_packet_t *packet)
 {
     if (packet == NULL ||
@@ -3877,17 +4059,28 @@ static void gateway_telemetry_handle_packet(const mathos_secure_packet_t *packet
     gateway_telemetry_update(&telemetry);
 
     static uint32_t print_counter = 0;
+    static uint32_t previous_mode = UINT32_MAX;
+
     print_counter++;
 
-    if (print_counter == 1 || (print_counter % 25) == 0)
+    int mode_changed =
+    telemetry.fc_custom_mode != previous_mode;
+
+    if (mode_changed || print_counter == 1 || (print_counter % 25) == 0)
     {
+        previous_mode = telemetry.fc_custom_mode;
         printf(
-            "[GATEWAY TELEMETRY RX] packet=%lu fresh=%d flags=0x%02X "
+            "[GATEWAY TELEMETRY RX] packet=%lu fresh=%d "
+            "mode=%lu mode_name=%s vehicle_type=%u flags=0x%02X "
             "batt=%.2fV current=%.2fA rem=%d%% gps=%s sats=%u "
             "lat=%.7f lon=%.7f alt=%.1fm rel=%.1fm "
             "roll=%.2f pitch=%.2f yaw=%.2f armed=%u status=%u\n",
             (unsigned long)telemetry.packet_id,
             gateway_telemetry_is_fresh(),
+            (unsigned long)telemetry.fc_custom_mode,
+            ardupilot_plane_mode_to_string(
+                telemetry.fc_custom_mode),
+            telemetry.fc_vehicle_type,
             telemetry.telemetry_flags,
             telemetry.battery_voltage_mv / 1000.0f,
             telemetry.battery_current_ca / 100.0f,
@@ -5070,6 +5263,8 @@ void lcd_task(void *pvParameters)
     int32_t last_relative_altitude_m = INT32_MAX;
     int last_battery_percent_valid = -1;
     int last_battery_percent = -1;
+    int last_mode_data_valid = -1;
+    uint32_t last_fc_mode = UINT32_MAX;
     lcd_fill_color(COLOR_BLACK);
 
 
@@ -5109,6 +5304,25 @@ void lcd_task(void *pvParameters)
         {
             telemetry_display_state =
                 telemetry_fresh ? 2 : 1;
+        }
+        /*
+   Flight mode is usable when the complete gateway
+   telemetry packet is fresh.
+
+   HEARTBEAT.custom_mode is carried in every outgoing
+   gateway telemetry snapshot.
+*/
+        int mode_data_valid =
+            telemetry_available &&
+            telemetry_fresh &&
+            gateway_fc_heartbeat_is_fresh();
+
+        uint32_t fc_mode = UINT32_MAX;
+
+        if (mode_data_valid)
+        {
+            fc_mode =
+                telemetry_snapshot.fc_custom_mode;
         }
 /*
     Battery data is usable only when:
@@ -5215,7 +5429,9 @@ void lcd_task(void *pvParameters)
             link_ok != last_link_ok ||
             master_off != last_master_off ||
             arm_locked != last_arm_locked ||
-            ready_to_arm != last_ready_to_arm || boot_lock != last_boot_lock || arm_status != last_arm_status)
+            boot_lock != last_boot_lock ||
+            mode_data_valid != last_mode_data_valid ||
+            fc_mode != last_fc_mode)
         {
             last_state = state;
             last_link_mode = link_mode;
@@ -5227,6 +5443,8 @@ void lcd_task(void *pvParameters)
             last_ready_to_arm = ready_to_arm;
             last_boot_lock = boot_lock;
             last_arm_status = arm_status;
+            last_mode_data_valid = mode_data_valid;
+            last_fc_mode = fc_mode;
             /*
                 Keep the static title at the top.
 
@@ -5237,6 +5455,8 @@ void lcd_task(void *pvParameters)
             /*
                 Main state
             */
+            last_ready_to_arm = ready_to_arm;
+            last_arm_status = arm_status;
             if (state == RC_FAILSAFE)
             {
                 lcd_draw_text_centered(65, "FAILSAFE", 3, COLOR_RED, COLOR_BLACK);
@@ -5286,17 +5506,62 @@ void lcd_task(void *pvParameters)
             {
                 lcd_draw_text_centered(120, "LINK RF", 2, COLOR_BLUE, COLOR_BLACK);
             }
+            /*
+            Flight-controller mode.
 
+            Keep this separate from the local controller state.
+            For example:
+
+                controller state = ARMED
+                FC mode          = QHOVER
+            */
+            char mode_text[32];
+
+            if (mode_data_valid)
+            {
+                snprintf(
+                    mode_text,
+                    sizeof(mode_text),
+                    "MODE %s",
+                    ardupilot_plane_mode_to_string(
+                        fc_mode));
+            }
+            else
+            {
+                snprintf(
+                    mode_text,
+                    sizeof(mode_text),
+                    "MODE NO DATA");
+            }
+
+            uint16_t mode_color =
+                mode_data_valid ? COLOR_BLUE : COLOR_RED;
+
+            /*
+            RTL and QRTL receive yellow emphasis.
+            */
+            if (mode_data_valid &&
+                (fc_mode == 11U || fc_mode == 21U))
+            {
+                mode_color = COLOR_YELLOW;
+            }
+
+            lcd_draw_text_centered(
+                142,
+                mode_text,
+                2,
+                mode_color,
+                COLOR_BLACK);
             /*
                 Drone link status
             */
             if (link_ok)
             {
-                lcd_draw_text_centered(155, "DRONE LINK OK", 1, COLOR_BLUE, COLOR_BLACK);
+                lcd_draw_text_centered(164, "DRONE LINK OK", 1, COLOR_BLUE, COLOR_BLACK);
             }
             else
             {
-                lcd_draw_text_centered(155, "DRONE LINK BAD", 1, COLOR_RED, COLOR_BLACK);
+                lcd_draw_text_centered(164, "DRONE LINK BAD", 1, COLOR_RED, COLOR_BLACK);
             }
 
             /*
@@ -5355,12 +5620,49 @@ void lcd_task(void *pvParameters)
                 lcd_draw_text_centered(185, "FAULT", 3, COLOR_RED, COLOR_BLACK);
             }
         }
+
+        
         /*
             Telemetry health line.
 
             This region updates independently from the main
             controller status display.
         */
+       /*
+    While DISARMED, joystick movement can change the
+    pre-arm result between READY and STICK BAD.
+
+    Redraw only the bottom status line instead of
+    clearing the complete dynamic LCD area.
+*/
+        if (state == RC_DISARMED &&
+            (ready_to_arm != last_ready_to_arm ||
+            arm_status != last_arm_status))
+        {
+            last_ready_to_arm = ready_to_arm;
+            last_arm_status = arm_status;
+
+            lcd_clear_region(185, 23);
+
+            if (arm_status == ARM_STATUS_READY)
+            {
+                lcd_draw_text_centered(
+                    185,
+                    "READY",
+                    3,
+                    COLOR_BLUE,
+                    COLOR_BLACK);
+            }
+            else
+            {
+                lcd_draw_text_centered(
+                    185,
+                    arm_status_to_lcd_text(arm_status),
+                    2,
+                    COLOR_RED,
+                    COLOR_BLACK);
+            }
+        }
         if (status_redrawn ||
             telemetry_display_state != last_telemetry_display_state ||
             battery_data_valid != last_battery_data_valid ||
