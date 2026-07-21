@@ -17,6 +17,12 @@
 #include "mathos_protocol.h"
 #include "mathos_secure.h"
 #include "esp_random.h"
+#include "mathos_messages.h"
+#include "mathos_flight_modes.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "nvs_flash.h"
 ////////////////////////////////////////////////////////////////////////////////////
 #define COMMAND_STATUS_MESSAGE_CLEAR_MS 3000
 
@@ -155,31 +161,22 @@
 //////////////////// MAVLINK
 #define JOY_X_ADC ADC_CHANNEL_5 // GPIO6
 #define JOY_Y_ADC ADC_CHANNEL_6 // GPIO7
-
 #define JOY2_X_ADC ADC_CHANNEL_3 // GPIO4
 #define JOY2_Y_ADC ADC_CHANNEL_4 // GPIO5
-
 #define ROLL_RAW_MIN 317
 #define ROLL_RAW_CENTER 2000
 #define ROLL_RAW_MAX 4095
-
 #define PITCH_RAW_MIN 429
 #define PITCH_RAW_CENTER 2300
 #define PITCH_RAW_MAX 4095
-
 #define AXIS_DEADZONE_RAW 120
-
 #define ROLL_INVERT 0
 #define PITCH_INVERT 1
-
 #define MIN_FREE_HEAP_BYTES 30000
 #define MIN_STACK_WATERMARK 512
-
 #define ARM_THROTTLE_MAX 50
 #define ARM_STICK_MAX 100
-
 #define DEBUG_SERIAL 1
-
 #define DEBUG_MAVLINK_TX 0
 #define DEBUG_SECURITY_PACKET 0
 #define DEBUG_SECURITY_TIMING 1
@@ -189,9 +186,19 @@
 #define SECURE_WIRE_TEST_PRINT_EVERY 100
 #define DEBUG_RC_PACKET_TX 1
 #define RC_PACKET_TX_PRINT_EVERY 50
-///////////////////FEATURE FLAGS//////////////////
+///////////////////WIFI//////////////////
 #define FEATURE_SECURITY_SKELETON 1
-#define FEATURE_WIFI_TELEMETRY 0
+#define FEATURE_WIFI_TELEMETRY 1
+/*
+    Temporary bench-test credentials.
+
+    These will later be removed and replaced by
+    maintenance-mode NVS provisioning.
+*/
+#define WIFI_TEST_SSID     "Redmi"
+#define WIFI_TEST_PASSWORD "3c089253327b"
+//////////////////////////////////////////////////////////
+#define WIFI_CONNECT_MAX_RETRIES 5
 #define FEATURE_SECURE_GATEWAY_MODE 1
 #define FEATURE_DIRECT_MAVLINK_MODE 0
 
@@ -222,17 +229,12 @@
 
 #define SECURITY_SKELETON_DIAGNOSTIC FEATURE_SECURITY_SKELETON
 
-#define SECURITY_CONTROLLER_ID 1
 #define SECURITY_LINK_ID_LOCAL_TEST 0
-
-#define SECURITY_PAYLOAD_TYPE_RC 1
-#define SECURITY_GATEWAY_ID 2
-#define SECURITY_PAYLOAD_TYPE_GATEWAY_STATUS 2
-#define SECURITY_PAYLOAD_TYPE_GATEWAY_TELEMETRY 3
 
 #define LINK_RX_BUFFER_SIZE 128
 #define GATEWAY_STATUS_FRESH_MS 1000
 #define GATEWAY_TELEMETRY_FRESH_MS 1000
+#define WIFI_TELEMETRY_WORKER_PERIOD_MS 5000
 #define SECURITY_PAYLOAD_MAX_LEN 64
 #define SECURITY_AUTH_TAG_LEN 16
 #define SECURITY_TIMING_DIAGNOSTIC DEBUG_SECURITY_TIMING
@@ -254,6 +256,7 @@ typedef enum
     ARM_STATUS_MASTER_OFF,
     ARM_STATUS_ARM_LOCKED,
     ARM_STATUS_BOOT_LOCK,
+     ARM_STATUS_PROTOCOL_MISMATCH,
     ARM_STATUS_INPUT_STALE,
     ARM_STATUS_STICKS_NOT_CENTERED,
     ARM_STATUS_TELEMETRY_STALE,
@@ -279,15 +282,10 @@ typedef enum
     FAULT_OUTPUT_FAILED = 1 << 10,
     FAULT_MASTER_SWITCH_OFF = 1 << 11,
     FAULT_ARM_BOOT_LOCK = 1 << 12,
-    FAULT_PACKET_SEQUENCE = 1 << 13
+    FAULT_PACKET_SEQUENCE = 1 << 13,
+    FAULT_PROTOCOL_MISMATCH = 1 << 14
 } system_fault_t;
 
-typedef enum
-{
-    RC_DISARMED = 0,
-    RC_ARMED = 1,
-    RC_FAILSAFE = 2
-} rc_state_t;
 
 rc_state_t drone_command_get(void);
 rc_state_t drone_get_state(void);
@@ -309,134 +307,9 @@ typedef enum
     EVENT_BUTTON_RECOVER_PRESS
 } rc_event_type_t;
 
-typedef struct
-{
-    uint32_t packet_id;
-    rc_state_t state;
-
-    int throttle;
-    int yaw;
-    int pitch;
-    int roll;
-} rc_packet_t;
-
-typedef enum
-{
-    GATEWAY_ACTION_NONE = 0,
-
-    GATEWAY_ACTION_ARM_DRY_RUN,
-    GATEWAY_ACTION_DISARM_DRY_RUN,
-    GATEWAY_ACTION_FAILSAFE_DRY_RUN,
-
-    GATEWAY_ACTION_ARM_REAL_SENT,
-    GATEWAY_ACTION_DISARM_REAL_SENT,
-
-    GATEWAY_ACTION_RTL_SENT,
-    GATEWAY_ACTION_RTL_CONFIRMED,
-    GATEWAY_ACTION_RTL_DENIED,
-    GATEWAY_ACTION_RTL_TIMEOUT,
-
-    GATEWAY_ACTION_ARM_CONFIRMED,
-    GATEWAY_ACTION_DISARM_CONFIRMED,
-    GATEWAY_ACTION_ARM_DENIED,
-    GATEWAY_ACTION_DISARM_DENIED,
-    GATEWAY_ACTION_ARM_TIMEOUT,
-    GATEWAY_ACTION_DISARM_TIMEOUT,
-
-    GATEWAY_ACTION_RECOVER_DRY_RUN,
-    GATEWAY_ACTION_RECOVER_CONFIRMED
-} gateway_action_t;
-
-typedef struct __attribute__((packed))
-{
-    uint32_t packet_id;
-    uint32_t session_id;
-
-    uint8_t fc_heartbeat_fresh;
-    uint8_t fc_is_armed;
-    uint8_t remote_state;
-    uint8_t gateway_link_ok;
-    uint8_t last_action;
-
-    uint8_t reserved[3];
-
-    uint32_t rx_ok_count;
-    uint32_t rx_bad_count;
-    uint32_t rx_replay_count;
-} gateway_status_packet_t;
-
-#define GATEWAY_TELEMETRY_FLAG_BATTERY_FRESH (1u << 0)
-#define GATEWAY_TELEMETRY_FLAG_GPS_FRESH (1u << 1)
-#define GATEWAY_TELEMETRY_FLAG_POSITION_FRESH (1u << 2)
-#define GATEWAY_TELEMETRY_FLAG_ATTITUDE_FRESH (1u << 3)
-#define GATEWAY_TELEMETRY_FLAG_EKF_FRESH      (1u << 4)
 
 
-typedef struct __attribute__((packed))
-{
-    uint32_t packet_id;
-    uint32_t sample_time_ms;
 
-    /*
-       Raw ArduPilot mode from MAVLink HEARTBEAT.custom_mode.
-
-       The remote will later convert this number into text such as:
-       MANUAL, FBWA, QHOVER, RTL, etc.
-    */
-    uint32_t fc_custom_mode;
-
-    uint16_t battery_voltage_mv;
-    int16_t battery_current_ca;
-    int8_t battery_remaining;
-
-    uint8_t gps_fix_type;
-    uint8_t satellites_visible;
-    uint8_t telemetry_flags;
-
-    int32_t latitude_e7;
-    int32_t longitude_e7;
-    int32_t altitude_mm;
-    int32_t relative_altitude_mm;
-
-    int16_t roll_cd;
-    int16_t pitch_cd;
-    int16_t yaw_cd;
-
-    uint16_t ekf_flags;
-
-    uint8_t fc_is_armed;
-    uint8_t system_status;
-
-    /*
-       MAVLink HEARTBEAT.type.
-
-       This tells the remote which mode table should be used,
-       for example Plane/QuadPlane versus Copter.
-    */
-    uint8_t fc_vehicle_type;
-
-    uint8_t reserved;
-} gateway_telemetry_packet_t;
-
-_Static_assert(
-    sizeof(rc_state_t) == 4,
-    "rc_state_t size changed"
-);
-
-_Static_assert(
-    sizeof(rc_packet_t) == 24,
-    "rc_packet_t size mismatch"
-);
-
-_Static_assert(
-    sizeof(gateway_status_packet_t) == 28,
-    "gateway_status_packet_t size mismatch"
-);
-
-_Static_assert(
-    sizeof(gateway_telemetry_packet_t) == 48,
-    "gateway_telemetry_packet_t size mismatch"
-);
 
 typedef struct
 {
@@ -554,6 +427,9 @@ volatile rc_input_t rc_input = {
     .roll = 0,
     .valid = 0};
 
+static volatile int wifi_station_connected = 0;
+static int wifi_connect_retry_count = 0;
+
 led_strip_handle_t strip;
 
 portMUX_TYPE rc_input_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -570,6 +446,7 @@ SemaphoreHandle_t button_semaphore_disarm = NULL;
 SemaphoreHandle_t button_semaphore_recover = NULL;
 
 QueueHandle_t rc_event_queue = NULL;
+static QueueHandle_t wifi_telemetry_queue = NULL;
 
 TaskHandle_t status_led_task_handle = NULL;
 TaskHandle_t button_task_arm_handle = NULL;
@@ -588,6 +465,7 @@ TaskHandle_t mavlink_heartbeat_task_handle = NULL;
 TaskHandle_t mavlink_rx_task_handle = NULL;
 TaskHandle_t gateway_status_rx_task_handle = NULL;
 TaskHandle_t command_status_auto_clear_task_handle = NULL;
+TaskHandle_t wifi_telemetry_task_handle = NULL;
 
 static spi_device_handle_t lcd_spi = NULL;
 static uint8_t mavlink_tx_seq = 0;
@@ -1171,6 +1049,10 @@ void print_fault_names(uint32_t faults)
     {
         printf(" PACKET_SEQUENCE");
     }
+    if (faults & FAULT_PROTOCOL_MISMATCH)
+    {    
+    printf(" PROTOCOL_MISMATCH");
+    }
 }
 
 void print_fault_snapshot(const char *prefix, uint32_t faults)
@@ -1228,23 +1110,7 @@ void create_task_checked(
     printf("[BOOT] Task created: %s\n", task_name);
 }
 
-const char *state_to_string(rc_state_t state)
-{
-    switch (state)
-    {
-    case RC_DISARMED:
-        return "DISARMED";
 
-    case RC_ARMED:
-        return "ARMED";
-
-    case RC_FAILSAFE:
-        return "FAILSAFE";
-
-    default:
-        return "UNKNOWN";
-    }
-}
 const char *arm_status_to_lcd_text(arm_status_t status)
 {
     switch (status)
@@ -1260,6 +1126,9 @@ const char *arm_status_to_lcd_text(arm_status_t status)
 
     case ARM_STATUS_BOOT_LOCK:
         return "BOOT LOCK";
+
+    case ARM_STATUS_PROTOCOL_MISMATCH:
+        return "PROTO BAD";
 
     case ARM_STATUS_INPUT_STALE:
         return "INPUT BAD";
@@ -1301,6 +1170,9 @@ const char *arm_status_to_log_text(arm_status_t status)
 
     case ARM_STATUS_BOOT_LOCK:
         return "ARM_BOOT_LOCK";
+
+    case ARM_STATUS_PROTOCOL_MISMATCH:
+        return "PROTOCOL_MISMATCH";
 
     case ARM_STATUS_INPUT_STALE:
         return "INPUT_STALE";
@@ -1843,7 +1715,7 @@ static int control_mavlink_send_manual_control(const rc_packet_t *packet)
                y_roll,
                z_throttle,
                r_yaw,
-               state_to_string(packet->state));
+               mathos_rc_state_to_string(packet->state));
 #endif
     }
     mav_put_i16_le(payload, &p, x_pitch);
@@ -1930,8 +1802,8 @@ void drone_command_set(rc_state_t new_state, const char *reason)
     if (changed)
     {
         printf("[CMD] drone command %s -> %s reason=%s\n",
-               state_to_string(old_state),
-               state_to_string(new_state),
+               mathos_rc_state_to_string(old_state),
+               mathos_rc_state_to_string(new_state),
                reason ? reason : "none");
     }
 }
@@ -1956,8 +1828,8 @@ void drone_set_state(rc_state_t new_state, const char *reason)
     if (changed)
     {
         printf("[STATE] drone %s -> %s reason=%s\n",
-               state_to_string(old_state),
-               state_to_string(new_state),
+               mathos_rc_state_to_string(old_state),
+               mathos_rc_state_to_string(new_state),
                reason ? reason : "none");
     }
 }
@@ -2141,7 +2013,7 @@ int security_wrap_rc_packet(const rc_packet_t *rc_packet,
 
     memset(secure_packet, 0, sizeof(secure_packet_t));
 
-    secure_packet->sequence = security_next_tx_sequence();
+    secure_packet->sequence = rc_packet->packet_id;
     secure_packet->timestamp_ms = mathos_session_id;
     secure_packet->controller_id = SECURITY_CONTROLLER_ID;
     secure_packet->link_id = (uint8_t)link_mode;
@@ -2353,35 +2225,7 @@ static int32_t mav_get_i32_le(const uint8_t *buffer)
             (int32_t)((uint32_t)buffer[3] << 24));
 }
 
-static const char *mav_result_to_string(uint8_t result)
-{
-    switch (result)
-    {
-    case MAV_RESULT_ACCEPTED:
-        return "ACCEPTED";
 
-    case MAV_RESULT_TEMPORARILY_REJECTED:
-        return "TEMPORARILY_REJECTED";
-
-    case MAV_RESULT_DENIED:
-        return "DENIED";
-
-    case MAV_RESULT_UNSUPPORTED:
-        return "UNSUPPORTED";
-
-    case MAV_RESULT_FAILED:
-        return "FAILED";
-
-    case MAV_RESULT_IN_PROGRESS:
-        return "IN_PROGRESS";
-
-    case MAV_RESULT_CANCELLED:
-        return "CANCELLED";
-
-    default:
-        return "UNKNOWN";
-    }
-}
 
 static const char *fc_arm_state_to_string(void)
 {
@@ -2551,7 +2395,7 @@ static void handle_mavlink_command_ack(
            sysid,
            compid,
            command,
-           mav_result_to_string(result),
+           mathos_mav_result_to_string(result),
            progress,
            (long)result_param2,
            target_system,
@@ -2566,7 +2410,7 @@ static void handle_mavlink_command_ack(
         else
         {
             printf("[FC ARM/DISARM ACK] NOT ACCEPTED: %s\n",
-                   mav_result_to_string(result));
+                   mathos_mav_result_to_string(result));
 
             fc_arm_pending = 0;
             fc_disarm_pending = 0;
@@ -2994,6 +2838,13 @@ arm_status_t get_arm_status(void)
         return ARM_STATUS_BOOT_LOCK;
     }
 
+    
+    if (fault_get_snapshot() &
+        FAULT_PROTOCOL_MISMATCH)
+    {
+        return ARM_STATUS_PROTOCOL_MISMATCH;
+    }
+
     rc_input_t input_snapshot;
     TickType_t input_last_update;
 
@@ -3042,13 +2893,14 @@ arm_status_t get_arm_status(void)
         Do not let them appear again as generic SYSTEM_FAULT.
     */
     uint32_t real_faults = fault_get_snapshot() &
-                           ~(FAULT_MASTER_SWITCH_OFF |
-                             FAULT_ARM_SWITCH_OFF |
-                             FAULT_ARM_BOOT_LOCK |
-                             FAULT_JOYSTICK_STALE |
-                             FAULT_TELEMETRY_STALE |
-                             FAULT_DRONE_LINK_BAD |
-                             FAULT_DRONE_FAILSAFE);
+                        ~(FAULT_MASTER_SWITCH_OFF |
+                            FAULT_ARM_SWITCH_OFF |
+                            FAULT_ARM_BOOT_LOCK |
+                            FAULT_PROTOCOL_MISMATCH |
+                            FAULT_JOYSTICK_STALE |
+                            FAULT_TELEMETRY_STALE |
+                            FAULT_DRONE_LINK_BAD |
+                            FAULT_DRONE_FAILSAFE);
 
     if (real_faults != FAULT_NONE)
     {
@@ -3222,8 +3074,8 @@ void system_health_task(void *pvParameters)
         telemetry_text = gateway_status_is_fresh() ? "GATEWAY" : "GW_STALE";
 #endif
         DBG_PRINT("[HEALTH] command=%s drone=%s input=%s telemetry=%s faults=0x%08lx age=%lu ms heap=%lu link=%s\n",
-                  state_to_string(command_state),
-                  state_to_string(drone_state_snapshot),
+                  mathos_rc_state_to_string(command_state),
+                  mathos_rc_state_to_string(drone_state_snapshot),
                   input_fresh ? "FRESH" : "STALE",
                   telemetry_text,
                   (unsigned long)fault_snapshot,
@@ -3558,74 +3410,6 @@ static int recover_checks_pass(void)
     return 1;
 }
 
-static uint16_t link_get_u16_le(const uint8_t *buffer)
-{
-    return ((uint16_t)buffer[0] << 0) |
-           ((uint16_t)buffer[1] << 8);
-}
-
-static const char *gateway_action_to_string(uint8_t action)
-{
-    switch (action)
-    {
-    case GATEWAY_ACTION_NONE:
-        return "NONE";
-
-    case GATEWAY_ACTION_ARM_DRY_RUN:
-        return "ARM_DRY_RUN";
-
-    case GATEWAY_ACTION_DISARM_DRY_RUN:
-        return "DISARM_DRY_RUN";
-
-    case GATEWAY_ACTION_FAILSAFE_DRY_RUN:
-        return "FAILSAFE_DRY_RUN";
-
-    case GATEWAY_ACTION_ARM_REAL_SENT:
-        return "ARM_REAL_SENT";
-
-    case GATEWAY_ACTION_DISARM_REAL_SENT:
-        return "DISARM_REAL_SENT";
-
-    case GATEWAY_ACTION_ARM_CONFIRMED:
-        return "ARM_CONFIRMED";
-
-    case GATEWAY_ACTION_DISARM_CONFIRMED:
-        return "DISARM_CONFIRMED";
-
-    case GATEWAY_ACTION_ARM_DENIED:
-        return "ARM_DENIED";
-
-    case GATEWAY_ACTION_DISARM_DENIED:
-        return "DISARM_DENIED";
-
-    case GATEWAY_ACTION_ARM_TIMEOUT:
-        return "ARM_TIMEOUT";
-
-    case GATEWAY_ACTION_DISARM_TIMEOUT:
-        return "DISARM_TIMEOUT";
-
-    case GATEWAY_ACTION_RECOVER_DRY_RUN:
-        return "RECOVER_DRY_RUN";
-
-    case GATEWAY_ACTION_RECOVER_CONFIRMED:
-        return "RECOVER_CONFIRMED";
-
-    case GATEWAY_ACTION_RTL_SENT:
-        return "RTL_SENT";
-
-    case GATEWAY_ACTION_RTL_CONFIRMED:
-        return "RTL_CONFIRMED";
-
-    case GATEWAY_ACTION_RTL_DENIED:
-        return "RTL_DENIED";
-
-    case GATEWAY_ACTION_RTL_TIMEOUT:
-        return "RTL_TIMEOUT";
-
-    default:
-        return "UNKNOWN";
-    }
-}
 
 static void gateway_status_apply_to_remote(const gateway_status_packet_t *status)
 {
@@ -3861,6 +3645,12 @@ static void gateway_telemetry_update(const gateway_telemetry_packet_t *telemetry
     gateway_telemetry_last_update_tick = xTaskGetTickCount();
     gateway_telemetry_valid = 1;
     taskEXIT_CRITICAL(&gateway_telemetry_mux);
+    if (wifi_telemetry_queue != NULL)
+        {
+            xQueueOverwrite(
+                wifi_telemetry_queue,
+                telemetry);
+        }
 }
 
 
@@ -3898,29 +3688,150 @@ static int gateway_telemetry_get_snapshot(
 
     return 1;
 }
-
-static const char *gateway_gps_fix_to_string(uint8_t fix_type)
+static int gateway_telemetry_build_json(
+    const gateway_telemetry_packet_t *telemetry,
+    char *output,
+    size_t output_size)
 {
-    switch (fix_type)
+    if (telemetry == NULL ||
+        output == NULL ||
+        output_size == 0)
     {
-    case 0:
-        return "NO_GPS";
-    case 1:
-        return "NO_FIX";
-    case 2:
-        return "2D";
-    case 3:
-        return "3D";
-    case 4:
-        return "DGPS";
-    case 5:
-        return "RTK_FLOAT";
-    case 6:
-        return "RTK_FIXED";
-    default:
-        return "UNKNOWN";
+        return 0;
+    }
+
+    int written = snprintf(
+        output,
+        output_size,
+
+        "{"
+        "\"packet_id\":%lu,"
+        "\"sample_time_ms\":%lu,"
+        "\"mode\":%lu,"
+        "\"mode_name\":\"%s\","
+        "\"vehicle_type\":%u,"
+        "\"armed\":%u,"
+        "\"system_status\":%u,"
+        "\"telemetry_flags\":%u,"
+        "\"battery_voltage_mv\":%u,"
+        "\"battery_current_ca\":%d,"
+        "\"battery_remaining\":%d,"
+        "\"gps_fix_type\":%u,"
+        "\"satellites\":%u,"
+        "\"latitude_e7\":%ld,"
+        "\"longitude_e7\":%ld,"
+        "\"altitude_mm\":%ld,"
+        "\"relative_altitude_mm\":%ld,"
+        "\"roll_cd\":%d,"
+        "\"pitch_cd\":%d,"
+        "\"yaw_cd\":%d,"
+        "\"ekf_flags\":%u"
+        "}",
+
+        (unsigned long)telemetry->packet_id,
+        (unsigned long)telemetry->sample_time_ms,
+        (unsigned long)telemetry->fc_custom_mode,
+        mathos_plane_mode_to_string(
+            telemetry->fc_custom_mode),
+        telemetry->fc_vehicle_type,
+        telemetry->fc_is_armed,
+        telemetry->system_status,
+        telemetry->telemetry_flags,
+        telemetry->battery_voltage_mv,
+        telemetry->battery_current_ca,
+        telemetry->battery_remaining,
+        telemetry->gps_fix_type,
+        telemetry->satellites_visible,
+        (long)telemetry->latitude_e7,
+        (long)telemetry->longitude_e7,
+        (long)telemetry->altitude_mm,
+        (long)telemetry->relative_altitude_mm,
+        telemetry->roll_cd,
+        telemetry->pitch_cd,
+        telemetry->yaw_cd,
+        telemetry->ekf_flags
+    );
+
+    if (written < 0)
+    {
+        output[0] = '\0';
+        return 0;
+    }
+
+    if ((size_t)written >= output_size)
+    {
+        output[0] = '\0';
+        return 0;
+    }
+
+    return written;
+}
+
+static void wifi_telemetry_task(void *pvParameters)
+{
+    gateway_telemetry_packet_t telemetry;
+
+    /*
+        Static so the JSON buffer does not consume
+        512 bytes from the task stack.
+    */
+    static char telemetry_json[512];
+
+    printf(
+        "[WIFI TELEMETRY] worker started, network disabled\n");
+
+    while (1)
+    {
+        /*
+            Wait for at least one telemetry packet.
+
+            The queue contains only one item, so while this
+            task sleeps, newer telemetry overwrites older data.
+        */
+        if (xQueueReceive(
+                wifi_telemetry_queue,
+                &telemetry,
+                portMAX_DELAY) != pdTRUE)
+        {
+            continue;
+        }
+
+        int json_length =
+            gateway_telemetry_build_json(
+                &telemetry,
+                telemetry_json,
+                sizeof(telemetry_json));
+
+        if (json_length > 0)
+        {
+            printf(
+                "[WIFI TELEMETRY DRY RUN] len=%d packet=%lu json=%s\n",
+                json_length,
+                (unsigned long)telemetry.packet_id,
+                telemetry_json);
+        }
+        else
+        {
+            printf(
+                "[WIFI TELEMETRY] JSON build failed packet=%lu\n",
+                (unsigned long)telemetry.packet_id);
+        }
+
+        /*
+            Rate limiting is mandatory.
+
+            Later, an HTTP request may take time.
+            The queue will continue retaining only the
+            newest telemetry packet.
+        */
+        vTaskDelay(
+            pdMS_TO_TICKS(
+                WIFI_TELEMETRY_WORKER_PERIOD_MS));
     }
 }
+
+
+
 static const char *gateway_gps_fix_to_lcd_text(uint8_t fix_type)
 {
     switch (fix_type)
@@ -3950,99 +3861,6 @@ static const char *gateway_gps_fix_to_lcd_text(uint8_t fix_type)
         return "UNKNOWN";
     }
 }
-
-/*
-   Convert ArduPlane / QuadPlane HEARTBEAT.custom_mode
-   into text for logs and the LCD.
-*/
-static const char *ardupilot_plane_mode_to_string(
-    uint32_t custom_mode)
-{
-    switch (custom_mode)
-    {
-    case 0:
-        return "MANUAL";
-
-    case 1:
-        return "CIRCLE";
-
-    case 2:
-        return "STABILIZE";
-
-    case 3:
-        return "TRAINING";
-
-    case 4:
-        return "ACRO";
-
-    case 5:
-        return "FBWA";
-
-    case 6:
-        return "FBWB";
-
-    case 7:
-        return "CRUISE";
-
-    case 8:
-        return "AUTOTUNE";
-
-    case 10:
-        return "AUTO";
-
-    case 11:
-        return "RTL";
-
-    case 12:
-        return "LOITER";
-
-    case 13:
-        return "TAKEOFF";
-
-    case 14:
-        return "AVOID ADSB";
-
-    case 15:
-        return "GUIDED";
-
-    case 16:
-        return "INITIALISING";
-
-    case 17:
-        return "QSTABILIZE";
-
-    case 18:
-        return "QHOVER";
-
-    case 19:
-        return "QLOITER";
-
-    case 20:
-        return "QLAND";
-
-    case 21:
-        return "QRTL";
-
-    case 22:
-        return "QAUTOTUNE";
-
-    case 23:
-        return "QACRO";
-
-    case 24:
-        return "THERMAL";
-
-    case 25:
-        return "LOITER QLAND";
-
-    case 26:
-        return "AUTOLAND";
-
-    default:
-        return "UNKNOWN";
-    }
-}
-
 
 static void gateway_telemetry_handle_packet(const mathos_secure_packet_t *packet)
 {
@@ -4082,7 +3900,7 @@ static void gateway_telemetry_handle_packet(const mathos_secure_packet_t *packet
             (unsigned long)telemetry.packet_id,
             gateway_telemetry_is_fresh(),
             (unsigned long)telemetry.fc_custom_mode,
-            ardupilot_plane_mode_to_string(
+            mathos_plane_mode_to_string(
                 telemetry.fc_custom_mode),
             telemetry.fc_vehicle_type,
             telemetry.telemetry_flags,
@@ -4092,7 +3910,7 @@ static void gateway_telemetry_handle_packet(const mathos_secure_packet_t *packet
             telemetry.battery_voltage_mv / 1000.0f,
             telemetry.battery_current_ca / 100.0f,
             telemetry.battery_remaining,
-            gateway_gps_fix_to_string(telemetry.gps_fix_type),
+            mathos_gps_fix_to_string(telemetry.gps_fix_type),
             telemetry.satellites_visible,
             telemetry.latitude_e7 / 10000000.0,
             telemetry.longitude_e7 / 10000000.0,
@@ -4209,6 +4027,47 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
         memset(&status, 0, sizeof(status));
         memcpy(&status, packet.payload, sizeof(status));
 
+        /*
+            Reject incompatible gateway firmware before the
+            packet can update snapshots, FC state, ARM/DISARM
+            confirmation, link status, or recovery state.
+        */
+        if (status.protocol_version !=
+            MATHOS_GATEWAY_PROTOCOL_VERSION)
+        {
+            bad_count++;
+
+            /*
+                Immediately invalidate the previously trusted gateway
+                status.
+
+                Without this, an older valid snapshot could remain usable
+                for up to GATEWAY_STATUS_FRESH_MS after a mismatch begins.
+            */
+            taskENTER_CRITICAL(&gateway_status_mux);
+            gateway_status_valid = 0;
+            taskEXIT_CRITICAL(&gateway_status_mux);
+
+            fault_set(
+                FAULT_PROTOCOL_MISMATCH);
+
+            printf(
+                "[GATEWAY STATUS RX] PROTOCOL MISMATCH "
+                "received=%u expected=%u packet_id=%lu "
+                "bad_count=%lu\n",
+                status.protocol_version,
+                (unsigned int)MATHOS_GATEWAY_PROTOCOL_VERSION,
+                (unsigned long)status.packet_id,
+                (unsigned long)bad_count);
+
+            return;
+        }
+        /*
+            A correctly authenticated and compatible status packet
+            restores protocol compatibility.
+        */
+        fault_clear(
+            FAULT_PROTOCOL_MISMATCH);
         gateway_status_update(&status);
         gateway_status_apply_to_remote(&status);
         ok_count++;
@@ -4231,16 +4090,28 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
             last_fc_fresh = status.fc_heartbeat_fresh;
             last_action = status.last_action;
 
-            printf("[GATEWAY STATUS RX] packet_id=%lu fc=%s fc_fresh=%u remote=%s link=%u action=%s ok=%lu bad=%lu replay=%lu\n",
-                   (unsigned long)status.packet_id,
-                   status.fc_is_armed ? "ARMED" : "DISARMED",
-                   status.fc_heartbeat_fresh,
-                   state_to_string((rc_state_t)status.remote_state),
-                   status.gateway_link_ok,
-                   gateway_action_to_string(status.last_action),
-                   (unsigned long)status.rx_ok_count,
-                   (unsigned long)status.rx_bad_count,
-                   (unsigned long)status.rx_replay_count);
+            printf(
+                "[GATEWAY STATUS RX] packet_id=%lu proto=%u "
+                "fc=%s fc_fresh=%u remote=%s link=%u "
+                "action=%s ok=%lu bad=%lu replay=%lu\n",
+
+                (unsigned long)status.packet_id,
+                status.protocol_version,
+
+                status.fc_is_armed ? "ARMED" : "DISARMED",
+                status.fc_heartbeat_fresh,
+
+                mathos_rc_state_to_string(
+                    (rc_state_t)status.remote_state),
+
+                status.gateway_link_ok,
+
+                mathos_gateway_action_to_string(
+                    status.last_action),
+
+                (unsigned long)status.rx_ok_count,
+                (unsigned long)status.rx_bad_count,
+                (unsigned long)status.rx_replay_count);
         }
     }
     else if (packet.payload_type == SECURITY_PAYLOAD_TYPE_GATEWAY_TELEMETRY)
@@ -4314,7 +4185,7 @@ static void gateway_status_process_byte(uint8_t byte)
 
     if (frame_index == 6)
     {
-        expected_frame_len = link_get_u16_le(&frame[4]);
+        expected_frame_len = mathos_get_u16_le(&frame[4]);
 
         if (expected_frame_len < (MATHOS_WIRE_HEADER_LEN + MATHOS_AUTH_TAG_LEN + MATHOS_WIRE_CRC_LEN) ||
             expected_frame_len > MATHOS_WIRE_MAX_FRAME_LEN)
@@ -4512,7 +4383,7 @@ void controller_task(void *pvParameters)
                 }
 
                 printf("[CONTROLLER] ARM button complete, command=%s\n",
-                       state_to_string(drone_command_get()));
+                       mathos_rc_state_to_string(drone_command_get()));
             }
             else if (event.type == EVENT_BUTTON_FAILSAFE_PRESS)
             {
@@ -4532,14 +4403,14 @@ void controller_task(void *pvParameters)
                 }
 
                 printf("[CONTROLLER] FAILSAFE button complete,  command=%s\n",
-                       state_to_string(drone_command_get()));
+                       mathos_rc_state_to_string(drone_command_get()));
             }
             else if (event.type == EVENT_BUTTON_RECOVER_PRESS)
             {
                 if (command_state != RC_FAILSAFE)
                 {
                     printf("[CONTROLLER] RECOVER ignored: command is %s, not FAILSAFE\n",
-                           state_to_string(command_state));
+                           mathos_rc_state_to_string(command_state));
                 }
                 else if (recover_checks_pass())
                 {
@@ -4558,11 +4429,11 @@ void controller_task(void *pvParameters)
                 else
                 {
                     printf("[CONTROLLER] RECOVER blocked, command=%s\n",
-                           state_to_string(drone_command_get()));
+                           mathos_rc_state_to_string(drone_command_get()));
                 }
 
                 printf("[CONTROLLER] RECOVER button complete, command=%s\n",
-                       state_to_string(drone_command_get()));
+                       mathos_rc_state_to_string(drone_command_get()));
             }
             else if (event.type == EVENT_BUTTON_DISARM_PRESS)
             {
@@ -4670,7 +4541,7 @@ void controller_task(void *pvParameters)
                 }
 
                 printf("[CONTROLLER] DISARM button complete, command=%s\n",
-                       state_to_string(drone_command_get()));
+                       mathos_rc_state_to_string(drone_command_get()));
             }
         }
     }
@@ -4678,7 +4549,7 @@ void controller_task(void *pvParameters)
 
 void radio_tx_task(void *pvParameters)
 {
-    uint32_t packet_id = 0;
+
 
     TickType_t last_wake = xTaskGetTickCount();
     const TickType_t period = pdMS_TO_TICKS(RADIO_TX_PERIOD_MS);
@@ -4734,12 +4605,17 @@ void radio_tx_task(void *pvParameters)
 #endif
 
         rc_packet_t packet = {
-            .packet_id = packet_id++,
+            .packet_id = security_next_tx_sequence(),
             .state = command_state,
             .throttle = throttle_to_send,
             .yaw = yaw_to_send,
             .pitch = pitch_to_send,
             .roll = roll_to_send,
+
+            .protocol_version =
+                MATHOS_RC_PROTOCOL_VERSION,
+
+            .reserved = {0, 0, 0},
         };
 #if DEBUG_RC_PACKET_TX
         static uint32_t rc_tx_print_counter = 0;
@@ -4768,7 +4644,7 @@ void radio_tx_task(void *pvParameters)
         {
             printf("[RC TX] packet_id=%lu state=%s op=%s input=%s throttle=%d yaw=%d pitch=%d roll=%d\n",
                    (unsigned long)packet.packet_id,
-                   state_to_string(packet.state),
+                   mathos_rc_state_to_string(packet.state),
                    command_status_to_string(op_status),
                    input_fresh ? "FRESH" : "STALE",
                    packet.throttle,
@@ -5530,7 +5406,7 @@ void lcd_task(void *pvParameters)
                     mode_text,
                     sizeof(mode_text),
                     "MODE %s",
-                    ardupilot_plane_mode_to_string(
+                    mathos_plane_mode_to_string(
                         fc_mode));
             }
             else
@@ -5883,6 +5759,196 @@ void lcd_task(void *pvParameters)
     }
 }
 
+static void wifi_station_event_handler(
+    void *handler_arg,
+    esp_event_base_t event_base,
+    int32_t event_id,
+    void *event_data)
+{
+    (void)handler_arg;
+
+    if (event_base == WIFI_EVENT &&
+        event_id == WIFI_EVENT_STA_START)
+    {
+        printf(
+            "[WIFI] station started, connecting\n");
+
+        esp_err_t err = esp_wifi_connect();
+
+        if (err != ESP_OK)
+        {
+            printf(
+                "[WIFI] initial connect failed: %s\n",
+                esp_err_to_name(err));
+        }
+    }
+    else if (event_base == WIFI_EVENT &&
+             event_id == WIFI_EVENT_STA_DISCONNECTED)
+    {
+        wifi_station_connected = 0;
+
+        if (wifi_connect_retry_count <
+            WIFI_CONNECT_MAX_RETRIES)
+        {
+            wifi_connect_retry_count++;
+
+            printf(
+                "[WIFI] disconnected, retry %d/%d\n",
+                wifi_connect_retry_count,
+                WIFI_CONNECT_MAX_RETRIES);
+
+            esp_err_t err = esp_wifi_connect();
+
+            if (err != ESP_OK)
+            {
+                printf(
+                    "[WIFI] reconnect request failed: %s\n",
+                    esp_err_to_name(err));
+            }
+        }
+        else
+        {
+            printf(
+                "[WIFI] connection retries exhausted; "
+                "control remains active\n");
+        }
+    }
+    else if (event_base == IP_EVENT &&
+             event_id == IP_EVENT_STA_GOT_IP)
+    {
+        ip_event_got_ip_t *event =
+            (ip_event_got_ip_t *)event_data;
+
+        wifi_station_connected = 1;
+        wifi_connect_retry_count = 0;
+
+        printf(
+            "[WIFI] connected ip=" IPSTR "\n",
+            IP2STR(&event->ip_info.ip));
+    }
+}
+
+
+static esp_err_t wifi_station_init(void)
+{
+    esp_err_t err;
+
+    /*
+        Wi-Fi stores internal calibration and configuration
+        information in NVS.
+    */
+    err = nvs_flash_init();
+
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
+        err == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        err = nvs_flash_erase();
+
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+
+        err = nvs_flash_init();
+    }
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = esp_netif_init();
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = esp_event_loop_create_default();
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    esp_netif_t *station_netif =
+        esp_netif_create_default_wifi_sta();
+
+    if (station_netif == NULL)
+    {
+        return ESP_FAIL;
+    }
+
+    wifi_init_config_t wifi_init_config =
+        WIFI_INIT_CONFIG_DEFAULT();
+
+    err = esp_wifi_init(&wifi_init_config);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = esp_event_handler_register(
+        WIFI_EVENT,
+        ESP_EVENT_ANY_ID,
+        &wifi_station_event_handler,
+        NULL);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = esp_event_handler_register(
+        IP_EVENT,
+        IP_EVENT_STA_GOT_IP,
+        &wifi_station_event_handler,
+        NULL);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_TEST_SSID,
+            .password = WIFI_TEST_PASSWORD,
+            .threshold.authmode =
+                WIFI_AUTH_WPA2_PSK,
+        },
+    };
+
+    err = esp_wifi_set_mode(WIFI_MODE_STA);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = esp_wifi_set_config(
+        WIFI_IF_STA,
+        &wifi_config);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = esp_wifi_start();
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    printf(
+        "[WIFI] station initialization complete\n");
+
+    return ESP_OK;
+}
+
 void app_main(void)
 {
     button_semaphore_arm = xSemaphoreCreateBinary();
@@ -5905,7 +5971,35 @@ void app_main(void)
         printf("failed to create queue");
         return;
     }
+    wifi_telemetry_queue = xQueueCreate(
+        1,
+        sizeof(gateway_telemetry_packet_t));
 
+    if (wifi_telemetry_queue == NULL)
+    {
+        printf(
+            "[FATAL] failed to create Wi-Fi telemetry queue\n");
+
+        return;
+    }
+
+    printf(
+        "[WIFI TELEMETRY] queue ready depth=1\n");
+#if FEATURE_WIFI_TELEMETRY
+
+    esp_err_t wifi_init_result =
+        wifi_station_init();
+
+    if (wifi_init_result != ESP_OK)
+    {
+        printf(
+            "[WIFI] optional initialization failed: %s\n",
+            esp_err_to_name(wifi_init_result));
+
+        wifi_station_connected = 0;
+    }
+
+#endif
 #if FEATURE_DIRECT_MAVLINK_MODE
     if (!control_output_init())
     {
@@ -6041,4 +6135,25 @@ void app_main(void)
     create_task_checked(lcd_task, "lcd_task", 4096, NULL, 2, &lcd_task_handle);
     create_task_checked(task_supervisor_task, "task_supervisor_task", 4096, NULL, 6, &heartbeat_task_handle);
     create_task_checked(joystick_adc_task, "joystick_adc_task", 4096, NULL, 3, &joystick_adc_task_handle);
+
+    BaseType_t wifi_task_result = xTaskCreate(
+    wifi_telemetry_task,
+    "wifi_telemetry_task",
+    4096,
+    NULL,
+    1,
+    &wifi_telemetry_task_handle);
+
+if (wifi_task_result == pdPASS)
+{
+    printf(
+        "[BOOT] Optional task created: wifi_telemetry_task\n");
+}
+else
+{
+    wifi_telemetry_task_handle = NULL;
+
+    printf(
+        "[WIFI TELEMETRY] worker creation failed; control remains active\n");
+}
 }

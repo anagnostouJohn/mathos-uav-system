@@ -10,4 +10,6 @@ idf_component_register(
         mathos_protocol
         mathos_secure
         mavlink
+        mathos_messages
+        mathos_flight_modes
 )
