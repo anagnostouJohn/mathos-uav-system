@@ -235,6 +235,7 @@ typedef struct __attribute__((packed))
 #define GATEWAY_TELEMETRY_FLAG_GPS_FRESH      (1u << 1)
 #define GATEWAY_TELEMETRY_FLAG_POSITION_FRESH (1u << 2)
 #define GATEWAY_TELEMETRY_FLAG_ATTITUDE_FRESH (1u << 3)
+#define GATEWAY_TELEMETRY_FLAG_EKF_FRESH      (1u << 4)
 
 typedef struct __attribute__((packed))
 {
@@ -259,12 +260,18 @@ typedef struct __attribute__((packed))
     int16_t roll_cd;
     int16_t pitch_cd;
     int16_t yaw_cd;
-
+    uint16_t ekf_flags;
     uint8_t fc_is_armed;
     uint8_t system_status;
     uint8_t fc_vehicle_type;
     uint8_t reserved;
 } gateway_telemetry_packet_t;
+
+_Static_assert(
+    sizeof(gateway_telemetry_packet_t) == 48,
+    "gateway_telemetry_packet_t size mismatch"
+);
+
 
 static QueueHandle_t rc_packet_queue = NULL;
 
@@ -359,6 +366,7 @@ static volatile int64_t fc_tel_battery_update_us = 0;
 static volatile int64_t fc_tel_gps_update_us = 0;
 static volatile int64_t fc_tel_position_update_us = 0;
 static volatile int64_t fc_tel_attitude_update_us = 0;
+static volatile int64_t fc_tel_ekf_update_us = 0;
 static volatile uint8_t fc_tel_system_status = 0;
 
 static volatile uint16_t fc_tel_battery_voltage_mv = 0;
@@ -375,6 +383,7 @@ static volatile int32_t fc_tel_relative_alt_mm = 0;
 static volatile float fc_tel_roll_rad = 0.0f;
 static volatile float fc_tel_pitch_rad = 0.0f;
 static volatile float fc_tel_yaw_rad = 0.0f;
+static volatile uint16_t fc_tel_ekf_flags = 0;
 
 static int16_t clamp_i16(int16_t value, int16_t min, int16_t max)
 {
@@ -2031,6 +2040,16 @@ static void gateway_request_telemetry_streams_once(void)
         TELEMETRY_REQUEST_SLOW_INTERVAL_US,
         "EXTENDED_SYS_STATE"
     );
+    /*
+   EKF health and estimator variances.
+
+   One update per second is enough for health monitoring.
+*/
+    gateway_send_message_interval_request(
+        MAVLINK_MSG_ID_EKF_STATUS_REPORT,
+        TELEMETRY_REQUEST_SLOW_INTERVAL_US,
+        "EKF_STATUS_REPORT"
+    );
 }
 
 static void telemetry_request_task(void *arg)
@@ -2388,6 +2407,72 @@ if (ack.command == MAV_CMD_NAV_RETURN_TO_LAUNCH)
 
             taskEXIT_CRITICAL(&fc_telemetry_mux);
         }
+        else if (msg.msgid == MAVLINK_MSG_ID_EKF_STATUS_REPORT){
+    mavlink_ekf_status_report_t ekf;
+
+    mavlink_msg_ekf_status_report_decode(
+        &msg,
+        &ekf);
+    int64_t update_us = esp_timer_get_time();
+
+    /*
+    Store the latest EKF flags for encrypted telemetry TX.
+    */
+    taskENTER_CRITICAL(&fc_telemetry_mux);
+
+    fc_tel_ekf_flags = ekf.flags;
+    fc_tel_ekf_update_us = update_us;
+
+    taskEXIT_CRITICAL(&fc_telemetry_mux);
+    /*
+       Print immediately when the EKF flags change.
+
+       While the flags remain unchanged, print one diagnostic
+       approximately every five received reports.
+    */
+    static uint16_t previous_ekf_flags = UINT16_MAX;
+    static uint32_t ekf_print_counter = 0;
+
+    ekf_print_counter++;
+
+    bool flags_changed =
+        ekf.flags != previous_ekf_flags;
+
+    if (flags_changed ||
+        ekf_print_counter >= 5)
+    {
+        previous_ekf_flags = ekf.flags;
+        ekf_print_counter = 0;
+
+        ESP_LOGI(
+            TAG,
+            "FC EKF flags=0x%04X "
+            "att=%u vel_h=%u vel_v=%u "
+            "pos_rel=%u pos_abs=%u alt_abs=%u "
+            "uninit=%u gps_glitch=%u "
+            "variance[v=%.2f ph=%.2f pv=%.2f "
+            "mag=%.2f terrain=%.2f air=%.2f]",
+            ekf.flags,
+
+            (ekf.flags & EKF_ATTITUDE) ? 1 : 0,
+            (ekf.flags & EKF_VELOCITY_HORIZ) ? 1 : 0,
+            (ekf.flags & EKF_VELOCITY_VERT) ? 1 : 0,
+
+            (ekf.flags & EKF_POS_HORIZ_REL) ? 1 : 0,
+            (ekf.flags & EKF_POS_HORIZ_ABS) ? 1 : 0,
+            (ekf.flags & EKF_POS_VERT_ABS) ? 1 : 0,
+
+            (ekf.flags & EKF_UNINITIALIZED) ? 1 : 0,
+            (ekf.flags & EKF_GPS_GLITCHING) ? 1 : 0,
+
+            ekf.velocity_variance,
+            ekf.pos_horiz_variance,
+            ekf.pos_vert_variance,
+            ekf.compass_variance,
+            ekf.terrain_alt_variance,
+            ekf.airspeed_variance);
+    }
+}
     }
 }
 
@@ -2551,6 +2636,7 @@ static bool gateway_telemetry_send_once(void)
     int64_t gps_update_us;
     int64_t position_update_us;
     int64_t attitude_update_us;
+    int64_t ekf_update_us;
 
     /*
     Take one complete telemetry snapshot.
@@ -2578,6 +2664,7 @@ static bool gateway_telemetry_send_once(void)
 
     telemetry.fc_custom_mode = fc_custom_mode;
     telemetry.fc_vehicle_type = fc_vehicle_type;
+    telemetry.ekf_flags = fc_tel_ekf_flags;
 
     telemetry.fc_is_armed = fc_is_armed ? 1 : 0;
     telemetry.system_status = fc_tel_system_status;
@@ -2586,7 +2673,7 @@ static bool gateway_telemetry_send_once(void)
     gps_update_us = fc_tel_gps_update_us;
     position_update_us = fc_tel_position_update_us;
     attitude_update_us = fc_tel_attitude_update_us;
-
+    ekf_update_us = fc_tel_ekf_update_us;
     taskEXIT_CRITICAL(&fc_telemetry_mux);
 /*
    Capture time after the snapshot so it cannot be older
@@ -2634,6 +2721,13 @@ static bool gateway_telemetry_send_once(void)
             now_us)) {
         telemetry.telemetry_flags |=
             GATEWAY_TELEMETRY_FLAG_ATTITUDE_FRESH;
+    }
+    if (gateway_telemetry_value_is_fresh(
+        ekf_update_us,
+        now_us))
+    {
+        telemetry.telemetry_flags |=
+            GATEWAY_TELEMETRY_FLAG_EKF_FRESH;
     }
 
     mathos_secure_packet_t packet;

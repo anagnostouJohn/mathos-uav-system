@@ -369,6 +369,7 @@ typedef struct __attribute__((packed))
 #define GATEWAY_TELEMETRY_FLAG_GPS_FRESH (1u << 1)
 #define GATEWAY_TELEMETRY_FLAG_POSITION_FRESH (1u << 2)
 #define GATEWAY_TELEMETRY_FLAG_ATTITUDE_FRESH (1u << 3)
+#define GATEWAY_TELEMETRY_FLAG_EKF_FRESH      (1u << 4)
 
 
 typedef struct __attribute__((packed))
@@ -401,6 +402,8 @@ typedef struct __attribute__((packed))
     int16_t pitch_cd;
     int16_t yaw_cd;
 
+    uint16_t ekf_flags;
+
     uint8_t fc_is_armed;
     uint8_t system_status;
 
@@ -431,7 +434,7 @@ _Static_assert(
 );
 
 _Static_assert(
-    sizeof(gateway_telemetry_packet_t) == 46,
+    sizeof(gateway_telemetry_packet_t) == 48,
     "gateway_telemetry_packet_t size mismatch"
 );
 
@@ -4072,6 +4075,7 @@ static void gateway_telemetry_handle_packet(const mathos_secure_packet_t *packet
         printf(
             "[GATEWAY TELEMETRY RX] packet=%lu fresh=%d "
             "mode=%lu mode_name=%s vehicle_type=%u flags=0x%02X "
+            "ekf=0x%04X ekf_fresh=%u "
             "batt=%.2fV current=%.2fA rem=%d%% gps=%s sats=%u "
             "lat=%.7f lon=%.7f alt=%.1fm rel=%.1fm "
             "roll=%.2f pitch=%.2f yaw=%.2f armed=%u status=%u\n",
@@ -4082,6 +4086,9 @@ static void gateway_telemetry_handle_packet(const mathos_secure_packet_t *packet
                 telemetry.fc_custom_mode),
             telemetry.fc_vehicle_type,
             telemetry.telemetry_flags,
+            (unsigned int)telemetry.ekf_flags,
+            (telemetry.telemetry_flags &
+            GATEWAY_TELEMETRY_FLAG_EKF_FRESH) ? 1U : 0U,
             telemetry.battery_voltage_mv / 1000.0f,
             telemetry.battery_current_ca / 100.0f,
             telemetry.battery_remaining,
