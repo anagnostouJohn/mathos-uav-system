@@ -19,10 +19,7 @@
 #include "esp_random.h"
 #include "mathos_messages.h"
 #include "mathos_flight_modes.h"
-#include "esp_wifi.h"
-#include "esp_event.h"
-#include "esp_netif.h"
-#include "nvs_flash.h"
+
 ////////////////////////////////////////////////////////////////////////////////////
 #define COMMAND_STATUS_MESSAGE_CLEAR_MS 3000
 
@@ -186,21 +183,9 @@
 #define SECURE_WIRE_TEST_PRINT_EVERY 100
 #define DEBUG_RC_PACKET_TX 1
 #define RC_PACKET_TX_PRINT_EVERY 50
-///////////////////WIFI//////////////////
-#define FEATURE_SECURITY_SKELETON 1
-#define FEATURE_WIFI_TELEMETRY 1
-/*
-    Temporary bench-test credentials.
-
-    These will later be removed and replaced by
-    maintenance-mode NVS provisioning.
-*/
-#define WIFI_TEST_SSID     "Redmi"
-#define WIFI_TEST_PASSWORD "3c089253327b"
-//////////////////////////////////////////////////////////
-#define WIFI_CONNECT_MAX_RETRIES 5
 #define FEATURE_SECURE_GATEWAY_MODE 1
 #define FEATURE_DIRECT_MAVLINK_MODE 0
+#define FEATURE_SECURITY_SKELETON 1
 
 /*
     Bench mode only.
@@ -234,7 +219,6 @@
 #define LINK_RX_BUFFER_SIZE 128
 #define GATEWAY_STATUS_FRESH_MS 1000
 #define GATEWAY_TELEMETRY_FRESH_MS 1000
-#define WIFI_TELEMETRY_WORKER_PERIOD_MS 5000
 #define SECURITY_PAYLOAD_MAX_LEN 64
 #define SECURITY_AUTH_TAG_LEN 16
 #define SECURITY_TIMING_DIAGNOSTIC DEBUG_SECURITY_TIMING
@@ -298,6 +282,26 @@ typedef enum
     COMMAND_STATUS_DENIED,
     COMMAND_STATUS_TIMEOUT
 } command_status_t;
+
+
+/*
+    ArduPilot EKF_STATUS_REPORT flags used by the remote.
+
+    ATTITUDE means the EKF has a usable attitude estimate.
+    UNINITIALIZED means the EKF has not completed initialization.
+*/
+#define REMOTE_EKF_FLAG_ATTITUDE      (1U << 0)
+#define REMOTE_EKF_FLAG_UNINITIALIZED (1U << 10)
+
+typedef enum
+{
+    EKF_HEALTH_NO_DATA = 0,
+    EKF_HEALTH_STALE,
+    EKF_HEALTH_INITIALIZING,
+    EKF_HEALTH_OK,
+    EKF_HEALTH_BAD
+} ekf_health_t;
+
 
 typedef enum
 {
@@ -427,9 +431,6 @@ volatile rc_input_t rc_input = {
     .roll = 0,
     .valid = 0};
 
-static volatile int wifi_station_connected = 0;
-static int wifi_connect_retry_count = 0;
-
 led_strip_handle_t strip;
 
 portMUX_TYPE rc_input_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -446,7 +447,6 @@ SemaphoreHandle_t button_semaphore_disarm = NULL;
 SemaphoreHandle_t button_semaphore_recover = NULL;
 
 QueueHandle_t rc_event_queue = NULL;
-static QueueHandle_t wifi_telemetry_queue = NULL;
 
 TaskHandle_t status_led_task_handle = NULL;
 TaskHandle_t button_task_arm_handle = NULL;
@@ -465,7 +465,7 @@ TaskHandle_t mavlink_heartbeat_task_handle = NULL;
 TaskHandle_t mavlink_rx_task_handle = NULL;
 TaskHandle_t gateway_status_rx_task_handle = NULL;
 TaskHandle_t command_status_auto_clear_task_handle = NULL;
-TaskHandle_t wifi_telemetry_task_handle = NULL;
+
 
 static spi_device_handle_t lcd_spi = NULL;
 static uint8_t mavlink_tx_seq = 0;
@@ -3633,7 +3633,8 @@ static int gateway_telemetry_is_fresh(void)
            pdMS_TO_TICKS(GATEWAY_TELEMETRY_FRESH_MS);
 }
 
-static void gateway_telemetry_update(const gateway_telemetry_packet_t *telemetry)
+static void gateway_telemetry_update(
+    const gateway_telemetry_packet_t *telemetry)
 {
     if (telemetry == NULL)
     {
@@ -3641,16 +3642,13 @@ static void gateway_telemetry_update(const gateway_telemetry_packet_t *telemetry
     }
 
     taskENTER_CRITICAL(&gateway_telemetry_mux);
+
     gateway_telemetry_snapshot = *telemetry;
-    gateway_telemetry_last_update_tick = xTaskGetTickCount();
+    gateway_telemetry_last_update_tick =
+        xTaskGetTickCount();
     gateway_telemetry_valid = 1;
+
     taskEXIT_CRITICAL(&gateway_telemetry_mux);
-    if (wifi_telemetry_queue != NULL)
-        {
-            xQueueOverwrite(
-                wifi_telemetry_queue,
-                telemetry);
-        }
 }
 
 
@@ -3688,180 +3686,101 @@ static int gateway_telemetry_get_snapshot(
 
     return 1;
 }
-static int gateway_telemetry_build_json(
-    const gateway_telemetry_packet_t *telemetry,
-    char *output,
-    size_t output_size)
+
+
+
+static const char *gateway_ekf_health_to_lcd_text(
+    mathos_ekf_health_t health)
 {
-    if (telemetry == NULL ||
-        output == NULL ||
-        output_size == 0)
+    switch (health)
     {
-        return 0;
-    }
+    case MATHOS_EKF_HEALTH_NO_DATA:
+        return "NO";
 
-    int written = snprintf(
-        output,
-        output_size,
+    case MATHOS_EKF_HEALTH_STALE:
+        return "STALE";
 
-        "{"
-        "\"packet_id\":%lu,"
-        "\"sample_time_ms\":%lu,"
-        "\"mode\":%lu,"
-        "\"mode_name\":\"%s\","
-        "\"vehicle_type\":%u,"
-        "\"armed\":%u,"
-        "\"system_status\":%u,"
-        "\"telemetry_flags\":%u,"
-        "\"battery_voltage_mv\":%u,"
-        "\"battery_current_ca\":%d,"
-        "\"battery_remaining\":%d,"
-        "\"gps_fix_type\":%u,"
-        "\"satellites\":%u,"
-        "\"latitude_e7\":%ld,"
-        "\"longitude_e7\":%ld,"
-        "\"altitude_mm\":%ld,"
-        "\"relative_altitude_mm\":%ld,"
-        "\"roll_cd\":%d,"
-        "\"pitch_cd\":%d,"
-        "\"yaw_cd\":%d,"
-        "\"ekf_flags\":%u"
-        "}",
+    case MATHOS_EKF_HEALTH_INITIALIZING:
+        return "INIT";
 
-        (unsigned long)telemetry->packet_id,
-        (unsigned long)telemetry->sample_time_ms,
-        (unsigned long)telemetry->fc_custom_mode,
-        mathos_plane_mode_to_string(
-            telemetry->fc_custom_mode),
-        telemetry->fc_vehicle_type,
-        telemetry->fc_is_armed,
-        telemetry->system_status,
-        telemetry->telemetry_flags,
-        telemetry->battery_voltage_mv,
-        telemetry->battery_current_ca,
-        telemetry->battery_remaining,
-        telemetry->gps_fix_type,
-        telemetry->satellites_visible,
-        (long)telemetry->latitude_e7,
-        (long)telemetry->longitude_e7,
-        (long)telemetry->altitude_mm,
-        (long)telemetry->relative_altitude_mm,
-        telemetry->roll_cd,
-        telemetry->pitch_cd,
-        telemetry->yaw_cd,
-        telemetry->ekf_flags
-    );
+    case MATHOS_EKF_HEALTH_OK:
+        return "OK";
 
-    if (written < 0)
-    {
-        output[0] = '\0';
-        return 0;
-    }
+    case MATHOS_EKF_HEALTH_BAD:
+        return "BAD";
 
-    if ((size_t)written >= output_size)
-    {
-        output[0] = '\0';
-        return 0;
-    }
-
-    return written;
-}
-
-static void wifi_telemetry_task(void *pvParameters)
-{
-    gateway_telemetry_packet_t telemetry;
-
-    /*
-        Static so the JSON buffer does not consume
-        512 bytes from the task stack.
-    */
-    static char telemetry_json[512];
-
-    printf(
-        "[WIFI TELEMETRY] worker started, network disabled\n");
-
-    while (1)
-    {
-        /*
-            Wait for at least one telemetry packet.
-
-            The queue contains only one item, so while this
-            task sleeps, newer telemetry overwrites older data.
-        */
-        if (xQueueReceive(
-                wifi_telemetry_queue,
-                &telemetry,
-                portMAX_DELAY) != pdTRUE)
-        {
-            continue;
-        }
-
-        int json_length =
-            gateway_telemetry_build_json(
-                &telemetry,
-                telemetry_json,
-                sizeof(telemetry_json));
-
-        if (json_length > 0)
-        {
-            printf(
-                "[WIFI TELEMETRY DRY RUN] len=%d packet=%lu json=%s\n",
-                json_length,
-                (unsigned long)telemetry.packet_id,
-                telemetry_json);
-        }
-        else
-        {
-            printf(
-                "[WIFI TELEMETRY] JSON build failed packet=%lu\n",
-                (unsigned long)telemetry.packet_id);
-        }
-
-        /*
-            Rate limiting is mandatory.
-
-            Later, an HTTP request may take time.
-            The queue will continue retaining only the
-            newest telemetry packet.
-        */
-        vTaskDelay(
-            pdMS_TO_TICKS(
-                WIFI_TELEMETRY_WORKER_PERIOD_MS));
+    default:
+        return "UNK";
     }
 }
-
-
-
-static const char *gateway_gps_fix_to_lcd_text(uint8_t fix_type)
+static const char *gateway_gps_health_to_lcd_text(
+    mathos_gps_health_t health)
 {
-    switch (fix_type)
+    switch (health)
     {
-    case 0:
+    case MATHOS_GPS_HEALTH_NO_DATA:
+        return "NO";
+
+    case MATHOS_GPS_HEALTH_STALE:
+        return "STALE";
+
+    case MATHOS_GPS_HEALTH_NO_GPS:
         return "NO GPS";
 
-    case 1:
+    case MATHOS_GPS_HEALTH_NO_FIX:
         return "NO FIX";
 
-    case 2:
+    case MATHOS_GPS_HEALTH_2D:
         return "2D";
 
-    case 3:
+    case MATHOS_GPS_HEALTH_3D:
         return "3D";
 
-    case 4:
+    case MATHOS_GPS_HEALTH_DGPS:
         return "DGPS";
 
-    case 5:
-        return "RTK FLT";
+    case MATHOS_GPS_HEALTH_RTK_FLOAT:
+        return "RTK F";
 
-    case 6:
+    case MATHOS_GPS_HEALTH_RTK_FIXED:
         return "RTK FIX";
+
+    case MATHOS_GPS_HEALTH_UNKNOWN:
+    default:
+        return "UNK";
+    }
+}
+
+static const char *gateway_battery_health_to_lcd_text(
+    mathos_battery_health_t health)
+{
+    switch (health)
+    {
+    case MATHOS_BATTERY_HEALTH_NO_DATA:
+        return "NO DATA";
+
+    case MATHOS_BATTERY_HEALTH_STALE:
+        return "STALE";
+
+    case MATHOS_BATTERY_HEALTH_INVALID:
+        return "INVALID";
+
+    case MATHOS_BATTERY_HEALTH_NO_PERCENT:
+        return "NO PCT";
+
+    case MATHOS_BATTERY_HEALTH_OK:
+        return "OK";
+
+    case MATHOS_BATTERY_HEALTH_LOW:
+        return "LOW";
+
+    case MATHOS_BATTERY_HEALTH_CRITICAL:
+        return "CRITICAL";
 
     default:
         return "UNKNOWN";
     }
 }
-
 static void gateway_telemetry_handle_packet(const mathos_secure_packet_t *packet)
 {
     if (packet == NULL ||
@@ -3879,6 +3798,35 @@ static void gateway_telemetry_handle_packet(const mathos_secure_packet_t *packet
 
     gateway_telemetry_update(&telemetry);
 
+    int ekf_data_fresh =
+        (telemetry.telemetry_flags &
+        GATEWAY_TELEMETRY_FLAG_EKF_FRESH) != 0;
+
+    mathos_ekf_health_t ekf_health =
+        mathos_ekf_health_classify(
+            telemetry.ekf_flags,
+            1,
+            ekf_data_fresh);
+    int gps_data_fresh =
+        (telemetry.telemetry_flags &
+        GATEWAY_TELEMETRY_FLAG_GPS_FRESH) != 0;
+
+    mathos_gps_health_t gps_health =
+        mathos_gps_health_classify(
+            telemetry.gps_fix_type,
+            1,
+            gps_data_fresh);
+
+    int battery_data_fresh =
+    (telemetry.telemetry_flags &
+     GATEWAY_TELEMETRY_FLAG_BATTERY_FRESH) != 0;
+
+    mathos_battery_health_t battery_health =
+        mathos_battery_health_classify(
+            telemetry.battery_voltage_mv,
+            telemetry.battery_remaining,
+            1,
+            battery_data_fresh);
     static uint32_t print_counter = 0;
     static uint32_t previous_mode = UINT32_MAX;
 
@@ -3893,8 +3841,10 @@ static void gateway_telemetry_handle_packet(const mathos_secure_packet_t *packet
         printf(
             "[GATEWAY TELEMETRY RX] packet=%lu fresh=%d "
             "mode=%lu mode_name=%s vehicle_type=%u flags=0x%02X "
-            "ekf=0x%04X ekf_fresh=%u "
-            "batt=%.2fV current=%.2fA rem=%d%% gps=%s sats=%u "
+            "ekf=0x%04X ekf_fresh=%u ekf_health=%s "
+            "batt=%.2fV current=%.2fA rem=%d%% "
+            "battery_fresh=%u battery_health=%s "
+            "gps=%s gps_health=%s sats=%u "
             "lat=%.7f lon=%.7f alt=%.1fm rel=%.1fm "
             "roll=%.2f pitch=%.2f yaw=%.2f armed=%u status=%u\n",
             (unsigned long)telemetry.packet_id,
@@ -3907,10 +3857,16 @@ static void gateway_telemetry_handle_packet(const mathos_secure_packet_t *packet
             (unsigned int)telemetry.ekf_flags,
             (telemetry.telemetry_flags &
             GATEWAY_TELEMETRY_FLAG_EKF_FRESH) ? 1U : 0U,
+            mathos_ekf_health_to_string(ekf_health),
             telemetry.battery_voltage_mv / 1000.0f,
             telemetry.battery_current_ca / 100.0f,
             telemetry.battery_remaining,
-            mathos_gps_fix_to_string(telemetry.gps_fix_type),
+            battery_data_fresh ? 1U : 0U,
+            mathos_battery_health_to_string(
+                battery_health),
+            mathos_gps_fix_to_string(
+                telemetry.gps_fix_type),
+            mathos_gps_health_to_string(gps_health),
             telemetry.satellites_visible,
             telemetry.latitude_e7 / 10000000.0,
             telemetry.longitude_e7 / 10000000.0,
@@ -5139,8 +5095,7 @@ void lcd_task(void *pvParameters)
     int last_telemetry_display_state = -1;
     int last_battery_data_valid = -1;
     uint16_t last_battery_display_mv = UINT16_MAX;
-    int last_gps_data_fresh = -1;
-    uint8_t last_gps_fix_type = UINT8_MAX;
+    mathos_gps_health_t last_gps_health = (mathos_gps_health_t)-1;
     uint8_t last_satellites_visible = UINT8_MAX;
     int last_altitude_data_valid = -1;
     int32_t last_relative_altitude_m = INT32_MAX;
@@ -5148,9 +5103,10 @@ void lcd_task(void *pvParameters)
     int last_battery_percent = -1;
     int last_mode_data_valid = -1;
     uint32_t last_fc_mode = UINT32_MAX;
+    mathos_ekf_health_t last_ekf_health = (mathos_ekf_health_t)-1;
+    mathos_battery_health_t last_battery_health =(mathos_battery_health_t)-1;
+
     lcd_fill_color(COLOR_BLACK);
-
-
 
     lcd_draw_text_centered(
     15,
@@ -5180,6 +5136,20 @@ void lcd_task(void *pvParameters)
             gateway_telemetry_get_snapshot(
                 &telemetry_snapshot,
                 &telemetry_fresh);
+
+        int ekf_data_fresh =
+            telemetry_available &&
+            telemetry_fresh &&
+            (telemetry_snapshot.telemetry_flags &
+            GATEWAY_TELEMETRY_FLAG_EKF_FRESH);
+
+        mathos_ekf_health_t ekf_health =
+            mathos_ekf_health_classify(
+                telemetry_available
+                    ? telemetry_snapshot.ekf_flags
+                    : 0,
+                telemetry_available,
+                ekf_data_fresh);
 
         int telemetry_display_state = 0;
 
@@ -5269,13 +5239,39 @@ void lcd_task(void *pvParameters)
             (telemetry_snapshot.telemetry_flags &
             GATEWAY_TELEMETRY_FLAG_GPS_FRESH);
 
-        uint8_t gps_fix_type = UINT8_MAX;
-        uint8_t satellites_visible = UINT8_MAX;
+        mathos_gps_health_t gps_health =
+            mathos_gps_health_classify(
+                telemetry_available
+                    ? telemetry_snapshot.gps_fix_type
+                    : 0,
+                telemetry_available,
+                gps_data_fresh);
+
+
+int battery_data_fresh =
+    telemetry_available &&
+    telemetry_fresh &&
+    (telemetry_snapshot.telemetry_flags &
+     GATEWAY_TELEMETRY_FLAG_BATTERY_FRESH);
+
+mathos_battery_health_t battery_health =
+    mathos_battery_health_classify(
+        telemetry_available
+            ? telemetry_snapshot.battery_voltage_mv
+            : 0,
+        telemetry_available
+            ? telemetry_snapshot.battery_remaining
+            : -1,
+        telemetry_available,
+        battery_data_fresh);
+
+        uint8_t satellites_visible =
+            UINT8_MAX;
 
         if (gps_data_fresh)
         {
-            gps_fix_type = telemetry_snapshot.gps_fix_type;
-            satellites_visible = telemetry_snapshot.satellites_visible;
+            satellites_visible =
+                telemetry_snapshot.satellites_visible;
         }
         /*
             Used to redraw the telemetry line when the larger
@@ -5550,24 +5546,25 @@ void lcd_task(void *pvParameters)
             telemetry_display_state != last_telemetry_display_state ||
             battery_data_valid != last_battery_data_valid ||
             battery_display_mv != last_battery_display_mv ||
-            gps_data_fresh != last_gps_data_fresh ||
-            gps_fix_type != last_gps_fix_type ||
+            gps_health != last_gps_health ||
             satellites_visible != last_satellites_visible ||
             altitude_data_valid != last_altitude_data_valid ||
             relative_altitude_m != last_relative_altitude_m ||
             battery_percent_valid != last_battery_percent_valid ||
-            battery_percent != last_battery_percent)
+            battery_percent != last_battery_percent ||
+            ekf_health != last_ekf_health || battery_health != last_battery_health )
         {
             last_telemetry_display_state = telemetry_display_state;
             last_battery_data_valid = battery_data_valid;
             last_battery_display_mv = battery_display_mv;
-            last_gps_data_fresh = gps_data_fresh;
-            last_gps_fix_type = gps_fix_type;
+            last_gps_health = gps_health;
             last_satellites_visible = satellites_visible;
             last_altitude_data_valid = altitude_data_valid;
             last_relative_altitude_m = relative_altitude_m;
             last_battery_percent_valid = battery_percent_valid;
             last_battery_percent = battery_percent;
+            last_ekf_health = ekf_health;
+            last_battery_health = battery_health;
 
             /*
                 Keep all the existing LCD drawing code here:
@@ -5661,38 +5658,66 @@ void lcd_task(void *pvParameters)
                     (unsigned int)battery_display_mv);
             }
         }
-        else if (altitude_data_valid)
-        {
-            if (relative_altitude_m < 0)
-            {
-                snprintf(
-                    battery_text,
-                    sizeof(battery_text),
-                    "BAT NO DATA ALT N%ldM",
-                    (long)(-relative_altitude_m));
-            }
-            else
-            {
-                snprintf(
-                    battery_text,
-                    sizeof(battery_text),
-                    "BAT NO DATA ALT %ldM",
-                    (long)relative_altitude_m);
-            }
-        }
+else if (altitude_data_valid)
+{
+    if (relative_altitude_m < 0)
+    {
+        snprintf(
+            battery_text,
+            sizeof(battery_text),
+            "BAT %s ALT N%ldM",
+            gateway_battery_health_to_lcd_text(
+                battery_health),
+            (long)(-relative_altitude_m));
+    }
+    else
+    {
+        snprintf(
+            battery_text,
+            sizeof(battery_text),
+            "BAT %s ALT %ldM",
+            gateway_battery_health_to_lcd_text(
+                battery_health),
+            (long)relative_altitude_m);
+    }
+}
         else
         {
             snprintf(
                 battery_text,
                 sizeof(battery_text),
-                "BAT NO DATA ALT NO DATA");
+                "BAT %s ALT NO DATA",
+                gateway_battery_health_to_lcd_text(
+                    battery_health));
+        }
+
+        uint16_t battery_color = COLOR_RED;
+
+        switch (battery_health)
+        {
+        case MATHOS_BATTERY_HEALTH_OK:
+        case MATHOS_BATTERY_HEALTH_NO_PERCENT:
+            battery_color = COLOR_BLUE;
+            break;
+
+        case MATHOS_BATTERY_HEALTH_LOW:
+            battery_color = COLOR_YELLOW;
+            break;
+
+        case MATHOS_BATTERY_HEALTH_CRITICAL:
+        case MATHOS_BATTERY_HEALTH_NO_DATA:
+        case MATHOS_BATTERY_HEALTH_STALE:
+        case MATHOS_BATTERY_HEALTH_INVALID:
+        default:
+            battery_color = COLOR_RED;
+            break;
         }
 
         lcd_draw_text_centered(
             210,
             battery_text,
             1,
-            battery_data_valid ? COLOR_BLUE : COLOR_RED,
+            battery_color,
             COLOR_BLACK);
 
         /*
@@ -5702,33 +5727,49 @@ void lcd_task(void *pvParameters)
         {
             char telemetry_text[32];
 
-            if (gps_data_fresh)
-            {
-                snprintf(
-                    telemetry_text,
-                    sizeof(telemetry_text),
-                    "TEL OK GPS %s S%u",
-                    gateway_gps_fix_to_lcd_text(gps_fix_type),
-                    (unsigned int)satellites_visible);
-            }
-            else
-            {
-                snprintf(
-                    telemetry_text,
-                    sizeof(telemetry_text),
-                    "TEL OK GPS STALE");
-            }
+        if (gps_data_fresh)
+        {
+            snprintf(
+                telemetry_text,
+                sizeof(telemetry_text),
+                "GPS %s S%u EKF %s",
+                gateway_gps_health_to_lcd_text(
+                    gps_health),
+                (unsigned int)satellites_visible,
+                gateway_ekf_health_to_lcd_text(
+                    ekf_health));
+        }
+        else
+        {
+            snprintf(
+                telemetry_text,
+                sizeof(telemetry_text),
+                "GPS %s EKF %s",
+                gateway_gps_health_to_lcd_text(
+                    gps_health),
+                gateway_ekf_health_to_lcd_text(
+                    ekf_health));
+        }
 
-            uint16_t gps_color = COLOR_YELLOW;
+        uint16_t gps_color = COLOR_RED;
 
-            /*
-                GPS fix type 2 or higher means at least a 2D fix.
-            */
-            if (gps_data_fresh && gps_fix_type >= 2)
-            {
-                gps_color = COLOR_BLUE;
-            }
+        switch (gps_health)
+        {
+        case MATHOS_GPS_HEALTH_2D:
+            gps_color = COLOR_YELLOW;
+            break;
 
+        case MATHOS_GPS_HEALTH_3D:
+        case MATHOS_GPS_HEALTH_DGPS:
+        case MATHOS_GPS_HEALTH_RTK_FLOAT:
+        case MATHOS_GPS_HEALTH_RTK_FIXED:
+            gps_color = COLOR_BLUE;
+            break;
+
+        default:
+            gps_color = COLOR_RED;
+            break;
+        }
             lcd_draw_text_centered(
                 225,
                 telemetry_text,
@@ -5759,196 +5800,6 @@ void lcd_task(void *pvParameters)
     }
 }
 
-static void wifi_station_event_handler(
-    void *handler_arg,
-    esp_event_base_t event_base,
-    int32_t event_id,
-    void *event_data)
-{
-    (void)handler_arg;
-
-    if (event_base == WIFI_EVENT &&
-        event_id == WIFI_EVENT_STA_START)
-    {
-        printf(
-            "[WIFI] station started, connecting\n");
-
-        esp_err_t err = esp_wifi_connect();
-
-        if (err != ESP_OK)
-        {
-            printf(
-                "[WIFI] initial connect failed: %s\n",
-                esp_err_to_name(err));
-        }
-    }
-    else if (event_base == WIFI_EVENT &&
-             event_id == WIFI_EVENT_STA_DISCONNECTED)
-    {
-        wifi_station_connected = 0;
-
-        if (wifi_connect_retry_count <
-            WIFI_CONNECT_MAX_RETRIES)
-        {
-            wifi_connect_retry_count++;
-
-            printf(
-                "[WIFI] disconnected, retry %d/%d\n",
-                wifi_connect_retry_count,
-                WIFI_CONNECT_MAX_RETRIES);
-
-            esp_err_t err = esp_wifi_connect();
-
-            if (err != ESP_OK)
-            {
-                printf(
-                    "[WIFI] reconnect request failed: %s\n",
-                    esp_err_to_name(err));
-            }
-        }
-        else
-        {
-            printf(
-                "[WIFI] connection retries exhausted; "
-                "control remains active\n");
-        }
-    }
-    else if (event_base == IP_EVENT &&
-             event_id == IP_EVENT_STA_GOT_IP)
-    {
-        ip_event_got_ip_t *event =
-            (ip_event_got_ip_t *)event_data;
-
-        wifi_station_connected = 1;
-        wifi_connect_retry_count = 0;
-
-        printf(
-            "[WIFI] connected ip=" IPSTR "\n",
-            IP2STR(&event->ip_info.ip));
-    }
-}
-
-
-static esp_err_t wifi_station_init(void)
-{
-    esp_err_t err;
-
-    /*
-        Wi-Fi stores internal calibration and configuration
-        information in NVS.
-    */
-    err = nvs_flash_init();
-
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
-        err == ESP_ERR_NVS_NEW_VERSION_FOUND)
-    {
-        err = nvs_flash_erase();
-
-        if (err != ESP_OK)
-        {
-            return err;
-        }
-
-        err = nvs_flash_init();
-    }
-
-    if (err != ESP_OK)
-    {
-        return err;
-    }
-
-    err = esp_netif_init();
-
-    if (err != ESP_OK)
-    {
-        return err;
-    }
-
-    err = esp_event_loop_create_default();
-
-    if (err != ESP_OK)
-    {
-        return err;
-    }
-
-    esp_netif_t *station_netif =
-        esp_netif_create_default_wifi_sta();
-
-    if (station_netif == NULL)
-    {
-        return ESP_FAIL;
-    }
-
-    wifi_init_config_t wifi_init_config =
-        WIFI_INIT_CONFIG_DEFAULT();
-
-    err = esp_wifi_init(&wifi_init_config);
-
-    if (err != ESP_OK)
-    {
-        return err;
-    }
-
-    err = esp_event_handler_register(
-        WIFI_EVENT,
-        ESP_EVENT_ANY_ID,
-        &wifi_station_event_handler,
-        NULL);
-
-    if (err != ESP_OK)
-    {
-        return err;
-    }
-
-    err = esp_event_handler_register(
-        IP_EVENT,
-        IP_EVENT_STA_GOT_IP,
-        &wifi_station_event_handler,
-        NULL);
-
-    if (err != ESP_OK)
-    {
-        return err;
-    }
-
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = WIFI_TEST_SSID,
-            .password = WIFI_TEST_PASSWORD,
-            .threshold.authmode =
-                WIFI_AUTH_WPA2_PSK,
-        },
-    };
-
-    err = esp_wifi_set_mode(WIFI_MODE_STA);
-
-    if (err != ESP_OK)
-    {
-        return err;
-    }
-
-    err = esp_wifi_set_config(
-        WIFI_IF_STA,
-        &wifi_config);
-
-    if (err != ESP_OK)
-    {
-        return err;
-    }
-
-    err = esp_wifi_start();
-
-    if (err != ESP_OK)
-    {
-        return err;
-    }
-
-    printf(
-        "[WIFI] station initialization complete\n");
-
-    return ESP_OK;
-}
-
 void app_main(void)
 {
     button_semaphore_arm = xSemaphoreCreateBinary();
@@ -5971,35 +5822,7 @@ void app_main(void)
         printf("failed to create queue");
         return;
     }
-    wifi_telemetry_queue = xQueueCreate(
-        1,
-        sizeof(gateway_telemetry_packet_t));
 
-    if (wifi_telemetry_queue == NULL)
-    {
-        printf(
-            "[FATAL] failed to create Wi-Fi telemetry queue\n");
-
-        return;
-    }
-
-    printf(
-        "[WIFI TELEMETRY] queue ready depth=1\n");
-#if FEATURE_WIFI_TELEMETRY
-
-    esp_err_t wifi_init_result =
-        wifi_station_init();
-
-    if (wifi_init_result != ESP_OK)
-    {
-        printf(
-            "[WIFI] optional initialization failed: %s\n",
-            esp_err_to_name(wifi_init_result));
-
-        wifi_station_connected = 0;
-    }
-
-#endif
 #if FEATURE_DIRECT_MAVLINK_MODE
     if (!control_output_init())
     {
@@ -6135,25 +5958,4 @@ void app_main(void)
     create_task_checked(lcd_task, "lcd_task", 4096, NULL, 2, &lcd_task_handle);
     create_task_checked(task_supervisor_task, "task_supervisor_task", 4096, NULL, 6, &heartbeat_task_handle);
     create_task_checked(joystick_adc_task, "joystick_adc_task", 4096, NULL, 3, &joystick_adc_task_handle);
-
-    BaseType_t wifi_task_result = xTaskCreate(
-    wifi_telemetry_task,
-    "wifi_telemetry_task",
-    4096,
-    NULL,
-    1,
-    &wifi_telemetry_task_handle);
-
-if (wifi_task_result == pdPASS)
-{
-    printf(
-        "[BOOT] Optional task created: wifi_telemetry_task\n");
-}
-else
-{
-    wifi_telemetry_task_handle = NULL;
-
-    printf(
-        "[WIFI TELEMETRY] worker creation failed; control remains active\n");
-}
 }

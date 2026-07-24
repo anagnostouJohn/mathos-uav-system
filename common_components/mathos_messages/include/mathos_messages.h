@@ -130,7 +130,95 @@ typedef struct __attribute__((packed))
 #define GATEWAY_TELEMETRY_FLAG_POSITION_FRESH (1u << 2)
 #define GATEWAY_TELEMETRY_FLAG_ATTITUDE_FRESH (1u << 3)
 #define GATEWAY_TELEMETRY_FLAG_EKF_FRESH      (1u << 4)
+/*
+    Raw MAVLink EKF_STATUS_REPORT flag bits used
+    by both the remote controller and gateway.
+*/
+#define MATHOS_EKF_FLAG_ATTITUDE      (1U << 0)
+#define MATHOS_EKF_FLAG_UNINITIALIZED (1U << 10)
 
+/*
+    Human-readable EKF health classification.
+
+    This enum is not included inside any wire packet,
+    so it does not change the protocol layout.
+*/
+typedef enum
+{
+    MATHOS_EKF_HEALTH_NO_DATA = 0,
+    MATHOS_EKF_HEALTH_STALE,
+    MATHOS_EKF_HEALTH_INITIALIZING,
+    MATHOS_EKF_HEALTH_OK,
+    MATHOS_EKF_HEALTH_BAD
+} mathos_ekf_health_t;
+
+/*
+    Convert raw EKF flags and freshness information
+    into one shared health state.
+*/
+mathos_ekf_health_t mathos_ekf_health_classify(
+    uint16_t ekf_flags,
+    int data_available,
+    int data_fresh);
+
+const char *mathos_ekf_health_to_string(
+    mathos_ekf_health_t health);
+/*
+    Shared GPS health classification.
+
+    This is derived locally from gps_fix_type and freshness.
+    It is not stored inside the wire packet.
+*/
+typedef enum
+{
+    MATHOS_GPS_HEALTH_NO_DATA = 0,
+    MATHOS_GPS_HEALTH_STALE,
+    MATHOS_GPS_HEALTH_NO_GPS,
+    MATHOS_GPS_HEALTH_NO_FIX,
+    MATHOS_GPS_HEALTH_2D,
+    MATHOS_GPS_HEALTH_3D,
+    MATHOS_GPS_HEALTH_DGPS,
+    MATHOS_GPS_HEALTH_RTK_FLOAT,
+    MATHOS_GPS_HEALTH_RTK_FIXED,
+    MATHOS_GPS_HEALTH_UNKNOWN
+} mathos_gps_health_t;
+
+
+/*
+    Shared battery health classification.
+
+    This state is calculated locally from the existing
+    telemetry values. It is not transmitted inside the
+    wire packet.
+*/
+typedef enum
+{
+    MATHOS_BATTERY_HEALTH_NO_DATA = 0,
+    MATHOS_BATTERY_HEALTH_STALE,
+    MATHOS_BATTERY_HEALTH_INVALID,
+    MATHOS_BATTERY_HEALTH_NO_PERCENT,
+    MATHOS_BATTERY_HEALTH_OK,
+    MATHOS_BATTERY_HEALTH_LOW,
+    MATHOS_BATTERY_HEALTH_CRITICAL
+} mathos_battery_health_t;
+
+mathos_battery_health_t mathos_battery_health_classify(
+    uint16_t voltage_mv,
+    int8_t remaining_percent,
+    int data_available,
+    int data_fresh);
+
+const char *mathos_battery_health_to_string(
+    mathos_battery_health_t health);
+
+    
+mathos_gps_health_t mathos_gps_health_classify(
+    uint8_t fix_type,
+    int data_available,
+    int data_fresh);
+
+const char *mathos_gps_health_to_string(
+    mathos_gps_health_t health);
 typedef struct __attribute__((packed))
 {
     uint32_t packet_id;

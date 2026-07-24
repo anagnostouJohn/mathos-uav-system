@@ -10,8 +10,4 @@ idf_component_register(
         mathos_secure 
         mathos_messages 
         mathos_flight_modes 
-        esp_wifi 
-        esp_event 
-        esp_netif 
-        nvs_flash
 )

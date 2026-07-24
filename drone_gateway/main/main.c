@@ -2575,14 +2575,90 @@ static void gateway_print_fc_telemetry(void)
     float pitch_deg = fc_tel_pitch_rad * 57.2957795f;
     float yaw_deg = fc_tel_yaw_rad * 57.2957795f;
 
+    int64_t gps_update_us;
+    uint8_t gps_fix_type;
+
+    taskENTER_CRITICAL(&fc_telemetry_mux);
+
+    gps_update_us = fc_tel_gps_update_us;
+    gps_fix_type = fc_tel_gps_fix_type;
+
+    taskEXIT_CRITICAL(&fc_telemetry_mux);
+
+    int gps_data_available =
+        gps_update_us > 0;
+
+    int gps_data_fresh = 0;
+
+    if (gps_data_available)
+    {
+        int64_t gps_age_ms =
+            (esp_timer_get_time() - gps_update_us) / 1000;
+
+        gps_data_fresh =
+            gps_age_ms <= GATEWAY_TELEMETRY_FRESH_MS;
+    }
+
+    mathos_gps_health_t gps_health =
+        mathos_gps_health_classify(
+            gps_fix_type,
+            gps_data_available,
+            gps_data_fresh);
+
+            int64_t battery_update_us;
+    uint16_t battery_voltage_mv;
+    int8_t battery_remaining;
+
+    taskENTER_CRITICAL(&fc_telemetry_mux);
+
+    battery_update_us =
+        fc_tel_battery_update_us;
+
+    battery_voltage_mv =
+        fc_tel_battery_voltage_mv;
+
+    battery_remaining =
+        fc_tel_battery_remaining;
+
+    taskEXIT_CRITICAL(&fc_telemetry_mux);
+
+    int battery_data_available =
+        battery_update_us > 0;
+
+    int battery_data_fresh = 0;
+
+    if (battery_data_available)
+    {
+        int64_t battery_age_ms =
+            (esp_timer_get_time() -
+            battery_update_us) /
+            1000;
+
+        battery_data_fresh =
+            battery_age_ms <=
+            GATEWAY_TELEMETRY_FRESH_MS;
+    }
+
+    mathos_battery_health_t battery_health =
+        mathos_battery_health_classify(
+            battery_voltage_mv,
+            battery_remaining,
+            battery_data_available,
+            battery_data_fresh);
+
     ESP_LOGI(
         TAG,
-        "FC TELEMETRY batt=%.2fV current=%.2fA rem=%d%% gps=%s sats=%u "
+        "FC TELEMETRY batt=%.2fV current=%.2fA rem=%d%% "
+        "battery_fresh=%u battery_health=%s "
+        "gps=%s gps_health=%s sats=%u "
         "lat=%.7f lon=%.7f alt=%.1fm rel=%.1fm roll=%.1f pitch=%.1f yaw=%.1f",
         battery_v,
         battery_a,
         fc_tel_battery_remaining,
+        battery_data_fresh ? 1U : 0U,
+        mathos_battery_health_to_string(battery_health),
         mathos_gps_fix_to_string(fc_tel_gps_fix_type),
+        mathos_gps_health_to_string(gps_health),
         fc_tel_satellites_visible,
         lat_deg,
         lon_deg,
@@ -3123,6 +3199,11 @@ if (ack.command ==
     static uint32_t ekf_print_counter = 0;
 
     ekf_print_counter++;
+    mathos_ekf_health_t ekf_health =
+    mathos_ekf_health_classify(
+        ekf.flags,
+        1,
+        1);
 
     bool flags_changed =
         ekf.flags != previous_ekf_flags;
@@ -3135,14 +3216,14 @@ if (ack.command ==
 
         ESP_LOGI(
             TAG,
-            "FC EKF flags=0x%04X "
+            "FC EKF flags=0x%04X health=%s "
             "att=%u vel_h=%u vel_v=%u "
             "pos_rel=%u pos_abs=%u alt_abs=%u "
             "uninit=%u gps_glitch=%u "
             "variance[v=%.2f ph=%.2f pv=%.2f "
             "mag=%.2f terrain=%.2f air=%.2f]",
             ekf.flags,
-
+            mathos_ekf_health_to_string(ekf_health),
             (ekf.flags & EKF_ATTITUDE) ? 1 : 0,
             (ekf.flags & EKF_VELOCITY_HORIZ) ? 1 : 0,
             (ekf.flags & EKF_VELOCITY_VERT) ? 1 : 0,
