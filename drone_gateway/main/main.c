@@ -167,12 +167,14 @@ static volatile bool fc_tel_sys_status_seen = false;
 static volatile bool fc_tel_gps_seen = false;
 static volatile bool fc_tel_position_seen = false;
 static volatile bool fc_tel_attitude_seen = false;
+static volatile bool fc_tel_vfr_hud_seen = false;
 
 static volatile int64_t fc_tel_battery_update_us = 0;
 static volatile int64_t fc_tel_gps_update_us = 0;
 static volatile int64_t fc_tel_position_update_us = 0;
 static volatile int64_t fc_tel_attitude_update_us = 0;
 static volatile int64_t fc_tel_ekf_update_us = 0;
+static volatile int64_t fc_tel_airspeed_update_us = 0;
 static volatile uint8_t fc_tel_system_status = 0;
 
 static volatile uint16_t fc_tel_battery_voltage_mv = 0;
@@ -192,6 +194,7 @@ static volatile int32_t fc_tel_relative_alt_mm = 0;
 static volatile float fc_tel_roll_rad = 0.0f;
 static volatile float fc_tel_pitch_rad = 0.0f;
 static volatile float fc_tel_yaw_rad = 0.0f;
+static volatile float fc_tel_airspeed_mps = 0.0f;
 static volatile uint16_t fc_tel_ekf_flags = 0;
 
 
@@ -2551,7 +2554,11 @@ static void gateway_print_fc_telemetry(void)
     double lat_deg = fc_tel_lat / 10000000.0;
     double lon_deg = fc_tel_lon / 10000000.0;
 
+
+
     int32_t selected_alt_mm;
+    int32_t selected_rel_alt_mm;
+    int64_t altitude_update_us;
 
     taskENTER_CRITICAL(&fc_telemetry_mux);
 
@@ -2560,8 +2567,11 @@ static void gateway_print_fc_telemetry(void)
             ? fc_tel_global_alt_mm
             : fc_tel_gps_alt_mm;
 
-    int32_t selected_rel_alt_mm =
+    selected_rel_alt_mm =
         fc_tel_relative_alt_mm;
+
+    altitude_update_us =
+        fc_tel_position_update_us;
 
     taskEXIT_CRITICAL(&fc_telemetry_mux);
 
@@ -2571,9 +2581,67 @@ static void gateway_print_fc_telemetry(void)
     float rel_alt_m =
         selected_rel_alt_mm / 1000.0f;
 
-    float roll_deg = fc_tel_roll_rad * 57.2957795f;
-    float pitch_deg = fc_tel_pitch_rad * 57.2957795f;
-    float yaw_deg = fc_tel_yaw_rad * 57.2957795f;
+    int altitude_data_available =
+    altitude_update_us > 0;
+
+    int altitude_data_fresh = 0;
+
+    if (altitude_data_available)
+    {
+        int64_t altitude_age_ms =
+            (esp_timer_get_time() -
+            altitude_update_us) /
+            1000;
+
+        altitude_data_fresh =
+            altitude_age_ms <=
+            GATEWAY_TELEMETRY_FRESH_MS;
+    }
+
+    mathos_altitude_health_t altitude_health =
+        mathos_altitude_health_classify(
+            altitude_data_available,
+            altitude_data_fresh);
+
+    float roll_rad;
+    float pitch_rad;
+    float yaw_rad;
+    int64_t attitude_update_us;
+
+    taskENTER_CRITICAL(&fc_telemetry_mux);
+
+    roll_rad = fc_tel_roll_rad;
+    pitch_rad = fc_tel_pitch_rad;
+    yaw_rad = fc_tel_yaw_rad;
+    attitude_update_us = fc_tel_attitude_update_us;
+
+    taskEXIT_CRITICAL(&fc_telemetry_mux);
+
+    int attitude_data_available =
+        attitude_update_us > 0;
+
+    int attitude_data_fresh = 0;
+
+    if (attitude_data_available)
+    {
+        int64_t attitude_age_ms =
+            (esp_timer_get_time() -
+            attitude_update_us) /
+            1000;
+
+        attitude_data_fresh =
+            attitude_age_ms <=
+            GATEWAY_TELEMETRY_FRESH_MS;
+    }
+
+    mathos_attitude_health_t attitude_health =
+        mathos_attitude_health_classify(
+            attitude_data_available,
+            attitude_data_fresh);
+
+    float roll_deg = roll_rad * 57.2957795f;
+    float pitch_deg = pitch_rad * 57.2957795f;
+    float yaw_deg = yaw_rad * 57.2957795f;
 
     int64_t gps_update_us;
     uint8_t gps_fix_type;
@@ -2651,7 +2719,9 @@ static void gateway_print_fc_telemetry(void)
         "FC TELEMETRY batt=%.2fV current=%.2fA rem=%d%% "
         "battery_fresh=%u battery_health=%s "
         "gps=%s gps_health=%s sats=%u "
-        "lat=%.7f lon=%.7f alt=%.1fm rel=%.1fm roll=%.1f pitch=%.1f yaw=%.1f",
+        "lat=%.7f lon=%.7f alt=%.1fm rel=%.1fm "
+        "altitude_health=%s attitude_health=%s "
+        "roll=%.1f pitch=%.1f yaw=%.1f",
         battery_v,
         battery_a,
         fc_tel_battery_remaining,
@@ -2664,6 +2734,8 @@ static void gateway_print_fc_telemetry(void)
         lon_deg,
         alt_m,
         rel_alt_m,
+        mathos_altitude_health_to_string(altitude_health),
+        mathos_attitude_health_to_string(attitude_health),
         roll_deg,
         pitch_deg,
         yaw_deg
@@ -3172,6 +3244,29 @@ if (ack.command ==
 
             taskEXIT_CRITICAL(&fc_telemetry_mux);
         }
+        else if (msg.msgid == MAVLINK_MSG_ID_VFR_HUD)
+        {
+            mavlink_vfr_hud_t vfr_hud;
+
+            mavlink_msg_vfr_hud_decode(
+                &msg,
+                &vfr_hud);
+
+            int64_t update_us =
+                esp_timer_get_time();
+
+            taskENTER_CRITICAL(
+                &fc_telemetry_mux);
+
+            fc_tel_vfr_hud_seen = true;
+            fc_tel_airspeed_mps =
+                vfr_hud.airspeed;
+            fc_tel_airspeed_update_us =
+                update_us;
+
+            taskEXIT_CRITICAL(
+                &fc_telemetry_mux);
+        }
         else if (msg.msgid == MAVLINK_MSG_ID_EKF_STATUS_REPORT){
     mavlink_ekf_status_report_t ekf;
 
@@ -3409,12 +3504,14 @@ static bool gateway_telemetry_send_once(void)
     float roll_rad;
     float pitch_rad;
     float yaw_rad;
+    float airspeed_mps;
 
     int64_t battery_update_us;
     int64_t gps_update_us;
     int64_t position_update_us;
     int64_t attitude_update_us;
     int64_t ekf_update_us;
+    int64_t airspeed_update_us;
 
     /*
     Take one complete telemetry snapshot.
@@ -3455,6 +3552,7 @@ static bool gateway_telemetry_send_once(void)
     roll_rad = fc_tel_roll_rad;
     pitch_rad = fc_tel_pitch_rad;
     yaw_rad = fc_tel_yaw_rad;
+    airspeed_mps = fc_tel_airspeed_mps;
 
     telemetry.fc_custom_mode = fc_custom_mode;
     telemetry.fc_vehicle_type = fc_vehicle_type;
@@ -3468,6 +3566,7 @@ static bool gateway_telemetry_send_once(void)
     position_update_us = fc_tel_position_update_us;
     attitude_update_us = fc_tel_attitude_update_us;
     ekf_update_us = fc_tel_ekf_update_us;
+    airspeed_update_us = fc_tel_airspeed_update_us;
     taskEXIT_CRITICAL(&fc_telemetry_mux);
 /*
    Capture time after the snapshot so it cannot be older
@@ -3489,11 +3588,34 @@ static bool gateway_telemetry_send_once(void)
     telemetry.yaw_cd =
         gateway_radians_to_centidegrees(yaw_rad);
 
+    float airspeed_kph =
+        airspeed_mps * 3.6f;
+
+    if (airspeed_kph < 0.0f)
+    {
+        airspeed_kph = 0.0f;
+    }
+    else if (airspeed_kph > 255.0f)
+    {
+        airspeed_kph = 255.0f;
+    }
+
+    telemetry.airspeed_kph =
+        (uint8_t)(airspeed_kph + 0.5f);
+
     if (gateway_telemetry_value_is_fresh(
             battery_update_us,
             now_us)) {
         telemetry.telemetry_flags |=
             GATEWAY_TELEMETRY_FLAG_BATTERY_FRESH;
+    }
+
+    if (gateway_telemetry_value_is_fresh(
+            airspeed_update_us,
+            now_us))
+    {
+        telemetry.telemetry_flags |=
+            GATEWAY_TELEMETRY_FLAG_AIRSPEED_FRESH;
     }
 
     if (gateway_telemetry_value_is_fresh(

@@ -130,6 +130,7 @@ typedef struct __attribute__((packed))
 #define GATEWAY_TELEMETRY_FLAG_POSITION_FRESH (1u << 2)
 #define GATEWAY_TELEMETRY_FLAG_ATTITUDE_FRESH (1u << 3)
 #define GATEWAY_TELEMETRY_FLAG_EKF_FRESH      (1u << 4)
+#define GATEWAY_TELEMETRY_FLAG_AIRSPEED_FRESH (1u << 5)
 /*
     Raw MAVLink EKF_STATUS_REPORT flag bits used
     by both the remote controller and gateway.
@@ -151,11 +152,52 @@ typedef enum
     MATHOS_EKF_HEALTH_OK,
     MATHOS_EKF_HEALTH_BAD
 } mathos_ekf_health_t;
+/*
+    Shared altitude health classification.
 
+    This state is calculated locally from existing
+    telemetry freshness information. It is not transmitted
+    inside the wire packet.
+*/
+typedef enum
+{
+    MATHOS_ALTITUDE_HEALTH_NO_DATA = 0,
+    MATHOS_ALTITUDE_HEALTH_STALE,
+    MATHOS_ALTITUDE_HEALTH_VALID
+} mathos_altitude_health_t;
+
+mathos_altitude_health_t mathos_altitude_health_classify(
+    int data_available,
+    int data_fresh);
+
+const char *mathos_altitude_health_to_string(
+    mathos_altitude_health_t health);
 /*
     Convert raw EKF flags and freshness information
     into one shared health state.
 */
+
+/*
+    Shared attitude health classification.
+
+    This state is calculated locally from the existing
+    ATTITUDE freshness flag. It is not transmitted inside
+    the wire packet.
+*/
+typedef enum
+{
+    MATHOS_ATTITUDE_HEALTH_NO_DATA = 0,
+    MATHOS_ATTITUDE_HEALTH_STALE,
+    MATHOS_ATTITUDE_HEALTH_VALID
+} mathos_attitude_health_t;
+
+mathos_attitude_health_t mathos_attitude_health_classify(
+    int data_available,
+    int data_fresh);
+
+const char *mathos_attitude_health_to_string(
+    mathos_attitude_health_t health);
+
 mathos_ekf_health_t mathos_ekf_health_classify(
     uint16_t ekf_flags,
     int data_available,
@@ -191,6 +233,29 @@ typedef enum
     telemetry values. It is not transmitted inside the
     wire packet.
 */
+
+/*
+    Shared airspeed health classification.
+
+    This state is calculated locally from the availability
+    and freshness of MAVLink airspeed telemetry.
+
+    It is not transmitted inside the wire packet.
+*/
+typedef enum
+{
+    MATHOS_AIRSPEED_HEALTH_NO_DATA = 0,
+    MATHOS_AIRSPEED_HEALTH_STALE,
+    MATHOS_AIRSPEED_HEALTH_VALID
+} mathos_airspeed_health_t;
+
+mathos_airspeed_health_t mathos_airspeed_health_classify(
+    int data_available,
+    int data_fresh);
+
+const char *mathos_airspeed_health_to_string(
+    mathos_airspeed_health_t health);
+
 typedef enum
 {
     MATHOS_BATTERY_HEALTH_NO_DATA = 0,
@@ -253,13 +318,8 @@ typedef struct __attribute__((packed))
 
     uint8_t fc_is_armed;
     uint8_t system_status;
-
-    /*
-        MAVLink HEARTBEAT.type.
-    */
     uint8_t fc_vehicle_type;
-
-    uint8_t reserved;
+    uint8_t airspeed_kph;
 } gateway_telemetry_packet_t;
 
 _Static_assert(

@@ -392,3 +392,111 @@ const char *mathos_battery_health_to_string(
         return "UNKNOWN";
     }
 }
+
+mathos_altitude_health_t mathos_altitude_health_classify(
+    int data_available,
+    int data_fresh)
+{
+    if (!data_available)
+    {
+        return MATHOS_ALTITUDE_HEALTH_NO_DATA;
+    }
+
+    if (!data_fresh)
+    {
+        return MATHOS_ALTITUDE_HEALTH_STALE;
+    }
+
+    return MATHOS_ALTITUDE_HEALTH_VALID;
+}
+
+const char *mathos_altitude_health_to_string(
+    mathos_altitude_health_t health)
+{
+    switch (health)
+    {
+    case MATHOS_ALTITUDE_HEALTH_NO_DATA:
+        return "NO_DATA";
+
+    case MATHOS_ALTITUDE_HEALTH_STALE:
+        return "STALE";
+
+    case MATHOS_ALTITUDE_HEALTH_VALID:
+        return "VALID";
+
+    default:
+        return "UNKNOWN";
+    }
+}
+
+mathos_attitude_health_t mathos_attitude_health_classify(
+    int data_available,
+    int data_fresh)
+{
+    if (!data_available)
+    {
+        return MATHOS_ATTITUDE_HEALTH_NO_DATA;
+    }
+
+    if (!data_fresh)
+    {
+        return MATHOS_ATTITUDE_HEALTH_STALE;
+    }
+
+    return MATHOS_ATTITUDE_HEALTH_VALID;
+}
+
+const char *mathos_attitude_health_to_string(
+    mathos_attitude_health_t health)
+{
+    switch (health)
+    {
+    case MATHOS_ATTITUDE_HEALTH_NO_DATA:
+        return "NO_DATA";
+
+    case MATHOS_ATTITUDE_HEALTH_STALE:
+        return "STALE";
+
+    case MATHOS_ATTITUDE_HEALTH_VALID:
+        return "VALID";
+
+    default:
+        return "UNKNOWN";
+    }
+}
+
+mathos_airspeed_health_t mathos_airspeed_health_classify(
+    int data_available,
+    int data_fresh)
+{
+    if (!data_available)
+    {
+        return MATHOS_AIRSPEED_HEALTH_NO_DATA;
+    }
+
+    if (!data_fresh)
+    {
+        return MATHOS_AIRSPEED_HEALTH_STALE;
+    }
+
+    return MATHOS_AIRSPEED_HEALTH_VALID;
+}
+
+const char *mathos_airspeed_health_to_string(
+    mathos_airspeed_health_t health)
+{
+    switch (health)
+    {
+    case MATHOS_AIRSPEED_HEALTH_NO_DATA:
+        return "NO_DATA";
+
+    case MATHOS_AIRSPEED_HEALTH_STALE:
+        return "STALE";
+
+    case MATHOS_AIRSPEED_HEALTH_VALID:
+        return "VALID";
+
+    default:
+        return "UNKNOWN";
+    }
+}

@@ -3781,6 +3781,46 @@ static const char *gateway_battery_health_to_lcd_text(
         return "UNKNOWN";
     }
 }
+
+static const char *gateway_altitude_health_to_lcd_text(
+    mathos_altitude_health_t health)
+{
+    switch (health)
+    {
+    case MATHOS_ALTITUDE_HEALTH_NO_DATA:
+        return "NO DATA";
+
+    case MATHOS_ALTITUDE_HEALTH_STALE:
+        return "STALE";
+
+    case MATHOS_ALTITUDE_HEALTH_VALID:
+        return "VALID";
+
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static const char *gateway_attitude_health_to_lcd_text(
+    mathos_attitude_health_t health)
+{
+    switch (health)
+    {
+    case MATHOS_ATTITUDE_HEALTH_NO_DATA:
+        return "NO";
+
+    case MATHOS_ATTITUDE_HEALTH_STALE:
+        return "STALE";
+
+    case MATHOS_ATTITUDE_HEALTH_VALID:
+        return "OK";
+
+    default:
+        return "UNK";
+    }
+}
+
+
 static void gateway_telemetry_handle_packet(const mathos_secure_packet_t *packet)
 {
     if (packet == NULL ||
@@ -3827,6 +3867,23 @@ static void gateway_telemetry_handle_packet(const mathos_secure_packet_t *packet
             telemetry.battery_remaining,
             1,
             battery_data_fresh);
+            int altitude_data_fresh =
+    (telemetry.telemetry_flags &
+     GATEWAY_TELEMETRY_FLAG_POSITION_FRESH) != 0;
+
+    mathos_altitude_health_t altitude_health =
+        mathos_altitude_health_classify(
+            1,
+            altitude_data_fresh);
+
+    int attitude_data_fresh =
+    (telemetry.telemetry_flags &
+     GATEWAY_TELEMETRY_FLAG_ATTITUDE_FRESH) != 0;
+
+    mathos_attitude_health_t attitude_health =
+        mathos_attitude_health_classify(
+            1,
+            attitude_data_fresh);
     static uint32_t print_counter = 0;
     static uint32_t previous_mode = UINT32_MAX;
 
@@ -3846,12 +3903,14 @@ static void gateway_telemetry_handle_packet(const mathos_secure_packet_t *packet
             "battery_fresh=%u battery_health=%s "
             "gps=%s gps_health=%s sats=%u "
             "lat=%.7f lon=%.7f alt=%.1fm rel=%.1fm "
+            "altitude_health=%s attitude_health=%s "
             "roll=%.2f pitch=%.2f yaw=%.2f armed=%u status=%u\n",
             (unsigned long)telemetry.packet_id,
             gateway_telemetry_is_fresh(),
             (unsigned long)telemetry.fc_custom_mode,
             mathos_plane_mode_to_string(
                 telemetry.fc_custom_mode),
+            
             telemetry.fc_vehicle_type,
             telemetry.telemetry_flags,
             (unsigned int)telemetry.ekf_flags,
@@ -3872,6 +3931,8 @@ static void gateway_telemetry_handle_packet(const mathos_secure_packet_t *packet
             telemetry.longitude_e7 / 10000000.0,
             telemetry.altitude_mm / 1000.0f,
             telemetry.relative_altitude_mm / 1000.0f,
+            mathos_altitude_health_to_string(altitude_health),
+            mathos_attitude_health_to_string(attitude_health),
             telemetry.roll_cd / 100.0f,
             telemetry.pitch_cd / 100.0f,
             telemetry.yaw_cd / 100.0f,
@@ -5105,6 +5166,8 @@ void lcd_task(void *pvParameters)
     uint32_t last_fc_mode = UINT32_MAX;
     mathos_ekf_health_t last_ekf_health = (mathos_ekf_health_t)-1;
     mathos_battery_health_t last_battery_health =(mathos_battery_health_t)-1;
+    mathos_altitude_health_t last_altitude_health = (mathos_altitude_health_t)-1;
+    mathos_attitude_health_t last_attitude_health = (mathos_attitude_health_t)-1;
 
     lcd_fill_color(COLOR_BLACK);
 
@@ -5287,6 +5350,27 @@ mathos_battery_health_t battery_health =
             (telemetry_snapshot.telemetry_flags &
             GATEWAY_TELEMETRY_FLAG_POSITION_FRESH);
 
+        mathos_altitude_health_t altitude_health =
+            mathos_altitude_health_classify(
+                telemetry_available,
+                altitude_data_valid);
+        int attitude_data_fresh =
+        telemetry_available &&
+        telemetry_fresh &&
+        (telemetry_snapshot.telemetry_flags &
+        GATEWAY_TELEMETRY_FLAG_ATTITUDE_FRESH);
+
+        mathos_attitude_health_t attitude_health =
+            mathos_attitude_health_classify(
+                telemetry_available,
+                attitude_data_fresh);
+
+        const char *attitude_health_text =
+            gateway_attitude_health_to_lcd_text(attitude_health);
+
+        const char *altitude_health_text =
+            gateway_altitude_health_to_lcd_text(
+                altitude_health);
         int32_t relative_altitude_m = 0;
 
         if (altitude_data_valid)
@@ -5552,7 +5636,10 @@ mathos_battery_health_t battery_health =
             relative_altitude_m != last_relative_altitude_m ||
             battery_percent_valid != last_battery_percent_valid ||
             battery_percent != last_battery_percent ||
-            ekf_health != last_ekf_health || battery_health != last_battery_health )
+            ekf_health != last_ekf_health || 
+            battery_health != last_battery_health ||
+            altitude_health != last_altitude_health ||
+            attitude_health != last_attitude_health)
         {
             last_telemetry_display_state = telemetry_display_state;
             last_battery_data_valid = battery_data_valid;
@@ -5565,6 +5652,7 @@ mathos_battery_health_t battery_health =
             last_battery_percent = battery_percent;
             last_ekf_health = ekf_health;
             last_battery_health = battery_health;
+            last_altitude_health = altitude_health;
 
             /*
                 Keep all the existing LCD drawing code here:
@@ -5645,17 +5733,20 @@ mathos_battery_health_t battery_health =
                 snprintf(
                     battery_text,
                     sizeof(battery_text),
-                    "BAT %uMV %dP ALT NO DATA",
+                    "BAT %uMV %dP ALT %s",
                     (unsigned int)battery_display_mv,
-                    battery_percent);
+                    battery_percent,
+                    altitude_health_text);
             }
             else
             {
                 snprintf(
                     battery_text,
                     sizeof(battery_text),
-                    "BAT %uMV ALT NO DATA",
-                    (unsigned int)battery_display_mv);
+                    "BAT %uMV ALT %s",
+                    (unsigned int)battery_display_mv,
+                    altitude_health_text
+                );
             }
         }
 else if (altitude_data_valid)
@@ -5686,9 +5777,10 @@ else if (altitude_data_valid)
             snprintf(
                 battery_text,
                 sizeof(battery_text),
-                "BAT %s ALT NO DATA",
+                "BAT %s ALT %s",
                 gateway_battery_health_to_lcd_text(
-                    battery_health));
+                    battery_health),
+                altitude_health_text);
         }
 
         uint16_t battery_color = COLOR_RED;
@@ -5725,30 +5817,32 @@ else if (altitude_data_valid)
         */
         if (telemetry_display_state == 2)
         {
-            char telemetry_text[32];
+            char telemetry_text[48];
 
         if (gps_data_fresh)
         {
             snprintf(
                 telemetry_text,
                 sizeof(telemetry_text),
-                "GPS %s S%u EKF %s",
+                "GPS %s S%u EKF %s ATT %s",
                 gateway_gps_health_to_lcd_text(
                     gps_health),
                 (unsigned int)satellites_visible,
                 gateway_ekf_health_to_lcd_text(
-                    ekf_health));
+                    ekf_health),
+                attitude_health_text);
         }
         else
         {
-            snprintf(
-                telemetry_text,
-                sizeof(telemetry_text),
-                "GPS %s EKF %s",
-                gateway_gps_health_to_lcd_text(
-                    gps_health),
-                gateway_ekf_health_to_lcd_text(
-                    ekf_health));
+        snprintf(
+            telemetry_text,
+            sizeof(telemetry_text),
+            "GPS %s EKF %s ATT %s",
+            gateway_gps_health_to_lcd_text(
+                gps_health),
+            gateway_ekf_health_to_lcd_text(
+                ekf_health),
+            attitude_health_text);
         }
 
         uint16_t gps_color = COLOR_RED;
