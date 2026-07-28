@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <inttypes.h>
+#include <math.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -3588,26 +3589,44 @@ static bool gateway_telemetry_send_once(void)
     telemetry.yaw_cd =
         gateway_radians_to_centidegrees(yaw_rad);
 
-    float airspeed_kph =
-        airspeed_mps * 3.6f;
+/*
+    Accept only a real, finite, non-negative value.
 
-    if (airspeed_kph < 0.0f)
+    This prevents NaN, infinity, or corrupted negative
+    values from being converted into believable telemetry.
+*/
+    bool airspeed_value_valid =
+        isfinite(airspeed_mps) &&
+        airspeed_mps >= 0.0f;
+
+
+    float airspeed_kph = 0.0f;
+
+    if (airspeed_value_valid)
     {
-        airspeed_kph = 0.0f;
-    }
-    else if (airspeed_kph > 255.0f)
-    {
-        airspeed_kph = 255.0f;
+        airspeed_kph =
+            airspeed_mps * 3.6f;
+
+        /*
+            The Mathos packet stores one unsigned byte,
+            so the maximum representable value is 255 km/h.
+        */
+        if (airspeed_kph > 255.0f)
+        {
+            airspeed_kph = 255.0f;
+        }
     }
 
     telemetry.airspeed_kph =
         (uint8_t)(airspeed_kph + 0.5f);
 
-    if (gateway_telemetry_value_is_fresh(
-            battery_update_us,
-            now_us)) {
+    if (airspeed_value_valid &&
+        gateway_telemetry_value_is_fresh(
+            airspeed_update_us,
+            now_us))
+    {
         telemetry.telemetry_flags |=
-            GATEWAY_TELEMETRY_FLAG_BATTERY_FRESH;
+            GATEWAY_TELEMETRY_FLAG_AIRSPEED_FRESH;
     }
 
     if (gateway_telemetry_value_is_fresh(
@@ -3713,7 +3732,8 @@ static bool gateway_telemetry_send_once(void)
             "GATEWAY TELEMETRY TX packet=%" PRIu32
             " mode=%" PRIu32 " vehicle_type=%u"
             " flags=0x%02X batt=%umV rem=%d%% gps=%u sats=%u"
-            " rel_alt=%" PRId32 "mm roll=%dcd pitch=%dcd yaw=%dcd",
+            " rel_alt=%" PRId32 "mm roll=%dcd pitch=%dcd yaw=%dcd"
+            " airspeed=%ukm/h airspeed_fresh=%u",
             telemetry.packet_id,
             telemetry.fc_custom_mode,
             telemetry.fc_vehicle_type,
@@ -3725,7 +3745,12 @@ static bool gateway_telemetry_send_once(void)
             telemetry.relative_altitude_mm,
             telemetry.roll_cd,
             telemetry.pitch_cd,
-            telemetry.yaw_cd
+            telemetry.yaw_cd,
+            (unsigned int)telemetry.airspeed_kph,
+            (telemetry.telemetry_flags &
+            GATEWAY_TELEMETRY_FLAG_AIRSPEED_FRESH)
+                ? 1U
+                : 0U
         );
     }
 

@@ -30,10 +30,8 @@ const char *mathos_rc_state_to_string(rc_state_t state)
     }
 }
 
-
 const char *mathos_gateway_action_to_string(
-    gateway_action_t action
-)
+    gateway_action_t action)
 {
     switch (action)
     {
