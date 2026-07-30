@@ -5,7 +5,9 @@ set(EXTRA_COMPONENT_DIRS
     "../common_components/mathos_secure"
     "../common_components/mathos_messages"
     "../common_components/mathos_flight_modes"
+    "../common_components/mathos_maintenance"
 )
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+
 project(remote_controller)

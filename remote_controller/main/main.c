@@ -17,8 +17,11 @@
 #include "mathos_protocol.h"
 #include "mathos_secure.h"
 #include "esp_random.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 #include "mathos_messages.h"
 #include "mathos_flight_modes.h"
+#include "mathos_maintenance.h"
 
 ////////////////////////////////////////////////////////////////////////////////////
 #define COMMAND_STATUS_MESSAGE_CLEAR_MS 3000
@@ -70,6 +73,7 @@
 #define SWITCH_RF_PIN 47
 #define MASTER_ENABLE_PIN 10
 #define ARM_PERMISSION_SWITCH_PIN 2
+#define MAINTENANCE_SWITCH_PIN 1
 
 #define JOYSTICK_PERIOD_MS 10
 #define RADIO_TX_PERIOD_MS 20
@@ -187,18 +191,11 @@
 #define FEATURE_DIRECT_MAVLINK_MODE 0
 #define FEATURE_SECURITY_SKELETON 1
 #define GATEWAY_SESSION_HISTORY_LEN 16
-
-/*
-    Bench mode only.
-
-    When gateway real ARM/DISARM is disabled, the gateway sends
-    ARM_DRY_RUN / DISARM_DRY_RUN instead of real FC confirmation.
-
-    This lets the remote clear ARMING / DISARMING during bench tests,
-    so we can verify joystick packet flow through the gateway.
-
-    Set this to 0 before real ARM/DISARM testing.
-*/
+#define JOYSTICK_CALIBRATION_MAGIC 0x4A43414CU
+#define JOYSTICK_CALIBRATION_VERSION 1U
+#define JOYSTICK_NVS_NAMESPACE "joystick"
+#define JOYSTICK_NVS_KEY "calibration"
+#define TEST_PROVISION_CALIBRATION_ONCE 0
 #define FEATURE_TREAT_GATEWAY_DRY_RUN_AS_CONFIRMED 0
 
 #if FEATURE_DIRECT_MAVLINK_MODE && FEATURE_SECURE_GATEWAY_MODE
@@ -362,6 +359,28 @@ typedef struct
     int valid;
 } rc_input_t;
 
+typedef struct
+{
+    int raw_min;
+    int raw_center;
+    int raw_max;
+    int deadzone_raw;
+    int invert;
+} joystick_axis_calibration_t;
+
+typedef struct
+{
+    uint32_t magic;
+    uint16_t version;
+    uint16_t record_size;
+
+    joystick_axis_calibration_t roll;
+    joystick_axis_calibration_t pitch;
+
+    uint32_t calibration_counter;
+    uint32_t crc32;
+} joystick_calibration_record_t;
+
 typedef enum
 {
     HB_LED = 0,
@@ -384,6 +403,28 @@ typedef enum
 
 static adc_oneshot_unit_handle_t adc1_handle;
 
+/*
+    Runtime joystick calibration.
+
+    These values currently come from the existing firmware
+    defaults. Later they will be loaded from NVS.
+*/
+static joystick_axis_calibration_t roll_calibration = {
+    .raw_min = ROLL_RAW_MIN,
+    .raw_center = ROLL_RAW_CENTER,
+    .raw_max = ROLL_RAW_MAX,
+    .deadzone_raw = AXIS_DEADZONE_RAW,
+    .invert = ROLL_INVERT,
+};
+
+static joystick_axis_calibration_t pitch_calibration = {
+    .raw_min = PITCH_RAW_MIN,
+    .raw_center = PITCH_RAW_CENTER,
+    .raw_max = PITCH_RAW_MAX,
+    .deadzone_raw = AXIS_DEADZONE_RAW,
+    .invert = PITCH_INVERT,
+};
+static uint32_t joystick_calibration_counter = 0;
 volatile uint32_t system_faults = FAULT_NONE;
 volatile TickType_t task_heartbeat[HB_COUNT];
 volatile TickType_t rc_input_last_update_tick = 0;
@@ -545,6 +586,523 @@ static const uint8_t font_5x7[37][7] = {
     // SPACE
     {0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000}};
 
+static int joystick_axis_calibration_is_valid(
+    const joystick_axis_calibration_t *calibration)
+{
+    if (calibration == NULL)
+    {
+        return 0;
+    }
+
+    if (calibration->raw_min < 0 ||
+        calibration->raw_max > 4095)
+    {
+        return 0;
+    }
+
+    if (calibration->raw_min >=
+            calibration->raw_center ||
+        calibration->raw_center >=
+            calibration->raw_max)
+    {
+        return 0;
+    }
+
+    /*
+        Require reasonable travel on both sides
+        of the center position.
+    */
+    if ((calibration->raw_center -
+         calibration->raw_min) < 300)
+    {
+        return 0;
+    }
+
+    if ((calibration->raw_max -
+         calibration->raw_center) < 300)
+    {
+        return 0;
+    }
+
+    if (calibration->deadzone_raw < 10 ||
+        calibration->deadzone_raw > 500)
+    {
+        return 0;
+    }
+
+    if (calibration->invert != 0 &&
+        calibration->invert != 1)
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
+static uint32_t joystick_calibration_calculate_crc32(
+    const joystick_calibration_record_t *record)
+{
+    if (record == NULL)
+    {
+        return 0;
+    }
+
+    /*
+        Calculate the CRC with the crc32 field cleared.
+
+        This ensures that the checksum does not include
+        itself in the calculation.
+    */
+    joystick_calibration_record_t copy =
+        *record;
+
+    copy.crc32 = 0;
+
+    const uint8_t *data =
+        (const uint8_t *)&copy;
+
+    uint32_t crc = 0xFFFFFFFFU;
+
+    for (size_t i = 0;
+         i < sizeof(copy);
+         i++)
+    {
+        crc ^= data[i];
+
+        for (int bit = 0;
+             bit < 8;
+             bit++)
+        {
+            if (crc & 1U)
+            {
+                crc =
+                    (crc >> 1) ^
+                    0xEDB88320U;
+            }
+            else
+            {
+                crc >>= 1;
+            }
+        }
+    }
+
+    return ~crc;
+}
+
+static int joystick_calibration_record_is_valid(
+    const joystick_calibration_record_t *record)
+{
+    if (record == NULL)
+    {
+        return 0;
+    }
+
+    if (record->magic !=
+        JOYSTICK_CALIBRATION_MAGIC)
+    {
+        return 0;
+    }
+
+    if (record->version !=
+        JOYSTICK_CALIBRATION_VERSION)
+    {
+        return 0;
+    }
+
+    if (record->record_size !=
+        sizeof(joystick_calibration_record_t))
+    {
+        return 0;
+    }
+
+    if (!joystick_axis_calibration_is_valid(
+            &record->roll))
+    {
+        return 0;
+    }
+
+    if (!joystick_axis_calibration_is_valid(
+            &record->pitch))
+    {
+        return 0;
+    }
+
+    uint32_t calculated_crc =
+        joystick_calibration_calculate_crc32(
+            record);
+
+    if (record->crc32 != calculated_crc)
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
+static void joystick_calibration_load_from_nvs(void)
+{
+    nvs_handle_t handle;
+
+    esp_err_t err = nvs_open(
+        JOYSTICK_NVS_NAMESPACE,
+        NVS_READONLY,
+        &handle);
+
+    /*
+        The namespace does not exist yet on a new controller.
+        Continue with the compiled calibration defaults.
+    */
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        printf(
+            "[JOYSTICK CAL] No saved calibration, "
+            "using firmware defaults\n");
+
+        return;
+    }
+
+    if (err != ESP_OK)
+    {
+        printf(
+            "[JOYSTICK CAL] Failed to open NVS "
+            "error=%s. Using firmware defaults\n",
+            esp_err_to_name(err));
+
+        return;
+    }
+
+    size_t blob_size = 0;
+
+    err = nvs_get_blob(
+        handle,
+        JOYSTICK_NVS_KEY,
+        NULL,
+        &blob_size);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        printf(
+            "[JOYSTICK CAL] No saved calibration, "
+            "using firmware defaults\n");
+
+        nvs_close(handle);
+        return;
+    }
+
+    if (err != ESP_OK)
+    {
+        printf(
+            "[JOYSTICK CAL] Failed to read record size "
+            "error=%s. Using firmware defaults\n",
+            esp_err_to_name(err));
+
+        nvs_close(handle);
+        return;
+    }
+
+    if (blob_size !=
+        sizeof(joystick_calibration_record_t))
+    {
+        printf(
+            "[JOYSTICK CAL] Invalid record size "
+            "stored=%u expected=%u. "
+            "Using firmware defaults\n",
+            (unsigned int)blob_size,
+            (unsigned int)sizeof(joystick_calibration_record_t));
+
+        nvs_close(handle);
+        return;
+    }
+
+    joystick_calibration_record_t record = {0};
+
+    err = nvs_get_blob(
+        handle,
+        JOYSTICK_NVS_KEY,
+        &record,
+        &blob_size);
+
+    nvs_close(handle);
+
+    if (err != ESP_OK)
+    {
+        printf(
+            "[JOYSTICK CAL] Failed to read record "
+            "error=%s. Using firmware defaults\n",
+            esp_err_to_name(err));
+
+        return;
+    }
+
+    if (!joystick_calibration_record_is_valid(
+            &record))
+    {
+        printf(
+            "[JOYSTICK CAL] Saved record is invalid. "
+            "Using firmware defaults\n");
+
+        return;
+    }
+
+    /*
+        Activate the saved calibration only after
+        the complete record has passed validation.
+    */
+    roll_calibration = record.roll;
+    pitch_calibration = record.pitch;
+    joystick_calibration_counter = record.calibration_counter;
+    printf(
+        "[JOYSTICK CAL] Loaded saved calibration "
+        "counter=%lu\n",
+        (unsigned long)
+            record.calibration_counter);
+
+    printf(
+        "[JOYSTICK CAL] ROLL "
+        "min=%d center=%d max=%d deadzone=%d invert=%d\n",
+        roll_calibration.raw_min,
+        roll_calibration.raw_center,
+        roll_calibration.raw_max,
+        roll_calibration.deadzone_raw,
+        roll_calibration.invert);
+
+    printf(
+        "[JOYSTICK CAL] PITCH "
+        "min=%d center=%d max=%d deadzone=%d invert=%d\n",
+        pitch_calibration.raw_min,
+        pitch_calibration.raw_center,
+        pitch_calibration.raw_max,
+        pitch_calibration.deadzone_raw,
+        pitch_calibration.invert);
+}
+
+static int joystick_calibration_save_to_nvs(
+    const joystick_axis_calibration_t *roll_candidate,
+    const joystick_axis_calibration_t *pitch_candidate)
+{
+    if (roll_candidate == NULL ||
+        pitch_candidate == NULL)
+    {
+        printf(
+            "[JOYSTICK CAL] Save rejected: "
+            "candidate is NULL\n");
+
+        return 0;
+    }
+
+    joystick_calibration_record_t record = {0};
+
+    record.magic =
+        JOYSTICK_CALIBRATION_MAGIC;
+
+    record.version =
+        JOYSTICK_CALIBRATION_VERSION;
+
+    record.record_size =
+        sizeof(joystick_calibration_record_t);
+
+    record.roll =
+        *roll_candidate;
+
+    record.pitch =
+        *pitch_candidate;
+
+    /*
+        Increase the counter for every successful
+        calibration-save attempt.
+
+        Zero remains reserved for "never calibrated".
+    */
+    record.calibration_counter =
+        joystick_calibration_counter + 1U;
+
+    if (record.calibration_counter == 0)
+    {
+        record.calibration_counter = 1U;
+    }
+
+    record.crc32 =
+        joystick_calibration_calculate_crc32(
+            &record);
+
+    if (!joystick_calibration_record_is_valid(
+            &record))
+    {
+        printf(
+            "[JOYSTICK CAL] Save rejected: "
+            "candidate record is invalid\n");
+
+        return 0;
+    }
+
+    nvs_handle_t handle;
+
+    esp_err_t err = nvs_open(
+        JOYSTICK_NVS_NAMESPACE,
+        NVS_READWRITE,
+        &handle);
+
+    if (err != ESP_OK)
+    {
+        printf(
+            "[JOYSTICK CAL] Save failed: "
+            "cannot open NVS error=%s\n",
+            esp_err_to_name(err));
+
+        return 0;
+    }
+
+    err = nvs_set_blob(
+        handle,
+        JOYSTICK_NVS_KEY,
+        &record,
+        sizeof(record));
+
+    if (err != ESP_OK)
+    {
+        printf(
+            "[JOYSTICK CAL] Save failed: "
+            "nvs_set_blob error=%s\n",
+            esp_err_to_name(err));
+
+        nvs_close(handle);
+        return 0;
+    }
+
+    err = nvs_commit(handle);
+
+    if (err != ESP_OK)
+    {
+        printf(
+            "[JOYSTICK CAL] Save failed: "
+            "nvs_commit error=%s\n",
+            esp_err_to_name(err));
+
+        nvs_close(handle);
+        return 0;
+    }
+
+    /*
+        Read the committed record back before trusting it.
+    */
+    joystick_calibration_record_t verified = {0};
+
+    size_t verified_size =
+        sizeof(verified);
+
+    err = nvs_get_blob(
+        handle,
+        JOYSTICK_NVS_KEY,
+        &verified,
+        &verified_size);
+
+    nvs_close(handle);
+
+    if (err != ESP_OK)
+    {
+        printf(
+            "[JOYSTICK CAL] Verification failed: "
+            "read-back error=%s\n",
+            esp_err_to_name(err));
+
+        return 0;
+    }
+
+    if (verified_size != sizeof(verified))
+    {
+        printf(
+            "[JOYSTICK CAL] Verification failed: "
+            "size=%u expected=%u\n",
+            (unsigned int)verified_size,
+            (unsigned int)sizeof(verified));
+
+        return 0;
+    }
+
+    if (!joystick_calibration_record_is_valid(
+            &verified))
+    {
+        printf(
+            "[JOYSTICK CAL] Verification failed: "
+            "stored record is invalid\n");
+
+        return 0;
+    }
+
+    if (memcmp(
+            &record,
+            &verified,
+            sizeof(record)) != 0)
+    {
+        printf(
+            "[JOYSTICK CAL] Verification failed: "
+            "read-back differs from written record\n");
+
+        return 0;
+    }
+
+    /*
+        Activate only after successful NVS verification.
+    */
+    roll_calibration =
+        verified.roll;
+
+    pitch_calibration =
+        verified.pitch;
+
+    joystick_calibration_counter =
+        verified.calibration_counter;
+
+    printf(
+        "[JOYSTICK CAL] Saved and verified "
+        "counter=%lu crc=0x%08lx\n",
+        (unsigned long)
+            joystick_calibration_counter,
+        (unsigned long)
+            verified.crc32);
+
+    return 1;
+}
+
+static void joystick_calibration_test_provision_once(void)
+{
+#if TEST_PROVISION_CALIBRATION_ONCE
+
+    /*
+        A nonzero counter means a valid calibration
+        was already loaded from NVS.
+    */
+    if (joystick_calibration_counter != 0)
+    {
+        printf(
+            "[JOYSTICK CAL TEST] Saved calibration "
+            "already exists counter=%lu\n",
+            (unsigned long)
+                joystick_calibration_counter);
+
+        return;
+    }
+
+    printf(
+        "[JOYSTICK CAL TEST] Provisioning current "
+        "firmware defaults into NVS\n");
+
+    if (!joystick_calibration_save_to_nvs(
+            &roll_calibration,
+            &pitch_calibration))
+    {
+        printf(
+            "[JOYSTICK CAL TEST] Provisioning FAILED\n");
+
+        return;
+    }
+
+    printf(
+        "[JOYSTICK CAL TEST] Provisioning PASSED\n");
+
+#endif
+}
+
 void heartbeat_init_all(void)
 {
     TickType_t now = xTaskGetTickCount();
@@ -691,6 +1249,40 @@ static void lcd_init(void)
 
     lcd_cmd(0x29);
     lcd_delay_ms(100);
+}
+
+static void lcd_hardware_start(void)
+{
+    gpio_config_t lcd_gpio_conf = {
+        .pin_bit_mask =
+            (1ULL << LCD_DC) |
+            (1ULL << LCD_RST),
+
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    ESP_ERROR_CHECK(
+        gpio_config(&lcd_gpio_conf));
+
+    gpio_set_level(
+        LCD_DC,
+        0);
+
+    gpio_set_level(
+        LCD_RST,
+        1);
+
+    lcd_spi_init();
+
+    lcd_delay_ms(500);
+
+    lcd_init();
+
+    printf(
+        "[LCD] hardware initialized\n");
 }
 
 static void lcd_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
@@ -948,6 +1540,76 @@ static void lcd_draw_text_centered(int y, const char *text, int scale, uint16_t 
     }
 
     lcd_draw_text(x, y, text, scale, text_color, bg_color);
+}
+
+static void lcd_draw_maintenance_screen(
+    const char *ip_address)
+{
+    char lcd_ip_text[24] =
+        "IP UNAVAILABLE";
+
+    if (ip_address != NULL &&
+        ip_address[0] != '\0')
+    {
+        snprintf(
+            lcd_ip_text,
+            sizeof(lcd_ip_text),
+            "IP %s",
+            ip_address);
+
+        /*
+            The current LCD font does not contain
+            a dot character, so display IP separators
+            as spaces.
+        */
+        for (size_t i = 0;
+             lcd_ip_text[i] != '\0';
+             i++)
+        {
+            if (lcd_ip_text[i] == '.')
+            {
+                lcd_ip_text[i] = ' ';
+            }
+        }
+    }
+
+    lcd_fill_color(
+        COLOR_BLACK);
+
+    lcd_draw_text_centered(
+        30,
+        "MAINTENANCE",
+        3,
+        COLOR_YELLOW,
+        COLOR_BLACK);
+
+    lcd_draw_text_centered(
+        90,
+        "MATHOS RC SETUP",
+        2,
+        COLOR_WHITE,
+        COLOR_BLACK);
+
+    lcd_draw_text_centered(
+        135,
+        lcd_ip_text,
+        2,
+        COLOR_BLUE,
+        COLOR_BLACK);
+
+    lcd_draw_text_centered(
+        180,
+        "CONTROL TASKS OFF",
+        1,
+        COLOR_RED,
+        COLOR_BLACK);
+
+    printf(
+        "[LCD] maintenance screen displayed "
+        "ip=%s\n",
+        ip_address != NULL
+            ? ip_address
+            : "unavailable");
 }
 
 void fault_set(system_fault_t fault)
@@ -2190,12 +2852,29 @@ int master_switch_enabled(void)
 
 int arm_permission_enabled(void)
 {
-    /*
-        Pull-up logic:
-        switch OFF = 1
-        switch ON  = 0
-    */
     return gpio_get_level(ARM_PERMISSION_SWITCH_PIN) == 0;
+}
+
+static int maintenance_switch_enabled(void)
+{
+    return gpio_get_level(MAINTENANCE_SWITCH_PIN) == 0;
+}
+
+static void boot_mode_switches_init(void)
+{
+    gpio_config_t boot_switch_conf = {
+        .pin_bit_mask =
+            (1ULL << MASTER_ENABLE_PIN) |
+            (1ULL << MAINTENANCE_SWITCH_PIN),
+
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    ESP_ERROR_CHECK(
+        gpio_config(&boot_switch_conf));
 }
 
 static uint32_t mav_get_u32_le(const uint8_t *buffer)
@@ -2705,11 +3384,12 @@ int map_axis_calibrated(
     int raw_min,
     int raw_center,
     int raw_max,
+    int deadzone_raw,
     int invert)
 {
     int value = 0;
 
-    if (abs(raw - raw_center) <= AXIS_DEADZONE_RAW)
+    if (abs(raw - raw_center) <= deadzone_raw)
     {
         value = 0;
     }
@@ -4169,6 +4849,28 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
 
         gateway_session_remember(
             session_id);
+
+        /*
+A new gateway boot must begin with no trusted
+status or telemetry from the previous session.
+*/
+        taskENTER_CRITICAL(
+            &gateway_status_mux);
+
+        gateway_status_valid = 0;
+
+        taskEXIT_CRITICAL(
+            &gateway_status_mux);
+
+        taskENTER_CRITICAL(
+            &gateway_telemetry_mux);
+
+        gateway_telemetry_valid = 0;
+
+        taskEXIT_CRITICAL(
+            &gateway_telemetry_mux);
+
+        validated_status_session_id = 0;
     }
 
     if (packet.sequence <= last_sequence)
@@ -5383,17 +6085,19 @@ void joystick_adc_task(void *pvParameters)
         */
         int mapped_roll = map_axis_calibrated(
             raw_roll,
-            ROLL_RAW_MIN,
-            ROLL_RAW_CENTER,
-            ROLL_RAW_MAX,
-            ROLL_INVERT);
+            roll_calibration.raw_min,
+            roll_calibration.raw_center,
+            roll_calibration.raw_max,
+            roll_calibration.deadzone_raw,
+            roll_calibration.invert);
 
         int mapped_pitch = map_axis_calibrated(
             raw_pitch,
-            PITCH_RAW_MIN,
-            PITCH_RAW_CENTER,
-            PITCH_RAW_MAX,
-            PITCH_INVERT);
+            pitch_calibration.raw_min,
+            pitch_calibration.raw_center,
+            pitch_calibration.raw_max,
+            pitch_calibration.deadzone_raw,
+            pitch_calibration.invert);
 
         /*
             ONE JOYSTICK TEST:
@@ -6278,54 +6982,232 @@ void lcd_task(void *pvParameters)
     }
 }
 
+static int persistent_storage_init(void)
+{
+    esp_err_t err =
+        nvs_flash_init();
+
+    if (err == ESP_OK)
+    {
+        printf(
+            "[NVS] persistent storage initialized\n");
+
+        return 1;
+    }
+
+    /*
+        Do not automatically erase NVS.
+
+        Future NVS data will include calibration,
+        credentials and cryptographic material.
+    */
+    printf(
+        "[FATAL] NVS initialization failed "
+        "error=%s code=0x%X\n",
+        esp_err_to_name(err),
+        (unsigned int)err);
+
+    return 0;
+}
 void app_main(void)
 {
-    button_semaphore_arm = xSemaphoreCreateBinary();
-    button_semaphore_failsafe = xSemaphoreCreateBinary();
-    button_semaphore_disarm = xSemaphoreCreateBinary();
-    button_semaphore_recover = xSemaphoreCreateBinary();
+    /*
+        NVS is needed in both normal and maintenance modes.
+
+        Later, maintenance mode will use NVS for settings,
+        credentials and securely provisioned configuration.
+    */
+    if (!persistent_storage_init())
+    {
+        return;
+    }
+
+    /*
+        Configure only the two switches required to select
+        the boot mode.
+
+        No control UART, link UART, ADC, buttons, security
+        session or control tasks have been initialized yet.
+    */
+    boot_mode_switches_init();
+
+    printf(
+        "[BOOT INPUTS] master_raw=%d maintenance_raw=%d\n",
+        gpio_get_level(MASTER_ENABLE_PIN),
+        gpio_get_level(MAINTENANCE_SWITCH_PIN));
+
+    /*
+        Enter maintenance mode only when:
+
+        MASTER      = OFF
+        MAINTENANCE = ON
+
+        Both switches use active-low pull-up logic.
+    */
+    if (!master_switch_enabled() &&
+        maintenance_switch_enabled())
+    {
+        printf(
+            "[BOOT MODE] MAINTENANCE\n");
+
+        printf(
+            "[MAINTENANCE] MASTER is OFF and "
+            "maintenance switch is ON\n");
+
+        printf(
+            "[MAINTENANCE] Control resources will not initialize\n");
+
+        esp_err_t maintenance_err =
+            mathos_maintenance_softap_start(
+                MATHOS_MAINTENANCE_ROLE_RC);
+
+        if (maintenance_err != ESP_OK)
+        {
+            printf(
+                "[MAINTENANCE] FATAL: SoftAP startup failed "
+                "error=%s\n",
+                esp_err_to_name(maintenance_err));
+
+            return;
+        }
+
+        printf(
+            "[MAINTENANCE] SoftAP is active\n");
+
+        char maintenance_ip[16] =
+            "Unavailable";
+
+        esp_err_t ip_err =
+            mathos_maintenance_get_ap_ip(
+                maintenance_ip,
+                sizeof(maintenance_ip));
+
+        if (ip_err != ESP_OK)
+        {
+            printf(
+                "[MAINTENANCE] Failed to read AP IP "
+                "error=%s\n",
+                esp_err_to_name(ip_err));
+        }
+
+        /*
+            The LCD is initialized only after the maintenance
+            network has started so it can display the real IP.
+        */
+        lcd_hardware_start();
+
+        lcd_draw_maintenance_screen(
+            maintenance_ip);
+
+        /*
+            Do not continue into normal-mode initialization.
+
+            Wi-Fi and HTTP run in their own ESP-IDF tasks.
+        */
+        return;
+    }
+
+    /*
+        Everything below this point belongs exclusively
+        to normal controller operation.
+    */
+    printf(
+        "[BOOT MODE] NORMAL\n");
+
+    joystick_calibration_load_from_nvs();
+    joystick_calibration_test_provision_once();
+
+    /*
+        Create button synchronization resources.
+    */
+    button_semaphore_arm =
+        xSemaphoreCreateBinary();
+
+    button_semaphore_failsafe =
+        xSemaphoreCreateBinary();
+
+    button_semaphore_disarm =
+        xSemaphoreCreateBinary();
+
+    button_semaphore_recover =
+        xSemaphoreCreateBinary();
 
     if (button_semaphore_arm == NULL ||
         button_semaphore_failsafe == NULL ||
         button_semaphore_disarm == NULL ||
         button_semaphore_recover == NULL)
     {
-        printf("[FATAL] failed to create button semaphores\n");
+        printf(
+            "[FATAL] failed to create button semaphores\n");
+
         return;
     }
 
-    rc_event_queue = xQueueCreate(10, sizeof(rc_event_t));
+    /*
+        Queue used by the button tasks to send events
+        to the central controller task.
+    */
+    rc_event_queue =
+        xQueueCreate(
+            10,
+            sizeof(rc_event_t));
+
     if (rc_event_queue == NULL)
     {
-        printf("failed to create queue");
+        printf(
+            "[FATAL] failed to create RC event queue\n");
+
         return;
     }
 
 #if FEATURE_DIRECT_MAVLINK_MODE
+
     if (!control_output_init())
     {
-        printf("[FATAL] control output init failed\n");
-        return;
-    }
-#else
-    printf("[OUTPUT] direct MAVLink disabled. Using secure gateway mode.\n");
-#endif
-    if (!link_uart_init())
-    {
-        printf("[FATAL] link UART init failed\n");
+        printf(
+            "[FATAL] control output init failed\n");
+
         return;
     }
 
-    mathos_session_id = esp_random();
+#else
+
+    printf(
+        "[OUTPUT] direct MAVLink disabled. "
+        "Using secure gateway mode.\n");
+
+#endif
+
+    /*
+        Initialize the encrypted Mathos link UART.
+    */
+    if (!link_uart_init())
+    {
+        printf(
+            "[FATAL] link UART init failed\n");
+
+        return;
+    }
+
+    /*
+        Generate a new nonzero controller session
+        identifier for this boot.
+    */
+    mathos_session_id =
+        esp_random();
 
     if (mathos_session_id == 0)
     {
         mathos_session_id = 1;
     }
 
-    printf("[SECURITY] session_id=0x%08lx\n",
-           (unsigned long)mathos_session_id);
+    printf(
+        "[SECURITY] session_id=0x%08lx\n",
+        (unsigned long)mathos_session_id);
 
+    /*
+        Initialize the RGB status LED.
+    */
     led_strip_config_t strip_config = {
         .strip_gpio_num = RGB_LED_PIN,
         .max_leds = RGB_LED_COUNT,
@@ -6336,104 +7218,322 @@ void app_main(void)
         .flags.with_dma = false,
     };
 
-    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &strip));
-    led_strip_clear(strip);
-    led_strip_refresh(strip);
+    ESP_ERROR_CHECK(
+        led_strip_new_rmt_device(
+            &strip_config,
+            &rmt_config,
+            &strip));
 
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << BUTTON_PIN_ARM) |
-                        (1ULL << BUTTON_PIN_FAILSAFE) |
-                        (1ULL << BUTTON_PIN_DISARM) |
-                        (1ULL << BUTTON_PIN_RECOVER),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_NEGEDGE};
-    gpio_config(&io_conf);
+    ESP_ERROR_CHECK(
+        led_strip_clear(strip));
 
-    gpio_config_t switch_conf = {
-        .pin_bit_mask = (1ULL << SWITCH_OPTIC_PIN) | (1ULL << SWITCH_RF_PIN) | (1ULL << ARM_PERMISSION_SWITCH_PIN) | (1ULL << MASTER_ENABLE_PIN),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE};
-    gpio_config(&switch_conf);
+    ESP_ERROR_CHECK(
+        led_strip_refresh(strip));
+
     /*
-    Boot safety latch.
+        Configure the physical buttons.
 
-    If ARM switch is already ON during boot,
-    block arming until operator moves it OFF.
-*/
+        Pull-up logic:
+            released = 1
+            pressed  = 0
+    */
+    gpio_config_t io_conf = {
+        .pin_bit_mask =
+            (1ULL << BUTTON_PIN_ARM) |
+            (1ULL << BUTTON_PIN_FAILSAFE) |
+            (1ULL << BUTTON_PIN_DISARM) |
+            (1ULL << BUTTON_PIN_RECOVER),
+
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE,
+    };
+
+    ESP_ERROR_CHECK(
+        gpio_config(&io_conf));
+
+    /*
+        Configure all normal-operation switches.
+
+        MASTER and MAINTENANCE were configured earlier,
+        but safely configuring them again here is acceptable.
+    */
+    gpio_config_t switch_conf = {
+        .pin_bit_mask =
+            (1ULL << SWITCH_OPTIC_PIN) |
+            (1ULL << SWITCH_RF_PIN) |
+            (1ULL << ARM_PERMISSION_SWITCH_PIN) |
+            (1ULL << MASTER_ENABLE_PIN) |
+            (1ULL << MAINTENANCE_SWITCH_PIN),
+
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    ESP_ERROR_CHECK(
+        gpio_config(&switch_conf));
+
+    /*
+        ARM boot-lock policy:
+
+        If ARM permission was ON during boot, arming
+        remains blocked until the switch is moved OFF.
+    */
     if (arm_permission_enabled())
     {
         arm_boot_latch_active = 1;
-        fault_set(FAULT_ARM_BOOT_LOCK);
 
-        printf("[BOOT SAFETY] ARM permission switch was ON at boot. Move it OFF to unlock\n");
+        fault_set(
+            FAULT_ARM_BOOT_LOCK);
+
+        printf(
+            "[BOOT SAFETY] ARM permission switch was ON at boot. "
+            "Move it OFF to unlock\n");
     }
     else
     {
         arm_boot_latch_active = 0;
-        fault_clear(FAULT_ARM_BOOT_LOCK);
 
-        printf("[BOOT SAFETY] ARM permission switch was OFF at boot. Normal startup\n");
+        fault_clear(
+            FAULT_ARM_BOOT_LOCK);
+
+        printf(
+            "[BOOT SAFETY] ARM permission switch was OFF at boot. "
+            "Normal startup\n");
     }
-    gpio_install_isr_service(0);
-    gpio_isr_handler_add(BUTTON_PIN_ARM, button_isr_handler, button_semaphore_arm);
-    gpio_isr_handler_add(BUTTON_PIN_DISARM, button_isr_handler, button_semaphore_disarm);
-    gpio_isr_handler_add(BUTTON_PIN_FAILSAFE, button_isr_handler, button_semaphore_failsafe);
-    gpio_isr_handler_add(BUTTON_PIN_RECOVER, button_isr_handler, button_semaphore_recover);
+
+    /*
+        Install the GPIO interrupt service and connect
+        each button to its semaphore.
+    */
+    ESP_ERROR_CHECK(
+        gpio_install_isr_service(0));
+
+    ESP_ERROR_CHECK(
+        gpio_isr_handler_add(
+            BUTTON_PIN_ARM,
+            button_isr_handler,
+            button_semaphore_arm));
+
+    ESP_ERROR_CHECK(
+        gpio_isr_handler_add(
+            BUTTON_PIN_DISARM,
+            button_isr_handler,
+            button_semaphore_disarm));
+
+    ESP_ERROR_CHECK(
+        gpio_isr_handler_add(
+            BUTTON_PIN_FAILSAFE,
+            button_isr_handler,
+            button_semaphore_failsafe));
+
+    ESP_ERROR_CHECK(
+        gpio_isr_handler_add(
+            BUTTON_PIN_RECOVER,
+            button_isr_handler,
+            button_semaphore_recover));
+
+    /*
+        Initialize ADC1 for joystick input.
+    */
     adc_oneshot_unit_init_cfg_t init_config = {
         .unit_id = ADC_UNIT_1,
     };
 
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc1_handle));
+    ESP_ERROR_CHECK(
+        adc_oneshot_new_unit(
+            &init_config,
+            &adc1_handle));
 
     adc_oneshot_chan_cfg_t channel_config = {
         .atten = ADC_ATTEN_DB_12,
         .bitwidth = ADC_BITWIDTH_DEFAULT,
     };
 
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, JOY_X_ADC, &channel_config));
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, JOY_Y_ADC, &channel_config));
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, JOY2_X_ADC, &channel_config));
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, JOY2_Y_ADC, &channel_config));
+    ESP_ERROR_CHECK(
+        adc_oneshot_config_channel(
+            adc1_handle,
+            JOY_X_ADC,
+            &channel_config));
 
-    gpio_config_t lcd_gpio_conf = {
-        .pin_bit_mask = (1ULL << LCD_DC) | (1ULL << LCD_RST),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE};
+    ESP_ERROR_CHECK(
+        adc_oneshot_config_channel(
+            adc1_handle,
+            JOY_Y_ADC,
+            &channel_config));
 
-    gpio_config(&lcd_gpio_conf);
+    ESP_ERROR_CHECK(
+        adc_oneshot_config_channel(
+            adc1_handle,
+            JOY2_X_ADC,
+            &channel_config));
 
-    gpio_set_level(LCD_DC, 0);
-    gpio_set_level(LCD_RST, 1);
+    ESP_ERROR_CHECK(
+        adc_oneshot_config_channel(
+            adc1_handle,
+            JOY2_Y_ADC,
+            &channel_config));
 
-    lcd_spi_init();
-    lcd_delay_ms(500);
-    lcd_init();
+    /*
+        Initialize normal-operation LCD hardware.
+    */
+    lcd_hardware_start();
+
+    /*
+        Initialize task heartbeat timestamps before
+        starting the supervisor.
+    */
     heartbeat_init_all();
-    create_task_checked(status_led_task, "led_task", 4096, NULL, 4, &status_led_task_handle);
-    create_task_checked(button_task_arm, "button_task_arm", 4096, NULL, 5, &button_task_arm_handle);
-    create_task_checked(button_task_disarm, "button_task_disarm", 4096, NULL, 5, &button_task_disarm_handle);
-    create_task_checked(button_task_failsafe, "button_task_failsafe", 4096, NULL, 5, &button_task_failsafe_handle);
-    create_task_checked(button_task_recover, "button_task_recover", 4096, NULL, 5, &button_task_recover_handle);
-    create_task_checked(controller_task, "controller_task", 4096, NULL, 5, &controller_task_handle);
-    create_task_checked(radio_tx_task, "radio_tx_task", 4096, NULL, 3, &radio_tx_task_handle);
-    create_task_checked(gateway_status_rx_task, "gateway_status_rx_task", 4096, NULL, 3, &gateway_status_rx_task_handle);
+
+    /*
+        Create all normal-operation tasks.
+    */
+    create_task_checked(
+        status_led_task,
+        "led_task",
+        4096,
+        NULL,
+        4,
+        &status_led_task_handle);
+
+    create_task_checked(
+        button_task_arm,
+        "button_task_arm",
+        4096,
+        NULL,
+        5,
+        &button_task_arm_handle);
+
+    create_task_checked(
+        button_task_disarm,
+        "button_task_disarm",
+        4096,
+        NULL,
+        5,
+        &button_task_disarm_handle);
+
+    create_task_checked(
+        button_task_failsafe,
+        "button_task_failsafe",
+        4096,
+        NULL,
+        5,
+        &button_task_failsafe_handle);
+
+    create_task_checked(
+        button_task_recover,
+        "button_task_recover",
+        4096,
+        NULL,
+        5,
+        &button_task_recover_handle);
+
+    create_task_checked(
+        controller_task,
+        "controller_task",
+        4096,
+        NULL,
+        5,
+        &controller_task_handle);
+
+    create_task_checked(
+        radio_tx_task,
+        "radio_tx_task",
+        4096,
+        NULL,
+        3,
+        &radio_tx_task_handle);
+
+    create_task_checked(
+        gateway_status_rx_task,
+        "gateway_status_rx_task",
+        4096,
+        NULL,
+        3,
+        &gateway_status_rx_task_handle);
+
 #if FEATURE_DIRECT_MAVLINK_MODE
-    create_task_checked(mavlink_heartbeat_task, "mavlink_heartbeat_task", 4096, NULL, 3, &mavlink_heartbeat_task_handle);
-    create_task_checked(mavlink_rx_task, "mavlink_rx_task", 4096, NULL, 3, &mavlink_rx_task_handle);
+
+    create_task_checked(
+        mavlink_heartbeat_task,
+        "mavlink_heartbeat_task",
+        4096,
+        NULL,
+        3,
+        &mavlink_heartbeat_task_handle);
+
+    create_task_checked(
+        mavlink_rx_task,
+        "mavlink_rx_task",
+        4096,
+        NULL,
+        3,
+        &mavlink_rx_task_handle);
+
 #else
-    printf("[BOOT] Direct MAVLink tasks disabled in secure gateway mode\n");
+
+    printf(
+        "[BOOT] Direct MAVLink tasks disabled "
+        "in secure gateway mode\n");
+
 #endif
-    create_task_checked(system_health_task, "system_health_task", 4096, NULL, 2, &system_health_task_handle);
-    create_task_checked(command_status_auto_clear_task, "command_status_auto_clear_task", 3072, NULL, 2, &command_status_auto_clear_task_handle);
-    create_task_checked(link_mode_task, "link_mode_task", 4096, NULL, 3, &link_mode_task_handle);
-    create_task_checked(arm_safety_task, "arm_safety_task", 4096, NULL, 5, &arm_safety_task_handle);
-    create_task_checked(lcd_task, "lcd_task", 4096, NULL, 2, &lcd_task_handle);
-    create_task_checked(task_supervisor_task, "task_supervisor_task", 4096, NULL, 6, &heartbeat_task_handle);
-    create_task_checked(joystick_adc_task, "joystick_adc_task", 4096, NULL, 3, &joystick_adc_task_handle);
+
+    create_task_checked(
+        system_health_task,
+        "system_health_task",
+        4096,
+        NULL,
+        2,
+        &system_health_task_handle);
+
+    create_task_checked(
+        command_status_auto_clear_task,
+        "command_status_auto_clear_task",
+        3072,
+        NULL,
+        2,
+        &command_status_auto_clear_task_handle);
+
+    create_task_checked(
+        link_mode_task,
+        "link_mode_task",
+        4096,
+        NULL,
+        3,
+        &link_mode_task_handle);
+
+    create_task_checked(
+        arm_safety_task,
+        "arm_safety_task",
+        4096,
+        NULL,
+        5,
+        &arm_safety_task_handle);
+
+    create_task_checked(
+        lcd_task,
+        "lcd_task",
+        4096,
+        NULL,
+        2,
+        &lcd_task_handle);
+
+    create_task_checked(
+        task_supervisor_task,
+        "task_supervisor_task",
+        4096,
+        NULL,
+        6,
+        &heartbeat_task_handle);
+
+    create_task_checked(
+        joystick_adc_task,
+        "joystick_adc_task",
+        4096,
+        NULL,
+        3,
+        &joystick_adc_task_handle);
 }
