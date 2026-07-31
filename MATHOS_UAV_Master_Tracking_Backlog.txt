@@ -1,0 +1,423 @@
+MATHOS UAV PROJECT
+MASTER TRACKING BACKLOG
+=======================
+
+Status legend
+-------------
+[x] Complete
+[ ] Unfinished
+[~] In progress
+[!] Blocked or known bug
+
+
+CURRENT ACTIVE PHASE
+====================
+
+Phase 1: Primary FC <-> Airborne Gateway <-> Main RC integration
+
+Current exact task:
+[~] Build, flash, and test after correcting the gateway battery freshness flag.
+
+Current checkpoint:
+[ ] Real FC telemetry is received by the Airborne Gateway.
+[ ] The Gateway marks each telemetry value fresh correctly.
+[ ] The RC receives the encrypted telemetry securely.
+[ ] The RC LCD displays the real values correctly.
+
+Project discipline:
+Do not jump to later phases until the current checkpoint passes,
+unless priorities are explicitly changed.
+
+
+PHASE 1
+PRIMARY FC <-> AIRBORNE GATEWAY <-> MAIN RC
+=============================================
+
+Completed
+---------
+[x] RC joystick, switches, and button framework.
+[x] Encrypted Mathos RC packets sent to the Airborne Gateway.
+[x] Gateway packet validation.
+[x] Gateway session tracking.
+[x] Replay and old-packet rejection.
+[x] Gateway MAVLink heartbeat framework.
+[x] Gateway MAVLink control-output framework.
+[x] Gateway parses HEARTBEAT.
+[x] Gateway parses SYS_STATUS.
+[x] Gateway parses BATTERY_STATUS.
+[x] Gateway parses GPS_RAW_INT.
+[x] Gateway parses GLOBAL_POSITION_INT.
+[x] Gateway parses ATTITUDE.
+[x] Gateway parses VFR_HUD.
+[x] Gateway parses EKF_STATUS_REPORT.
+[x] Gateway builds encrypted status packets.
+[x] Gateway builds encrypted telemetry packets.
+[x] RC validates Gateway status packets.
+[x] RC validates Gateway telemetry packets.
+[x] RC updates telemetry snapshots.
+[x] RC LCD telemetry framework.
+[x] Battery freshness bug corrected:
+    duplicated AIRSPEED_FRESH assignment replaced by
+    GATEWAY_TELEMETRY_FLAG_BATTERY_FRESH.
+
+Current work
+------------
+[~] Build Gateway after the battery freshness correction.
+[ ] Flash Gateway firmware.
+[ ] Run Flight Controller, Gateway, and RC together.
+[ ] Confirm battery freshness reaches the RC.
+[ ] Confirm the LCD changes from BAT NO DATA when valid data exists.
+[ ] Confirm GPS freshness.
+[ ] Confirm position freshness.
+[ ] Confirm altitude freshness.
+[ ] Confirm attitude freshness.
+[ ] Confirm airspeed freshness.
+[ ] Confirm EKF freshness.
+[ ] Confirm telemetry becomes stale correctly when MAVLink data stops.
+[ ] Determine whether zero battery data comes from firmware or
+    Flight Controller battery-monitor configuration/hardware.
+
+End-to-end tests
+----------------
+[ ] RC joystick -> encrypted Mathos -> Gateway.
+[ ] Gateway -> MAVLink control output -> Flight Controller.
+[ ] Flight Controller telemetry -> Gateway.
+[ ] Gateway -> encrypted Mathos telemetry -> RC.
+[ ] RC -> LCD display.
+[ ] Confirm real FC mode on RC.
+[ ] Confirm real armed/disarmed state on RC.
+[ ] Test Flight Controller UART disconnect.
+[ ] Test RC link disconnect.
+[ ] Test Gateway reboot.
+[ ] Test RC reboot while Gateway remains active.
+[ ] Confirm no automatic re-arm.
+[ ] Confirm explicit recovery is required.
+[ ] Confirm replayed packets are rejected.
+[ ] Confirm old sessions are rejected during the same Gateway boot.
+
+Additional telemetry
+--------------------
+[ ] Add or validate EXTENDED_SYS_STATE.
+[ ] Add or validate STATUSTEXT.
+[ ] Improve failsafe-state interpretation.
+[ ] Add home-position handling.
+[ ] Add multiple-battery support if required.
+[ ] Add ground speed and climb rate where useful.
+[ ] Add RC signal/link-quality telemetry where hardware supports it.
+
+
+PHASE 2
+FLIGHT SAFETY AND FAILSAFE VALIDATION
+=====================================
+
+Completed
+---------
+[x] ARM/DISARM command state machine.
+[x] Flight Controller heartbeat confirmation.
+[x] Command timeout handling.
+[x] New-session safety lock.
+[x] Manual recovery policy.
+[x] Bench failsafe DISARM path.
+
+Unfinished
+----------
+[ ] Test every ARM denial condition.
+[ ] Test pending ARM cancellation by DISARM.
+[ ] Test Flight Controller command rejection.
+[ ] Test heartbeat timeout while armed with propellers removed.
+[ ] Test RC timeout while armed with propellers removed.
+[ ] Configure ArduPilot radio/GCS failsafes.
+[ ] Test RTL in Mission Planner or SITL.
+[ ] Test QRTL where applicable.
+[ ] Confirm GPS lock and home-position requirements.
+[ ] Select the final flight failsafe policy:
+    - RTL
+    - QRTL
+    - LAND
+    - ArduPilot-managed failsafe
+[ ] Disable bench-only failsafe behavior before flight.
+[ ] Perform propeller-free bench tests.
+[ ] Perform restrained ground tests.
+[ ] Perform SITL or HITL testing before outdoor flight.
+
+
+PHASE 3
+MAIN RC FIRMWARE COMPLETION
+===========================
+
+Completed
+---------
+[x] Roll and pitch calibration defaults.
+[x] Joystick calibration NVS framework.
+[x] ARM button.
+[x] DISARM button.
+[x] FAILSAFE button.
+[x] RECOVER button.
+[x] MASTER switch.
+[x] ARM permission switch.
+[x] MAINTENANCE switch.
+[x] RF/optic selection switches.
+[x] Main LCD state display.
+[x] Gateway telemetry LCD display.
+[x] Maintenance LCD screen.
+
+Unfinished
+----------
+[ ] Install and support the second joystick.
+[ ] Add throttle calibration.
+[ ] Add yaw calibration.
+[ ] Add calibration workflow through maintenance mode.
+[ ] Add live switch diagnostics.
+[ ] Add live button diagnostics.
+[ ] Remove ONE_JOYSTICK_TEST when final controls exist.
+[ ] Disable all production-inappropriate test flags.
+[ ] Confirm every real telemetry value on the LCD.
+[ ] Improve LCD telemetry-page organization.
+[ ] Improve stale and invalid sensor presentation.
+[ ] Add warning-priority handling.
+[ ] Add all expected VTOL flight-mode names.
+[ ] Add telemetry-relay link status later.
+[ ] Remove or isolate disabled direct-MAVLink RC code.
+[ ] Remove temporary security-skeleton functions.
+[ ] Reduce legacy and duplicated code.
+[ ] Split the large RC main file into modules.
+[ ] Review task stack sizes after telemetry stabilizes.
+[ ] Review and resolve slow-task timing warnings.
+
+
+PHASE 4
+MAINTENANCE SYSTEM
+==================
+
+Completed
+---------
+[x] Physical maintenance boot mode.
+[x] MASTER OFF + MAINTENANCE ON safety condition.
+[x] Normal control tasks disabled in maintenance mode.
+[x] Maintenance SoftAP.
+[x] HTTP server.
+[x] Safe HTML generation.
+[x] HTML escaping.
+[x] URL/form decoding.
+[x] Request body size limits.
+[x] NVS record versioning.
+[x] CRC validation.
+[x] NVS commit verification.
+[x] NVS read-back verification.
+[x] RC/Gateway role-aware page framework.
+[x] RC-only POST route registration framework.
+[x] Gateway does not register the RC route.
+
+Known bug
+---------
+[!] The latest maintenance file contains a correct RC role check,
+    followed by an unconditional duplicate 403 Forbidden block.
+    Result: every RC Save submission is rejected.
+    Required fix: remove the unconditional duplicate 403 block.
+
+Architecture cleanup
+--------------------
+[ ] Remove Wi-Fi SSID from the Main RC page.
+[ ] Remove API server host from the Main RC page.
+[ ] Remove API server port from the Main RC page.
+[ ] Split the generic configuration into role-specific records.
+[ ] Use separate NVS namespaces or keys for:
+    - Main RC
+    - Airborne Gateway
+    - RC Telemetry Relay
+    - Remote Ground Gateway
+[ ] Keep common SoftAP, HTTP, parsing, and NVS mechanics shared.
+
+Main RC maintenance page
+------------------------
+[ ] Joystick calibration.
+[ ] Axis inversion.
+[ ] Dead-zone configuration.
+[ ] Button diagnostics.
+[ ] Switch diagnostics.
+[ ] RC device ID.
+[ ] Expected Airborne Gateway peer ID.
+[ ] Primary ChaCha root-key provisioning.
+[ ] Key status without revealing the key.
+[ ] Key ID.
+[ ] Key rotation.
+[ ] Telemetry-relay output configuration.
+[ ] Local relay-interface configuration.
+
+Airborne Gateway maintenance page
+---------------------------------
+[ ] Gateway device ID.
+[ ] Expected RC peer ID.
+[ ] Primary ChaCha root-key provisioning.
+[ ] FC UART baud rate.
+[ ] MAVLink system ID.
+[ ] MAVLink component ID.
+[ ] Expected Flight Controller ID.
+[ ] Flight Controller heartbeat timeout.
+[ ] Telemetry stream rates.
+[ ] RF/optic policy.
+[ ] Link diagnostics.
+[ ] Flight Controller connection test.
+[ ] Gateway-specific POST route.
+
+Maintenance hardening
+---------------------
+[ ] Replace the shared temporary AP password.
+[ ] Add device-specific maintenance passwords.
+[ ] Never display existing secrets.
+[ ] Never log secrets.
+[ ] Empty secret input keeps the current value.
+[ ] Explicit action required to clear a secret.
+[ ] Require confirmation when setting a new key.
+[ ] Add request rate limiting.
+[ ] Add maintenance session timeout.
+[ ] Consider HTTPS for the hardened version.
+[ ] Protect NVS secrets with flash encryption.
+
+
+PHASE 5
+CRYPTOGRAPHIC PROVISIONING AND HARDENING
+========================================
+
+Completed
+---------
+[x] ChaCha20-Poly1305 authenticated packet transport exists.
+[x] Runtime packet sequence checking.
+[x] Runtime session checking.
+[x] Runtime replay protection.
+
+Unfinished
+----------
+[ ] Remove hardcoded production keys.
+[ ] Provision root keys through physical maintenance mode.
+[ ] Separate primary RC-to-Airborne-Gateway root key.
+[ ] Separate Main-RC-to-Relay local key if used.
+[ ] Separate Relay-to-Remote-Gateway root key.
+[ ] Add device IDs.
+[ ] Add expected peer IDs.
+[ ] Add key IDs.
+[ ] Add directional key derivation.
+[ ] Add session-key derivation.
+[ ] Add controlled key rotation.
+[ ] Support old/new key overlap during rotation.
+[ ] Add persistent reboot/session protection.
+[ ] Add factory reset and secure re-pairing.
+[ ] Enable ESP32 Secure Boot.
+[ ] Enable ESP32 Flash Encryption.
+[ ] Add signed OTA.
+[ ] Add authenticated firmware-update procedure.
+[ ] Add security event and audit counters.
+
+
+PHASE 6
+SECONDARY TELEMETRY NETWORK
+===========================
+
+Confirmed architecture
+----------------------
+Flight Controller
+    -> Airborne Gateway ESP32
+    -> Main RC ESP32
+    -> RC Telemetry-Relay ESP32
+    -> Remote Ground Gateway ESP32
+    -> API / Monitoring Server
+
+Main RC to RC Telemetry Relay
+-----------------------------
+[ ] Define local telemetry packet format.
+[ ] Select UART or SPI.
+[ ] Select telemetry fields.
+[ ] Add a bounded queue.
+[ ] Add telemetry freshness timestamps.
+[ ] Add local authentication/encryption if required.
+[ ] Return relay health to the Main RC.
+
+RC Telemetry-Relay ESP32
+------------------------
+[ ] Create a new ESP-IDF project.
+[ ] Receive telemetry from Main RC.
+[ ] Filter telemetry.
+[ ] Rate-limit telemetry.
+[ ] Encrypt the secondary RF link.
+[ ] Select secondary RF hardware.
+[ ] Implement RF transmission.
+[ ] Implement retry policy.
+[ ] Implement link-health reporting.
+[ ] Build the Relay maintenance page.
+
+Remote Ground Gateway ESP32
+---------------------------
+[ ] Create a new ESP-IDF project.
+[ ] Receive secondary RF telemetry.
+[ ] Authenticate telemetry.
+[ ] Reject replayed packets.
+[ ] Connect through Wi-Fi, Ethernet, or cellular.
+[ ] Store Wi-Fi SSID.
+[ ] Store Wi-Fi password.
+[ ] Store API hostname.
+[ ] Store API port.
+[ ] Store API token.
+[ ] Add TLS validation.
+[ ] Add offline buffering.
+[ ] Add retry and backoff.
+[ ] Build the Remote Gateway maintenance page.
+
+Server and API
+--------------
+[ ] Select HTTPS REST, MQTT over TLS, or secure WebSocket.
+[ ] Define the telemetry schema.
+[ ] Add device authentication.
+[ ] Add device registration.
+[ ] Add database storage.
+[ ] Add live monitoring dashboard.
+[ ] Add alerts.
+[ ] Add audit history.
+[ ] Add access control.
+
+
+PHASE 7
+HARDWARE AND FLIGHT INTEGRATION
+===============================
+
+[ ] Finalize the flight controller.
+[ ] Finalize the VTOL airframe.
+[ ] Install GPS and compass.
+[ ] Configure the battery monitor.
+[ ] Finalize primary RF hardware.
+[ ] Integrate the optic/fiber path where applicable.
+[ ] Select secondary telemetry RF hardware.
+[ ] Complete power-supply and regulator design.
+[ ] Review grounding.
+[ ] Review EMI.
+[ ] Build enclosures.
+[ ] Add cooling where required.
+[ ] Finalize connectors and strain relief.
+[ ] Test watchdog behavior.
+[ ] Test brownout behavior.
+[ ] Perform range testing.
+[ ] Perform packet-loss testing.
+[ ] Perform lawful interference testing.
+[ ] Tune the Flight Controller.
+[ ] Test VTOL transitions.
+[ ] Create staged flight-test checklists.
+[ ] Record and review flight logs.
+
+
+CURRENT NEXT ACTION
+===================
+
+1. Build the Airborne Gateway firmware.
+2. Flash the Airborne Gateway.
+3. Connect the Flight Controller, Gateway, and Main RC.
+4. Observe Gateway telemetry logs.
+5. Confirm the battery freshness flag is present.
+6. Confirm the RC receives the battery data.
+7. Confirm the LCD displays a real battery value or a valid no-data state.
+8. Continue through the Phase 1 telemetry freshness tests.
+
+Current checkpoint:
+FC real data
+    -> Gateway receives it
+    -> Gateway marks it fresh
+    -> RC receives it securely
+    -> LCD displays it correctly

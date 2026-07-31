@@ -3629,13 +3629,13 @@ static bool gateway_telemetry_send_once(void)
             GATEWAY_TELEMETRY_FLAG_AIRSPEED_FRESH;
     }
 
-    if (gateway_telemetry_value_is_fresh(
-            airspeed_update_us,
-            now_us))
-    {
-        telemetry.telemetry_flags |=
-            GATEWAY_TELEMETRY_FLAG_AIRSPEED_FRESH;
-    }
+if (gateway_telemetry_value_is_fresh(
+        battery_update_us,
+        now_us))
+{
+    telemetry.telemetry_flags |=
+        GATEWAY_TELEMETRY_FLAG_BATTERY_FRESH;
+}
 
     if (gateway_telemetry_value_is_fresh(
             gps_update_us,

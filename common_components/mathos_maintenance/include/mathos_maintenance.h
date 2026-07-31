@@ -72,6 +72,13 @@ void mathos_maintenance_config_set_defaults(
 int mathos_maintenance_config_is_valid(
     const mathos_maintenance_config_t *config);
 
+esp_err_t mathos_maintenance_config_save(
+    const mathos_maintenance_config_t *config);
+
+esp_err_t mathos_maintenance_config_load(
+    mathos_maintenance_config_t *config,
+    int *loaded_from_nvs);
+
 esp_err_t mathos_maintenance_softap_start(
     mathos_maintenance_role_t role);
 

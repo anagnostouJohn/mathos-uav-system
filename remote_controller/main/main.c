@@ -3554,6 +3554,11 @@ arm_status_t get_arm_status(void)
     {
         return ARM_STATUS_LINK_BAD;
     }
+
+    if (!gateway_fc_heartbeat_is_fresh())
+    {
+        return ARM_STATUS_TELEMETRY_STALE;
+    }
 #endif
     if (input_snapshot.throttle > ARM_THROTTLE_MAX)
     {

@@ -1,0 +1,850 @@
+“where are we?”, “what is next?”, or “show the backlog”,
+
+MATHOS UAV SYSTEM
+MAINTENANCE PAGES SPECIFICATION
+================================
+
+PURPOSE
+-------
+This document defines the planned maintenance pages for every ESP32 role in the MATHOS UAV system.
+
+Maintenance mode is entered only when:
+- MASTER switch is OFF.
+- MAINTENANCE switch is ON.
+- The device is rebooted.
+
+While maintenance mode is active:
+- Normal control tasks remain disabled.
+- Arming is unavailable.
+- Flight-control output is disabled.
+- Configuration changes are allowed only through the maintenance interface.
+- A reboot is required before returning to normal operation.
+
+
+SYSTEM ARCHITECTURE
+===================
+
+Primary aircraft path:
+Flight Controller
+    -> Airborne Gateway ESP32
+    -> Main RC ESP32
+
+Secondary remote-telemetry path:
+Main RC ESP32
+    -> RC Telemetry-Relay ESP32
+    -> Remote Ground Gateway ESP32
+    -> API / Monitoring Server
+
+ESP32 roles:
+1. Main RC ESP32
+2. Airborne Gateway ESP32
+3. RC Telemetry-Relay ESP32
+4. Remote Ground Gateway ESP32
+
+
+SHARED MAINTENANCE ENGINE
+=========================
+
+The shared mathos_maintenance component should provide:
+- Maintenance SoftAP startup.
+- HTTP server startup.
+- Role detection.
+- Safe HTML generation.
+- HTML escaping.
+- URL/form decoding.
+- Request body size limits.
+- Configuration validation.
+- NVS save, commit, read-back and verification.
+- Configuration versioning.
+- CRC integrity checking.
+- Safe-default loading.
+- Role-specific route registration.
+- Maintenance status information.
+- Control-task-disabled safety state.
+
+The shared component should not force all devices to use the same page or configuration structure.
+
+Recommended configuration structures:
+- mathos_maintenance_common_config_t
+- mathos_maintenance_rc_config_t
+- mathos_maintenance_gateway_config_t
+- mathos_maintenance_relay_config_t
+- mathos_maintenance_ground_gateway_config_t
+
+Recommended NVS namespaces or keys:
+- mathos_common
+- mathos_rc
+- mathos_air_gw
+- mathos_relay
+- mathos_ground_gw
+
+
+1. MAIN RC MAINTENANCE PAGE
+===========================
+
+Purpose
+-------
+Configure and test the physical remote controller, the primary secure aircraft link, and the local telemetry output to the RC Telemetry-Relay ESP32.
+
+A. Device and maintenance status
+--------------------------------
+Read-only information:
+- Device role: Remote Controller.
+- Device ID.
+- Firmware version.
+- Build identifier.
+- Maintenance mode active.
+- Local maintenance IP address.
+- MASTER switch state.
+- MAINTENANCE switch state.
+- Control tasks disabled.
+- Current configuration source: Safe defaults or Saved configuration.
+- Free heap.
+- Reset reason.
+- Uptime.
+
+B. Controller calibration
+-------------------------
+Editable or guided calibration controls:
+- Roll joystick minimum, centre and maximum.
+- Pitch joystick minimum, centre and maximum.
+- Throttle minimum, centre when applicable, and maximum.
+- Yaw minimum, centre and maximum.
+- Dead zone per axis.
+- Axis inversion per axis.
+- Input filtering level.
+- Calibration wizard.
+- Live raw ADC display.
+- Live normalized channel display.
+- Save calibration.
+- Restore previous calibration.
+- Restore safe defaults.
+
+C. Switch and button diagnostics
+--------------------------------
+Read-only live tests:
+- MASTER switch.
+- ARM permission switch.
+- MAINTENANCE switch.
+- OPTIC/RF selector.
+- ARM button.
+- DISARM button.
+- FAILSAFE button.
+- RECOVER button.
+- Auxiliary switches.
+- Button press counters.
+- Debounce status.
+- Stuck-input warning.
+
+D. Primary aircraft-link security
+---------------------------------
+The primary secure link is:
+
+Main RC ESP32
+    <-> Airborne Gateway ESP32
+
+Configuration and status:
+- RC device ID.
+- Expected airborne gateway peer ID.
+- Current key ID.
+- Primary secure key status: Configured or Not configured.
+- New 256-bit root key.
+- Confirm new 256-bit root key.
+- Key rotation command.
+- Pairing status.
+- Last authenticated packet age.
+- Last authenticated peer ID.
+- Authentication success counter.
+- Authentication failure counter.
+- Replay rejection counter.
+- Duplicate packet counter.
+- Current session status.
+- Clear pairing action with strong confirmation.
+
+Key-entry rules:
+- The root key is 32 random bytes.
+- Hexadecimal entry format uses 64 hex characters.
+- The key field uses <input type="password">.
+- The existing key is never displayed.
+- The existing key is never returned to the browser.
+- The existing key is never printed in logs.
+- An empty submitted key means keep the existing key.
+- Clearing the key requires a separate explicit action.
+- New key and confirmation fields must match.
+- Invalid length or non-hex characters are rejected.
+- The key is stored only after NVS write and read-back verification.
+- The new key becomes active only after reboot.
+- Nonce counters are never manually configured by the user.
+- Directional and session keys are derived internally from the root key.
+
+E. Primary aircraft-link configuration
+---------------------------------------
+Editable settings:
+- Primary link enabled.
+- Preferred link mode: AUTO, FORCE RF or FORCE OPTIC.
+- RC command transmit rate.
+- Link heartbeat interval.
+- Remote-link timeout.
+- Telemetry timeout.
+- Maximum acceptable packet age.
+- Retry policy, where applicable.
+- Link diagnostics enabled.
+
+Read-only information:
+- Active link.
+- RF state.
+- Optic state.
+- Last valid packet age.
+- RX packet count.
+- Lost packet count.
+- Invalid packet count.
+- Authentication failures.
+- Average cryptographic processing time.
+- Maximum cryptographic processing time.
+
+F. Secondary telemetry output
+-----------------------------
+This connection is:
+
+Main RC ESP32
+    -> RC Telemetry-Relay ESP32
+
+Editable settings:
+- Telemetry relay output enabled.
+- Local transport: UART initially, SPI may be considered later.
+- UART baud rate.
+- Telemetry forwarding rate.
+- Message-selection profile.
+- Relay device ID.
+- Expected relay peer ID.
+- Local-link security enabled.
+- Local-link key status.
+- New local-link root key.
+- Confirm local-link root key.
+- Key ID.
+- Key rotation.
+
+Selectable telemetry groups:
+- Battery.
+- GPS.
+- Position.
+- Altitude.
+- Attitude.
+- Flight mode.
+- Armed state.
+- Failsafe state.
+- EKF/health.
+- Link health.
+- Vehicle status.
+- Selected MAVLink status values.
+- Diagnostic counters.
+
+Read-only relay status:
+- Relay connected.
+- Last relay packet age.
+- Relay TX count.
+- Relay error count.
+- Relay authentication failures.
+- Relay queue usage.
+- Relay UART state.
+
+G. Display and controller preferences
+-------------------------------------
+Possible future settings:
+- LCD brightness.
+- LCD update rate.
+- Units: Metric or Imperial.
+- Warning display policy.
+- Telemetry-page selection.
+- Audible warning enabled.
+- Haptic warning enabled.
+- Language.
+
+H. RC page must not contain
+---------------------------
+- Internet Wi-Fi SSID.
+- Internet Wi-Fi password.
+- API hostname.
+- API port.
+- API token.
+- Server TLS credentials.
+
+Those settings belong to the Remote Ground Gateway ESP32.
+
+
+2. AIRBORNE GATEWAY MAINTENANCE PAGE
+====================================
+
+Purpose
+-------
+Configure the drone-side gateway that translates the secure MATHOS protocol to MAVLink and communicates with the flight controller.
+
+A. Device and maintenance status
+--------------------------------
+Read-only information:
+- Device role: Airborne Gateway.
+- Device ID.
+- Firmware version.
+- Build identifier.
+- Maintenance mode active.
+- Local maintenance IP address.
+- Control and flight tasks disabled.
+- Current configuration source.
+- Free heap.
+- Reset reason.
+- Uptime.
+- Flight controller connection state.
+- Last FC heartbeat age.
+- Current detected vehicle type.
+- Current detected flight mode.
+- Armed state.
+- Failsafe state.
+
+B. Primary RC-link security
+---------------------------
+The primary secure link is:
+
+Airborne Gateway ESP32
+    <-> Main RC ESP32
+
+Configuration and status:
+- Gateway device ID.
+- Expected RC peer ID.
+- Current key ID.
+- Primary secure key status: Configured or Not configured.
+- New 256-bit root key.
+- Confirm new root key.
+- Pairing status.
+- Key rotation.
+- Last authenticated RC packet age.
+- Authentication success counter.
+- Authentication failure counter.
+- Replay rejection counter.
+- Duplicate packet counter.
+- Anti-replay state summary.
+- Clear pairing action with strong confirmation.
+
+Security behaviour:
+- The root key must match the primary root key provisioned on the RC.
+- RC-to-gateway and gateway-to-RC directional keys are derived internally.
+- Existing keys are never displayed.
+- Existing keys are never logged.
+- Empty key fields keep the existing key.
+- New key activation requires reboot.
+
+C. Flight-controller interface
+------------------------------
+Editable settings:
+- FC UART baud rate.
+- MAVLink 2 enabled.
+- Gateway MAVLink system ID.
+- Gateway MAVLink component ID.
+- Expected FC system ID.
+- Expected FC component ID, when required.
+- FC heartbeat timeout.
+- MAVLink receive timeout.
+- Vehicle-type detection policy.
+- Telemetry stream request rates.
+- MAVLink signing configuration, later.
+- FC connection-test command.
+
+Read-only diagnostics:
+- FC UART state.
+- Last heartbeat age.
+- Last valid MAVLink packet age.
+- MAVLink RX count.
+- MAVLink TX count.
+- MAVLink parse-error count.
+- Detected MAVLink version.
+- Detected FC system ID.
+- Detected FC component ID.
+- Vehicle type.
+- Flight mode.
+- Armed state.
+- System status.
+- GPS state.
+- Battery state.
+- EKF/health state.
+- Failsafe state.
+
+GPIO policy:
+- FC UART pins should remain compiled into firmware initially.
+- Web-based GPIO reassignment is not recommended for the first version.
+- Baud rate may be configurable.
+- Pin changes should require a firmware build or protected expert mode later.
+
+D. Link behaviour
+-----------------
+Editable settings:
+- Link mode policy: AUTO, FORCE RF or FORCE OPTIC.
+- RC command freshness limit.
+- Remote-link timeout.
+- FC heartbeat timeout.
+- Status-packet rate.
+- Telemetry forwarding rate.
+- Allowed command classes.
+- Duplicate rejection enabled.
+- Replay protection enabled.
+- Link diagnostics enabled.
+
+Read-only diagnostics:
+- Active physical link.
+- RF link state.
+- Optic link state.
+- Last valid RC command age.
+- Valid packet count.
+- Lost packet count.
+- Invalid packet count.
+- Duplicate packet count.
+- Replay rejection count.
+- Authentication failure count.
+- Average cryptographic processing time.
+- Maximum cryptographic processing time.
+- FC UART load.
+- Gateway queue usage.
+
+E. Safety information
+---------------------
+Read-only safety state:
+- Control output disabled in maintenance mode.
+- Arming commands blocked.
+- Current FC armed state.
+- Current gateway state.
+- Current remote-controller state.
+- Current failsafe state.
+- Last authenticated command.
+- Last authenticated command age.
+- Master authority state.
+- Maintenance interlock state.
+
+The first gateway maintenance page should not provide:
+- Manual arming.
+- Failsafe bypass.
+- Authentication bypass.
+- Anti-replay disable switch.
+- Unsafe command-authorization overrides.
+- Live flight-control output.
+
+F. Gateway page must not contain
+--------------------------------
+- RC joystick calibration.
+- RC button calibration.
+- Internet Wi-Fi password.
+- API token.
+- API server credentials.
+- Remote monitoring server settings.
+
+
+3. RC TELEMETRY-RELAY MAINTENANCE PAGE
+======================================
+
+Purpose
+-------
+Configure the second ESP32 attached to or installed inside the RC. It receives selected telemetry from the Main RC ESP32 and transmits it over a separate long-range RF link.
+
+A. Device and status
+--------------------
+Read-only information:
+- Device role: RC Telemetry Relay.
+- Device ID.
+- Firmware version.
+- Maintenance mode active.
+- Local maintenance IP.
+- Main RC local-link state.
+- Remote ground gateway RF-link state.
+- Last received telemetry age.
+- Last transmitted telemetry age.
+- Free heap.
+- Queue usage.
+- Reset reason.
+- Uptime.
+
+B. Main RC local interface
+--------------------------
+Editable settings:
+- Local interface enabled.
+- Transport: UART initially, SPI later if selected.
+- UART baud rate.
+- Expected Main RC device ID.
+- Local packet rate.
+- Local timeout.
+- Local framing mode.
+- Local-link security enabled.
+
+Read-only diagnostics:
+- UART connected.
+- RX packet count.
+- Parse-error count.
+- Last packet age.
+- Queue depth.
+- Dropped telemetry count.
+
+C. Secondary RF-link security
+-----------------------------
+This secure link is:
+
+RC Telemetry-Relay ESP32
+    <-> Remote Ground Gateway ESP32
+
+Configuration:
+- Relay device ID.
+- Expected remote ground gateway peer ID.
+- Current key ID.
+- Secondary secure key status.
+- New 256-bit root key.
+- Confirm new root key.
+- Pairing status.
+- Key rotation.
+- Clear pairing with strong confirmation.
+
+Read-only diagnostics:
+- Authentication successes.
+- Authentication failures.
+- Replay rejections.
+- Duplicate packets.
+- Last authenticated peer packet age.
+- Current session state.
+
+The secondary telemetry key must be different from:
+- The primary RC-to-airborne-gateway key.
+- Any local RC-to-relay key.
+- Any API token.
+
+D. Secondary RF settings
+------------------------
+Editable settings:
+- RF profile.
+- Frequency or regional profile, where legally supported.
+- Channel or network ID.
+- Transmit power, within legal and hardware limits.
+- Packet rate.
+- Retry policy.
+- Forward-error-correction profile, if supported.
+- Telemetry compression profile.
+- Heartbeat interval.
+- Remote gateway timeout.
+
+Read-only diagnostics:
+- Link connected.
+- RSSI.
+- SNR.
+- Packet success rate.
+- Lost packet count.
+- Retry count.
+- Last ACK age.
+- Current RF profile.
+- Thermal or power warning.
+
+E. Telemetry filtering
+----------------------
+Editable selection:
+- Battery.
+- GPS.
+- Position.
+- Altitude.
+- Attitude.
+- Flight mode.
+- Armed state.
+- Failsafe.
+- EKF/health.
+- Link health.
+- Vehicle status.
+- Diagnostic summaries.
+
+The relay should not forward unnecessary high-rate data by default.
+
+F. Relay page must not contain
+------------------------------
+- RC joystick calibration.
+- Flight-controller UART settings.
+- Internet Wi-Fi credentials.
+- API hostname.
+- API port.
+- API token.
+
+
+4. REMOTE GROUND GATEWAY MAINTENANCE PAGE
+=========================================
+
+Purpose
+-------
+Configure the far-away ESP32 gateway that receives the secondary telemetry RF stream and forwards telemetry to an API or monitoring server.
+
+A. Device and status
+--------------------
+Read-only information:
+- Device role: Remote Ground Gateway.
+- Device ID.
+- Firmware version.
+- Maintenance mode active.
+- Local maintenance IP.
+- Secondary RF-link state.
+- Wi-Fi state.
+- API connection state.
+- Last received telemetry age.
+- Last successful API upload.
+- Offline queue depth.
+- Free heap.
+- Reset reason.
+- Uptime.
+
+B. Secondary RF-link security
+-----------------------------
+This secure link is:
+
+Remote Ground Gateway ESP32
+    <-> RC Telemetry-Relay ESP32
+
+Configuration:
+- Ground gateway device ID.
+- Expected relay peer ID.
+- Current key ID.
+- Secondary secure key status.
+- New 256-bit root key.
+- Confirm new root key.
+- Pairing status.
+- Key rotation.
+- Clear pairing with strong confirmation.
+
+Read-only diagnostics:
+- Authentication successes.
+- Authentication failures.
+- Replay rejections.
+- Duplicate packets.
+- Last authenticated packet age.
+- Current session state.
+
+C. Network configuration
+------------------------
+Editable settings:
+- Wi-Fi enabled.
+- Wi-Fi SSID.
+- Wi-Fi password.
+- DHCP or static IP mode.
+- Static IP address, when enabled.
+- Gateway address.
+- Subnet mask.
+- DNS server.
+- Connection timeout.
+- Reconnect policy.
+
+Wi-Fi password rules:
+- Use <input type="password">.
+- Never display the existing password.
+- Never return it to the browser.
+- Never print it in logs.
+- Empty submitted password means keep the existing password.
+- Clearing the password requires a separate explicit action.
+- Show status only: Configured or Not configured.
+- Store only after NVS write and read-back verification.
+- Protect storage using ESP32 flash encryption.
+
+Possible future alternatives:
+- Ethernet.
+- Cellular modem.
+- Multiple network profiles.
+- Network priority and failover.
+
+D. API and server configuration
+-------------------------------
+Editable settings:
+- API hostname or IP address.
+- API port.
+- Transport: HTTPS preferred, MQTT over TLS or WebSocket over TLS may be considered.
+- API path.
+- Gateway identity.
+- API token.
+- Upload interval.
+- Batch size.
+- Request timeout.
+- Retry policy.
+- Maximum offline buffer size.
+- Telemetry compression enabled.
+- Server certificate authority.
+- Certificate fingerprint or pinned public key, if used.
+
+API token rules:
+- Password-style input.
+- Existing token is never displayed.
+- Existing token is never logged.
+- Empty submission keeps the existing token.
+- Clearing requires a separate explicit action.
+- Status shows Configured or Not configured only.
+
+E. Telemetry forwarding
+-----------------------
+Editable settings:
+- Forwarding enabled.
+- Upload frequency.
+- Immediate alarm forwarding enabled.
+- Normal telemetry batching.
+- Offline buffering.
+- Old-data expiry.
+- Message priority.
+- Maximum queue size.
+- Selected telemetry groups.
+- Device/site label.
+
+Read-only diagnostics:
+- Packets received from relay.
+- Packets rejected.
+- Last valid telemetry timestamp.
+- Upload successes.
+- Upload failures.
+- Current retry count.
+- Offline queue depth.
+- Oldest queued record age.
+- Last HTTP/MQTT response status.
+- TLS connection state.
+
+F. Ground gateway page must not contain
+---------------------------------------
+- RC joystick calibration.
+- Flight-controller UART configuration.
+- Aircraft arming controls.
+- Direct flight-control commands.
+- Primary RC-to-airborne-gateway key.
+
+
+5. KEY SEPARATION
+=================
+
+At least two independent secure roots are required.
+
+Primary aircraft-control and telemetry link:
+- Main RC ESP32 <-> Airborne Gateway ESP32
+- Root key A
+
+Secondary remote-monitoring link:
+- RC Telemetry-Relay ESP32 <-> Remote Ground Gateway ESP32
+- Root key B
+
+Optional local RC-to-relay link:
+- Main RC ESP32 <-> RC Telemetry-Relay ESP32
+- Root key C
+
+Rules:
+- Root key A, B and C must be different.
+- API tokens are not encryption root keys.
+- Wi-Fi passwords are not encryption root keys.
+- Maintenance AP passwords are not link root keys.
+- Directional session keys are derived internally.
+- Nonces and anti-replay counters are managed internally.
+- Root keys are never transmitted in normal operation.
+- Root keys are never displayed after provisioning.
+
+
+6. MAINTENANCE SECURITY RULES
+=============================
+
+Required controls:
+- Physical MAINTENANCE switch active.
+- MASTER switch off.
+- Normal control tasks disabled.
+- Arming disabled.
+- Maintenance AP enabled only in maintenance mode.
+- Role-specific routes only.
+- Request body size limits.
+- Strict field parsing.
+- HTML escaping.
+- URL decoding with encoded-null rejection.
+- NVS configuration version.
+- CRC validation.
+- NVS commit and read-back verification.
+- Reboot required before sensitive changes become active.
+- Existing secrets never displayed.
+- Existing secrets never logged.
+- Password fields masked.
+- Empty secret input keeps current secret.
+- Explicit separate action required to clear secrets.
+- Key confirmation field required.
+- Device-specific maintenance AP password in the final version.
+- HTTPS for maintenance in the final hardened version.
+- ESP32 Secure Boot.
+- ESP32 Flash Encryption.
+- Signed OTA.
+- Authentication-failure rate limiting.
+- Session timeout.
+- Optional maintenance-page login.
+- Configuration audit event counters.
+- Factory reset with physical confirmation.
+
+Sensitive information that must never appear in logs:
+- Root keys.
+- Derived keys.
+- Wi-Fi passwords.
+- API tokens.
+- TLS private keys.
+- Full authentication material.
+
+
+7. IMPLEMENTATION PRIORITY
+==========================
+
+Phase 1: Role separation
+- Keep the shared maintenance engine.
+- Separate RC and Airborne Gateway page builders.
+- Register only role-appropriate routes.
+- Remove Wi-Fi/API fields from the Main RC page.
+- Keep Gateway-specific fields separate.
+
+Phase 2: Main RC configuration
+- RC device identity.
+- Primary peer identity.
+- Primary key-status display.
+- Secure key provisioning form.
+- Joystick calibration page.
+- Switch and button diagnostics.
+- Secondary telemetry output settings.
+
+Phase 3: Airborne Gateway configuration
+- Gateway identity.
+- Expected RC identity.
+- Primary key provisioning.
+- FC UART baud.
+- MAVLink IDs.
+- Heartbeat timeout.
+- Link diagnostics.
+
+Phase 4: RC Telemetry Relay
+- Local RC interface.
+- Secondary RF configuration.
+- Secondary root key.
+- Telemetry filtering.
+- Relay diagnostics.
+
+Phase 5: Remote Ground Gateway
+- Secondary RF key.
+- Wi-Fi SSID and password.
+- API host, port and token.
+- TLS configuration.
+- Offline buffering.
+- Upload diagnostics.
+
+Phase 6: Hardening
+- Device-specific maintenance password.
+- HTTPS maintenance interface.
+- Flash encryption.
+- Secure Boot.
+- Signed OTA.
+- Key rotation with old/new key slots.
+- Audit counters.
+- Recovery and factory-reset procedure.
+
+
+8. CURRENT DECISIONS
+====================
+
+Confirmed:
+- The Main RC ESP32 does not send telemetry directly to the internet.
+- The Main RC sends selected telemetry to a second ESP32.
+- The RC Telemetry-Relay ESP32 sends telemetry over a separate RF link.
+- The Remote Ground Gateway ESP32 receives that telemetry.
+- The Remote Ground Gateway sends telemetry to the API/server.
+- Internet Wi-Fi credentials belong to the Remote Ground Gateway.
+- Primary and secondary RF links use different root keys.
+- Maintenance pages are role-specific.
+- RC calibration controls must never appear on the Airborne Gateway.
+- Gateway FC/MAVLink controls must never appear on the RC.
+- Sensitive keys are provisioned only in maintenance mode.
+- Existing secrets are never shown after provisioning.
