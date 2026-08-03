@@ -22,6 +22,8 @@
 // If your path is different, change this include.
 #include "ardupilotmega/mavlink.h"
 #include "mathos_messages.h"
+#include "nvs_flash.h"
+#include "mathos_maintenance.h"
 #include "mathos_flight_modes.h"
 
 static const char *TAG = "DRONE_GATEWAY";
@@ -104,19 +106,11 @@ static const char *TAG = "DRONE_GATEWAY";
 #define GATEWAY_DISARM_TIMEOUT_MS       5000
 #define GATEWAY_RTL_TIMEOUT_MS          5000
 #define GATEWAY_SESSION_RECOVERY_HOLD_MS 3000
-/*
-   ArduPlane / QuadPlane custom_mode values used for
-   positive RTL confirmation.
-
-   RTL  = fixed-wing return
-   QRTL = QuadPlane VTOL return
-*/
-/*
-   RC override works reliably with broadcast target 0/0.
-   Real COMMAND_LONG uses the FC sysid/compid learned from heartbeat.
-*/
 #define FC_COMMAND_TARGET_SYS_ID_FALLBACK   1
 #define FC_COMMAND_TARGET_COMP_ID_FALLBACK  1
+
+
+#define GATEWAY_MAINTENANCE_BENCH_BOOT 1
 
 static QueueHandle_t rc_packet_queue = NULL;
 static SemaphoreHandle_t mavlink_tx_mutex = NULL;
@@ -3804,6 +3798,74 @@ static void health_task(void *arg)
 void app_main(void)
 {
     gateway_status_session_id = esp_random();
+        /*
+        NVS must be initialized before loading or saving
+        maintenance configuration.
+    */
+    esp_err_t nvs_err =
+        nvs_flash_init();
+
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES ||
+        nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        ESP_LOGW(
+            TAG,
+            "NVS partition requires reinitialization");
+
+        esp_err_t erase_err =
+            nvs_flash_erase();
+
+        if (erase_err != ESP_OK)
+        {
+            ESP_LOGE(
+                TAG,
+                "NVS erase failed: %s",
+                esp_err_to_name(erase_err));
+
+            return;
+        }
+
+        nvs_err =
+            nvs_flash_init();
+    }
+
+    if (nvs_err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "NVS initialization failed: %s",
+            esp_err_to_name(nvs_err));
+
+        return;
+    }
+
+#if GATEWAY_MAINTENANCE_BENCH_BOOT
+
+    /*
+        Maintenance mode is exclusive.
+
+        No RC-link UART, FC UART, MAVLink, control,
+        arming, telemetry or failsafe task is started.
+    */
+    ESP_LOGW(
+        TAG,
+        "GATEWAY MAINTENANCE BENCH MODE ACTIVE");
+
+    esp_err_t maintenance_err =
+        mathos_maintenance_softap_start(
+            MATHOS_MAINTENANCE_ROLE_GATEWAY);
+
+    if (maintenance_err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Gateway maintenance startup failed: %s",
+            esp_err_to_name(maintenance_err));
+    }
+
+    return;
+
+#endif
     if (gateway_status_session_id == 0) {
     gateway_status_session_id = 1;
 }

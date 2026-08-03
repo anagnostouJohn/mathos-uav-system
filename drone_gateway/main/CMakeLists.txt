@@ -12,4 +12,6 @@ idf_component_register(
         mavlink
         mathos_messages
         mathos_flight_modes
+        mathos_maintenance
+        nvs_flash
 )

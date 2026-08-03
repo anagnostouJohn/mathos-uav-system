@@ -8,6 +8,7 @@ set(EXTRA_COMPONENT_DIRS
     "../common_components/mavlink"
     "../common_components/mathos_messages"
     "../common_components/mathos_flight_modes"
+    "../common_components/mathos_maintenance"
 )
 
 set(COMPONENTS
@@ -17,6 +18,7 @@ set(COMPONENTS
     mavlink
     mathos_messages
     mathos_flight_modes
+    mathos_maintenance
 )
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)

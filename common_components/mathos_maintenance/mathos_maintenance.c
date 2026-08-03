@@ -12,6 +12,10 @@
 #include "esp_wifi.h"
 #include "esp_http_server.h"
 #include "nvs.h"
+#include "mbedtls/md.h"
+#include "mbedtls/pkcs5.h"
+#include "esp_random.h"
+#include "esp_timer.h"
 
 #define MATHOS_MAINTENANCE_RC_SSID "MATHOS-RC-SETUP"
 #define MATHOS_MAINTENANCE_GATEWAY_SSID "MATHOS-GW-SETUP"
@@ -28,9 +32,17 @@
 #define MATHOS_MAINTENANCE_MAX_CLIENTS 4
 #define MATHOS_MAINTENANCE_NVS_NAMESPACE "mathos_cfg"
 #define MATHOS_MAINTENANCE_NVS_KEY "config_v1"
-#define MATHOS_MAINTENANCE_PAGE_BUFFER_SIZE 8192
-#define MATHOS_MAINTENANCE_ROLE_SECTION_BUFFER_SIZE 4096
-#define MATHOS_MAINTENANCE_FORM_BODY_MAX 512
+#define MATHOS_GATEWAY_NVS_KEY "gateway_v2"
+#define MATHOS_RC_PAIRING_NVS_KEY "rc_pair_v1"
+#define MATHOS_MAINTENANCE_PAGE_BUFFER_SIZE 16384
+#define MATHOS_MAINTENANCE_ROLE_SECTION_BUFFER_SIZE 8192
+#define MATHOS_MAINTENANCE_FORM_BODY_MAX 2048
+/*
+    Temporary bench-only pairing self-test.
+
+    Set to 0 after the runtime test passes.
+*/
+#define MATHOS_PAIRING_BENCH_SELF_TEST_ENABLED 0
 
 static const char *TAG = "MATHOS_MAINT";
 
@@ -41,12 +53,35 @@ static esp_netif_t *maintenance_ap_netif = NULL;
 
 static mathos_maintenance_role_t maintenance_active_role =
     MATHOS_MAINTENANCE_ROLE_RC;
+static mathos_maintenance_config_t
+    maintenance_active_config;
+static mathos_gateway_config_t
+    maintenance_active_gateway_config;
 
-static mathos_maintenance_config_t maintenance_active_config;
+static mathos_rc_pairing_config_t
+    maintenance_active_rc_pairing_config;
 
-static int maintenance_config_loaded_from_nvs = 0;
+static int
+    maintenance_config_loaded_from_nvs = 0;
+
+static int
+    maintenance_gateway_config_loaded_from_nvs = 0;
+
+static int
+    maintenance_rc_pairing_config_loaded_from_nvs = 0;
+
 static esp_err_t maintenance_rc_config_post_handler(
     httpd_req_t *request);
+
+static esp_err_t maintenance_gateway_config_post_handler(
+    httpd_req_t *request);
+
+static void maintenance_clear_sensitive_memory(
+    void *buffer,
+    size_t buffer_size);
+
+static esp_err_t maintenance_run_pairing_bench_self_test(
+    void);
 
 static uint32_t mathos_maintenance_config_calculate_crc32(
     const mathos_maintenance_config_t *config)
@@ -97,6 +132,4288 @@ static uint32_t mathos_maintenance_config_calculate_crc32(
     return ~crc;
 }
 
+static uint32_t mathos_gateway_config_calculate_crc32(
+    const mathos_gateway_config_t *config)
+{
+    if (config == NULL)
+    {
+        return 0;
+    }
+
+    /*
+        Calculate the CRC using a copy with the
+        crc32 field cleared.
+
+        This prevents the checksum from including itself.
+    */
+    mathos_gateway_config_t copy =
+        *config;
+
+    copy.crc32 = 0;
+
+    const uint8_t *data =
+        (const uint8_t *)&copy;
+
+    uint32_t crc =
+        0xFFFFFFFFU;
+
+    for (size_t i = 0;
+         i < sizeof(copy);
+         i++)
+    {
+        crc ^= data[i];
+
+        for (int bit = 0;
+             bit < 8;
+             bit++)
+        {
+            if (crc & 1U)
+            {
+                crc =
+                    (crc >> 1) ^
+                    0xEDB88320U;
+            }
+            else
+            {
+                crc >>= 1;
+            }
+        }
+    }
+
+    return ~crc;
+}
+static uint32_t mathos_rc_pairing_config_calculate_crc32(
+    const mathos_rc_pairing_config_t *config)
+{
+    if (config == NULL)
+    {
+        return 0;
+    }
+
+    /*
+        Work on a copy so the CRC field is excluded
+        from its own calculation.
+    */
+    mathos_rc_pairing_config_t copy =
+        *config;
+
+    copy.crc32 = 0;
+
+    const uint8_t *data =
+        (const uint8_t *)&copy;
+
+    uint32_t crc =
+        0xFFFFFFFFU;
+
+    for (size_t i = 0;
+         i < sizeof(copy);
+         i++)
+    {
+        crc ^= data[i];
+
+        for (int bit = 0;
+             bit < 8;
+             bit++)
+        {
+            if (crc & 1U)
+            {
+                crc =
+                    (crc >> 1) ^
+                    0xEDB88320U;
+            }
+            else
+            {
+                crc >>= 1;
+            }
+        }
+    }
+
+    return ~crc;
+}
+
+static uint32_t mathos_pairing_package_calculate_crc32(
+    const mathos_pairing_package_t *package)
+{
+    if (package == NULL)
+    {
+        return 0;
+    }
+
+    /*
+        Calculate the CRC using a copy with the
+        crc32 field cleared.
+    */
+    mathos_pairing_package_t copy =
+        *package;
+
+    copy.crc32 = 0;
+
+    const uint8_t *data =
+        (const uint8_t *)&copy;
+
+    uint32_t crc =
+        0xFFFFFFFFU;
+
+    for (size_t i = 0;
+         i < sizeof(copy);
+         i++)
+    {
+        crc ^= data[i];
+
+        for (int bit = 0;
+             bit < 8;
+             bit++)
+        {
+            if (crc & 1U)
+            {
+                crc =
+                    (crc >> 1) ^
+                    0xEDB88320U;
+            }
+            else
+            {
+                crc >>= 1;
+            }
+        }
+    }
+
+    return ~crc;
+}
+
+static uint32_t mathos_pairing_challenge_calculate_crc32(
+    const mathos_pairing_challenge_t *challenge)
+{
+    if (challenge == NULL)
+    {
+        return 0;
+    }
+
+    /*
+        Calculate the CRC using a copy with its CRC
+        field cleared.
+    */
+    mathos_pairing_challenge_t copy =
+        *challenge;
+
+    copy.crc32 = 0;
+
+    const uint8_t *data =
+        (const uint8_t *)&copy;
+
+    uint32_t crc =
+        0xFFFFFFFFU;
+
+    for (size_t i = 0;
+         i < sizeof(copy);
+         i++)
+    {
+        crc ^= data[i];
+
+        for (int bit = 0;
+             bit < 8;
+             bit++)
+        {
+            if (crc & 1U)
+            {
+                crc =
+                    (crc >> 1) ^
+                    0xEDB88320U;
+            }
+            else
+            {
+                crc >>= 1;
+            }
+        }
+    }
+
+    return ~crc;
+}
+
+static uint32_t mathos_pairing_proof_calculate_crc32(
+    const mathos_pairing_proof_t *proof)
+{
+    if (proof == NULL)
+    {
+        return 0;
+    }
+
+    /*
+        Calculate the CRC using a copy with its
+        crc32 field cleared.
+    */
+    mathos_pairing_proof_t copy =
+        *proof;
+
+    copy.crc32 = 0;
+
+    const uint8_t *data =
+        (const uint8_t *)&copy;
+
+    uint32_t crc =
+        0xFFFFFFFFU;
+
+    for (size_t i = 0;
+         i < sizeof(copy);
+         i++)
+    {
+        crc ^= data[i];
+
+        for (int bit = 0;
+             bit < 8;
+             bit++)
+        {
+            if (crc & 1U)
+            {
+                crc =
+                    (crc >> 1) ^
+                    0xEDB88320U;
+            }
+            else
+            {
+                crc >>= 1;
+            }
+        }
+    }
+
+    return ~crc;
+}
+
+void mathos_gateway_config_set_defaults(
+    mathos_gateway_config_t *config)
+{
+    if (config == NULL)
+    {
+        return;
+    }
+    memset(
+        config,
+        0,
+        sizeof(*config));
+    config->magic =
+        MATHOS_GATEWAY_CONFIG_MAGIC;
+    config->version =
+        MATHOS_GATEWAY_CONFIG_VERSION;
+    config->record_size =
+        sizeof(mathos_gateway_config_t);
+    config->gateway_id = 2;
+    config->authorised_rc_id = 1;
+    config->failsafe_policy =
+        MATHOS_GATEWAY_FAILSAFE_FC_NATIVE;
+
+    config->key_derivation_method =
+        MATHOS_GATEWAY_KEY_DERIVATION_NONE;
+
+    config->key_generation = 0;
+    config->kdf_iteration_count = 0;
+    config->link_uart_baud = 115200;
+    config->fc_uart_baud = 115200;
+    config->rc_packet_timeout_ms = 250;
+    config->fc_heartbeat_timeout_ms = 1500;
+    config->status_tx_period_ms = 200;
+    config->telemetry_tx_period_ms = 200;
+    memset(
+        config->pairing_salt,
+        0,
+        sizeof(config->pairing_salt));
+
+    memset(
+        config->reserved1,
+        0,
+        sizeof(config->reserved1));
+    config->configuration_counter = 0;
+
+    config->crc32 = 0;
+
+    config->crc32 =
+        mathos_gateway_config_calculate_crc32(
+            config);
+}
+void mathos_rc_pairing_config_set_defaults(
+    mathos_rc_pairing_config_t *config)
+{
+    if (config == NULL)
+    {
+        return;
+    }
+
+    /*
+        Begin with a completely cleared record.
+
+        An all-zero root key and salt represent the
+        unpaired state.
+    */
+    memset(
+        config,
+        0,
+        sizeof(*config));
+
+    config->magic =
+        MATHOS_RC_PAIRING_CONFIG_MAGIC;
+
+    config->version =
+        MATHOS_RC_PAIRING_CONFIG_VERSION;
+
+    config->record_size =
+        sizeof(mathos_rc_pairing_config_t);
+
+    /*
+        Current default device identities.
+
+        These will later be editable from the RC
+        maintenance interface.
+    */
+    config->rc_id = 1;
+
+    config->authorised_gateway_id = 2;
+
+    config->key_derivation_method =
+        MATHOS_GATEWAY_KEY_DERIVATION_NONE;
+
+    config->key_generation = 0;
+
+    config->kdf_iteration_count = 0;
+
+    /*
+        Reserved fields and pairing material are already
+        zero because the complete structure was cleared.
+    */
+    config->configuration_counter = 0;
+
+    config->crc32 = 0;
+
+    config->crc32 =
+        mathos_rc_pairing_config_calculate_crc32(
+            config);
+}
+
+void mathos_pairing_package_set_defaults(
+    mathos_pairing_package_t *package)
+{
+    if (package == NULL)
+    {
+        return;
+    }
+
+    /*
+        A completely cleared package represents
+        no active pairing offer.
+    */
+    memset(
+        package,
+        0,
+        sizeof(*package));
+
+    package->magic =
+        MATHOS_PAIRING_PACKAGE_MAGIC;
+
+    package->version =
+        MATHOS_PAIRING_PACKAGE_VERSION;
+
+    package->record_size =
+        sizeof(mathos_pairing_package_t);
+
+    package->rc_id = 1;
+    package->gateway_id = 2;
+
+    /*
+        No salt, generation or derivation method exists
+        until the Gateway creates a real pairing package.
+    */
+    package->key_derivation_method =
+        MATHOS_GATEWAY_KEY_DERIVATION_NONE;
+
+    package->key_generation = 0;
+    package->kdf_iteration_count = 0;
+
+    package->reserved0 = 0;
+
+    memset(
+        package->reserved1,
+        0,
+        sizeof(package->reserved1));
+
+    package->crc32 = 0;
+
+    package->crc32 =
+        mathos_pairing_package_calculate_crc32(
+            package);
+}
+
+void mathos_pairing_challenge_set_defaults(
+    mathos_pairing_challenge_t *challenge)
+{
+    if (challenge == NULL)
+    {
+        return;
+    }
+
+    /*
+        A cleared nonce represents no active challenge.
+    */
+    memset(
+        challenge,
+        0,
+        sizeof(*challenge));
+
+    challenge->magic =
+        MATHOS_PAIRING_CHALLENGE_MAGIC;
+
+    challenge->version =
+        MATHOS_PAIRING_CHALLENGE_VERSION;
+
+    challenge->record_size =
+        sizeof(mathos_pairing_challenge_t);
+
+    challenge->rc_id = 1;
+    challenge->gateway_id = 2;
+
+    challenge->key_generation = 0;
+
+    challenge->crc32 = 0;
+
+    challenge->crc32 =
+        mathos_pairing_challenge_calculate_crc32(
+            challenge);
+}
+void mathos_pairing_proof_set_defaults(
+    mathos_pairing_proof_t *proof)
+{
+    if (proof == NULL)
+    {
+        return;
+    }
+
+    /*
+        A completely cleared proof represents
+        no active authenticated response.
+    */
+    memset(
+        proof,
+        0,
+        sizeof(*proof));
+
+    proof->magic =
+        MATHOS_PAIRING_PROOF_MAGIC;
+
+    proof->version =
+        MATHOS_PAIRING_PROOF_VERSION;
+
+    proof->record_size =
+        sizeof(mathos_pairing_proof_t);
+
+    proof->rc_id = 1;
+    proof->gateway_id = 2;
+
+    proof->proof_role = 0;
+    proof->reserved0 = 0;
+
+    proof->key_generation = 0;
+
+    proof->crc32 = 0;
+
+    proof->crc32 =
+        mathos_pairing_proof_calculate_crc32(
+            proof);
+}
+
+void mathos_pairing_session_set_defaults(
+    mathos_pairing_session_t *session)
+{
+    if (session == NULL)
+    {
+        return;
+    }
+
+    /*
+        Clear the entire session first because it may
+        contain a candidate root key.
+    */
+    maintenance_clear_sensitive_memory(
+        session,
+        sizeof(*session));
+
+    session->state =
+        MATHOS_PAIRING_SESSION_IDLE;
+
+    session->active = 0;
+    session->retry_count = 0;
+    session->key_generation = 0;
+    session->started_at_us = 0;
+
+    mathos_pairing_package_set_defaults(
+        &session->package);
+
+    mathos_pairing_challenge_set_defaults(
+        &session->challenge);
+
+    mathos_rc_pairing_config_set_defaults(
+        &session->rc_candidate);
+
+    mathos_pairing_proof_set_defaults(
+        &session->rc_proof);
+
+    mathos_pairing_proof_set_defaults(
+        &session->gateway_proof);
+}
+
+void mathos_pairing_session_reset(
+    mathos_pairing_session_t *session)
+{
+    if (session == NULL)
+    {
+        return;
+    }
+
+    /*
+        mathos_pairing_session_set_defaults() securely
+        clears the complete session before rebuilding
+        the safe inactive state.
+
+        This wipes the candidate root key, nonce,
+        package parameters and both proof records.
+    */
+    mathos_pairing_session_set_defaults(
+        session);
+
+    ESP_LOGI(
+        TAG,
+        "pairing session securely reset to IDLE");
+}
+
+int mathos_pairing_session_has_timed_out(
+    const mathos_pairing_session_t *session)
+{
+    if (session == NULL)
+    {
+        return 0;
+    }
+
+    /*
+        An inactive session cannot expire.
+    */
+    if (!session->active)
+    {
+        return 0;
+    }
+
+    /*
+        Every active session must have a valid start time.
+
+        Treat a missing timestamp as expired so sensitive
+        session material cannot remain active indefinitely.
+    */
+    if (session->started_at_us <= 0)
+    {
+        return 1;
+    }
+
+    int64_t now_us =
+        esp_timer_get_time();
+
+    /*
+        A backwards timestamp should not normally occur,
+        but reject the session rather than trusting an
+        invalid elapsed-time calculation.
+    */
+    if (now_us < session->started_at_us)
+    {
+        return 1;
+    }
+
+    int64_t elapsed_us =
+        now_us -
+        session->started_at_us;
+
+    int64_t timeout_us =
+        (int64_t)
+            MATHOS_PAIRING_SESSION_TIMEOUT_MS *
+        1000LL;
+
+    return elapsed_us >= timeout_us
+               ? 1
+               : 0;
+}
+
+int mathos_pairing_session_register_failure(
+    mathos_pairing_session_t *session)
+{
+    if (session == NULL)
+    {
+        return 0;
+    }
+
+    /*
+        A failure can belong only to an active pairing
+        attempt.
+
+        An inactive or inconsistent session is reset
+        immediately.
+    */
+    if (!session->active)
+    {
+        ESP_LOGW(
+            TAG,
+            "pairing failure received for inactive session");
+
+        mathos_pairing_session_reset(
+            session);
+
+        return 0;
+    }
+
+    /*
+        A timed-out session must never be retried using
+        its old challenge, nonce or candidate key.
+    */
+    if (mathos_pairing_session_has_timed_out(
+            session))
+    {
+        ESP_LOGW(
+            TAG,
+            "pairing session failure caused by timeout");
+
+        mathos_pairing_session_reset(
+            session);
+
+        return 0;
+    }
+
+    /*
+        Increase the retry counter safely.
+
+        The configured limit is far below UINT8_MAX,
+        but avoid integer wrap-around anyway.
+    */
+    if (session->retry_count < UINT8_MAX)
+    {
+        session->retry_count++;
+    }
+
+    /*
+        Reaching the retry limit terminates the complete
+        pairing attempt.
+
+        Resetting wipes the candidate root key, nonce,
+        package parameters and proof records.
+    */
+    if (session->retry_count >=
+        MATHOS_PAIRING_SESSION_MAX_RETRIES)
+    {
+        ESP_LOGW(
+            TAG,
+            "pairing retry limit reached retries=%u; "
+            "session will be securely reset",
+            session->retry_count);
+
+        mathos_pairing_session_reset(
+            session);
+
+        return 0;
+    }
+
+    /*
+        Preserve the active session for a controlled retry.
+
+        The caller must explicitly decide which previous
+        valid state should be recreated next.
+    */
+    session->state =
+        MATHOS_PAIRING_SESSION_FAILED;
+
+    ESP_LOGW(
+        TAG,
+        "pairing attempt failed retry=%u/%u",
+        session->retry_count,
+        (unsigned int)
+            MATHOS_PAIRING_SESSION_MAX_RETRIES);
+
+    /*
+        Return one while another retry is permitted.
+    */
+    return 1;
+}
+
+esp_err_t mathos_pairing_session_start(
+    mathos_pairing_session_t *session,
+    const mathos_pairing_package_t *package)
+{
+    if (session == NULL ||
+        package == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        A new pairing attempt may begin only from the
+        safe inactive state.
+
+        An existing session must be cancelled, completed
+        or timed out before another one begins.
+    */
+    if (session->active ||
+        session->state !=
+            MATHOS_PAIRING_SESSION_IDLE)
+    {
+        ESP_LOGW(
+            TAG,
+            "pairing session start rejected: "
+            "another session is already active");
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+        Reject corrupted, empty or incompatible packages
+        before allocating any active session state.
+    */
+    if (!mathos_pairing_package_is_valid(
+            package))
+    {
+        ESP_LOGW(
+            TAG,
+            "pairing session start rejected: "
+            "invalid pairing package");
+
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (package->key_generation == 0)
+    {
+        ESP_LOGW(
+            TAG,
+            "pairing session start rejected: "
+            "pairing package is empty");
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+        Construct the complete new session locally.
+
+        The caller's session remains unchanged unless
+        every initialization step succeeds.
+    */
+    mathos_pairing_session_t candidate;
+
+    mathos_pairing_session_set_defaults(
+        &candidate);
+
+    candidate.package =
+        *package;
+
+    candidate.state =
+        MATHOS_PAIRING_SESSION_PACKAGE_READY;
+
+    candidate.key_generation =
+        package->key_generation;
+
+    candidate.retry_count = 0;
+
+    candidate.started_at_us =
+        esp_timer_get_time();
+
+    /*
+        The timeout logic treats a missing or invalid
+        timestamp as expired.
+    */
+    if (candidate.started_at_us <= 0)
+    {
+        ESP_LOGE(
+            TAG,
+            "pairing session start failed: "
+            "invalid start timestamp");
+
+        maintenance_clear_sensitive_memory(
+            &candidate,
+            sizeof(candidate));
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+        Generate a fresh random challenge for this
+        particular pairing attempt.
+    */
+    esp_err_t challenge_err =
+        mathos_pairing_challenge_from_package(
+            &candidate.package,
+            &candidate.challenge);
+
+    if (challenge_err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "pairing session start failed: "
+            "challenge generation error=%s",
+            esp_err_to_name(challenge_err));
+
+        maintenance_clear_sensitive_memory(
+            &candidate,
+            sizeof(candidate));
+
+        return challenge_err;
+    }
+
+    candidate.state =
+        MATHOS_PAIRING_SESSION_CHALLENGE_READY;
+
+    candidate.active = 1;
+
+    /*
+        Publish the complete session only after the
+        challenge has been generated and validated.
+    */
+    *session =
+        candidate;
+
+    ESP_LOGI(
+        TAG,
+        "pairing session started "
+        "rc_id=%u gateway_id=%u "
+        "key_generation=%lu state=%u",
+        session->package.rc_id,
+        session->package.gateway_id,
+        (unsigned long)
+            session->key_generation,
+        (unsigned int)
+            session->state);
+
+    /*
+        The active session now owns the required copy.
+        Clear the temporary stack copy.
+    */
+    maintenance_clear_sensitive_memory(
+        &candidate,
+        sizeof(candidate));
+
+    return ESP_OK;
+}
+
+esp_err_t mathos_pairing_session_prepare_rc_response(
+    mathos_pairing_session_t *session,
+    const mathos_rc_pairing_config_t *current_config,
+    const char *passphrase)
+{
+    if (session == NULL ||
+        current_config == NULL ||
+        passphrase == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Build the candidate configuration and proof in
+        temporary storage.
+
+        Nothing sensitive is published into the active
+        session until every operation succeeds.
+    */
+    mathos_rc_pairing_config_t candidate_config = {0};
+    mathos_pairing_proof_t candidate_proof = {0};
+
+    esp_err_t result = ESP_OK;
+
+    /*
+        RC response generation is allowed only while an
+        active challenge is waiting for a response.
+    */
+    if (!session->active ||
+        session->state !=
+            MATHOS_PAIRING_SESSION_CHALLENGE_READY)
+    {
+        ESP_LOGW(
+            TAG,
+            "RC pairing response rejected: "
+            "invalid session state=%u active=%u",
+            (unsigned int)session->state,
+            session->active);
+
+        result = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+
+    /*
+        Never use an expired challenge or candidate-key
+        derivation session.
+    */
+    if (mathos_pairing_session_has_timed_out(
+            session))
+    {
+        ESP_LOGW(
+            TAG,
+            "RC pairing response rejected: "
+            "session timed out");
+
+        mathos_pairing_session_reset(
+            session);
+
+        result = ESP_ERR_TIMEOUT;
+        goto cleanup;
+    }
+
+    /*
+        The package and challenge must still be complete
+        and valid.
+    */
+    if (!mathos_pairing_package_is_valid(
+            &session->package) ||
+        !mathos_pairing_challenge_is_valid(
+            &session->challenge))
+    {
+        ESP_LOGE(
+            TAG,
+            "RC pairing response rejected: "
+            "session records are invalid");
+
+        mathos_pairing_session_reset(
+            session);
+
+        result = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+
+    /*
+        Confirm that all session metadata belongs to the
+        same pairing attempt.
+    */
+    if (session->key_generation !=
+            session->package.key_generation ||
+        session->key_generation !=
+            session->challenge.key_generation ||
+        session->package.rc_id !=
+            session->challenge.rc_id ||
+        session->package.gateway_id !=
+            session->challenge.gateway_id)
+    {
+        ESP_LOGE(
+            TAG,
+            "RC pairing response rejected: "
+            "session metadata mismatch");
+
+        mathos_pairing_session_reset(
+            session);
+
+        result = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+
+    /*
+        Derive and validate the RC candidate configuration.
+
+        This does not save anything to NVS.
+    */
+    result =
+        mathos_rc_pairing_config_prepare_from_package(
+            current_config,
+            &session->package,
+            passphrase,
+            &candidate_config);
+
+    if (result != ESP_OK)
+    {
+        ESP_LOGW(
+            TAG,
+            "RC pairing response rejected: "
+            "candidate preparation failed");
+
+        goto attempt_failed;
+    }
+
+    /*
+        The candidate must describe the exact identities
+        and generation from the active challenge.
+    */
+    if (candidate_config.rc_id !=
+            session->challenge.rc_id ||
+        candidate_config.authorised_gateway_id !=
+            session->challenge.gateway_id ||
+        candidate_config.key_generation !=
+            session->challenge.key_generation)
+    {
+        ESP_LOGE(
+            TAG,
+            "RC pairing response rejected: "
+            "candidate metadata mismatch");
+
+        result = ESP_ERR_INVALID_STATE;
+        goto attempt_failed;
+    }
+
+    /*
+        Create the role-1 proof using the candidate
+        root key.
+
+        This proves that the RC derived the same key
+        expected by the Gateway.
+    */
+    result =
+        mathos_pairing_proof_create(
+            candidate_config.root_key,
+            &session->challenge,
+            MATHOS_PAIRING_PROOF_ROLE_RC,
+            &candidate_proof);
+
+    if (result != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "RC pairing response failed: "
+            "proof generation error=%s",
+            esp_err_to_name(result));
+
+        goto attempt_failed;
+    }
+
+    /*
+        Validate the finished proof before publishing it.
+    */
+    if (!mathos_pairing_proof_is_valid(
+            &candidate_proof))
+    {
+        ESP_LOGE(
+            TAG,
+            "RC pairing response failed: "
+            "generated proof is invalid");
+
+        result = ESP_FAIL;
+        goto attempt_failed;
+    }
+
+    /*
+        Publish both sensitive records only after the
+        complete operation succeeds.
+    */
+    session->rc_candidate =
+        candidate_config;
+
+    session->rc_proof =
+        candidate_proof;
+
+    session->state =
+        MATHOS_PAIRING_SESSION_RC_PROOF_READY;
+
+    ESP_LOGI(
+        TAG,
+        "RC pairing response prepared "
+        "rc_id=%u gateway_id=%u "
+        "key_generation=%lu retry=%u "
+        "state=%u",
+        session->rc_candidate.rc_id,
+        session->rc_candidate.authorised_gateway_id,
+        (unsigned long)
+            session->rc_candidate.key_generation,
+        session->retry_count,
+        (unsigned int)
+            session->state);
+
+    result = ESP_OK;
+    goto cleanup;
+
+attempt_failed:
+    /*
+        Count unsuccessful derivation or proof attempts.
+
+        After the first two failures, return to the same
+        challenge so the operator may correct the
+        passphrase.
+
+        The third failure securely resets the session.
+    */
+    if (mathos_pairing_session_register_failure(
+            session))
+    {
+        session->state =
+            MATHOS_PAIRING_SESSION_CHALLENGE_READY;
+
+        ESP_LOGI(
+            TAG,
+            "pairing session returned to "
+            "CHALLENGE_READY for retry");
+    }
+
+cleanup:
+    /*
+        These temporary structures may contain a derived
+        root key and HMAC proof.
+    */
+    maintenance_clear_sensitive_memory(
+        &candidate_config,
+        sizeof(candidate_config));
+
+    maintenance_clear_sensitive_memory(
+        &candidate_proof,
+        sizeof(candidate_proof));
+
+    return result;
+}
+
+esp_err_t mathos_pairing_session_prepare_gateway_response(
+    mathos_pairing_session_t *session,
+    const mathos_gateway_config_t *gateway_config)
+{
+    if (session == NULL ||
+        gateway_config == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Build the Gateway confirmation proof in temporary
+        storage.
+
+        It is published into the active session only after
+        RC proof verification succeeds.
+    */
+    mathos_pairing_proof_t candidate_gateway_proof = {0};
+
+    esp_err_t result = ESP_OK;
+
+    /*
+        The Gateway may process a response only when an
+        active RC proof is waiting for verification.
+    */
+    if (!session->active ||
+        session->state !=
+            MATHOS_PAIRING_SESSION_RC_PROOF_READY)
+    {
+        ESP_LOGW(
+            TAG,
+            "Gateway pairing response rejected: "
+            "invalid session state=%u active=%u",
+            (unsigned int)session->state,
+            session->active);
+
+        result = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+
+    /*
+        Never verify a proof from an expired pairing
+        attempt.
+    */
+    if (mathos_pairing_session_has_timed_out(
+            session))
+    {
+        ESP_LOGW(
+            TAG,
+            "Gateway pairing response rejected: "
+            "session timed out");
+
+        mathos_pairing_session_reset(
+            session);
+
+        result = ESP_ERR_TIMEOUT;
+        goto cleanup;
+    }
+
+    /*
+        Only a fully validated and provisioned Gateway
+        configuration may authenticate an RC.
+    */
+    if (!mathos_gateway_config_is_valid(
+            gateway_config))
+    {
+        ESP_LOGE(
+            TAG,
+            "Gateway pairing response rejected: "
+            "invalid Gateway configuration");
+
+        mathos_pairing_session_reset(
+            session);
+
+        result = ESP_ERR_INVALID_ARG;
+        goto cleanup;
+    }
+
+    if (gateway_config->key_generation == 0)
+    {
+        ESP_LOGW(
+            TAG,
+            "Gateway pairing response rejected: "
+            "Gateway key is not provisioned");
+
+        mathos_pairing_session_reset(
+            session);
+
+        result = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+
+    /*
+        Every record involved in the exchange must still
+        pass its own structural and CRC validation.
+    */
+    if (!mathos_pairing_package_is_valid(
+            &session->package) ||
+        !mathos_pairing_challenge_is_valid(
+            &session->challenge) ||
+        !mathos_pairing_proof_is_valid(
+            &session->rc_proof))
+    {
+        ESP_LOGE(
+            TAG,
+            "Gateway pairing response rejected: "
+            "invalid session record");
+
+        mathos_pairing_session_reset(
+            session);
+
+        result = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+
+    /*
+        Confirm that the pairing package still describes
+        this exact Gateway configuration.
+    */
+    if (session->package.rc_id !=
+            gateway_config->authorised_rc_id ||
+        session->package.gateway_id !=
+            gateway_config->gateway_id ||
+        session->package.key_generation !=
+            gateway_config->key_generation ||
+        session->package.key_derivation_method !=
+            gateway_config->key_derivation_method ||
+        session->package.kdf_iteration_count !=
+            gateway_config->kdf_iteration_count ||
+        memcmp(
+            session->package.pairing_salt,
+            gateway_config->pairing_salt,
+            sizeof(session->package.pairing_salt)) != 0)
+    {
+        ESP_LOGE(
+            TAG,
+            "Gateway pairing response rejected: "
+            "Gateway configuration does not match package");
+
+        mathos_pairing_session_reset(
+            session);
+
+        result = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+
+    /*
+        Confirm that the package, challenge and session
+        all belong to the same generation and identities.
+    */
+    if (session->key_generation !=
+            gateway_config->key_generation ||
+        session->challenge.key_generation !=
+            gateway_config->key_generation ||
+        session->challenge.rc_id !=
+            gateway_config->authorised_rc_id ||
+        session->challenge.gateway_id !=
+            gateway_config->gateway_id)
+    {
+        ESP_LOGE(
+            TAG,
+            "Gateway pairing response rejected: "
+            "session metadata mismatch");
+
+        mathos_pairing_session_reset(
+            session);
+
+        result = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+
+    /*
+        Verify the role-1 proof using the Gateway's own
+        root key.
+
+        A successful result proves that the RC derived the
+        same root key without transmitting that key.
+    */
+    result =
+        mathos_pairing_proof_verify(
+            gateway_config->root_key,
+            &session->challenge,
+            &session->rc_proof,
+            MATHOS_PAIRING_PROOF_ROLE_RC);
+
+    if (result != ESP_OK)
+    {
+        ESP_LOGW(
+            TAG,
+            "Gateway rejected RC pairing proof");
+
+        goto attempt_failed;
+    }
+
+    session->state =
+        MATHOS_PAIRING_SESSION_RC_PROOF_VERIFIED;
+
+    /*
+        Create the role-2 Gateway confirmation proof.
+
+        Role separation prevents the received RC proof
+        from being reflected back as a valid confirmation.
+    */
+    result =
+        mathos_pairing_proof_create(
+            gateway_config->root_key,
+            &session->challenge,
+            MATHOS_PAIRING_PROOF_ROLE_GATEWAY,
+            &candidate_gateway_proof);
+
+    if (result != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Gateway confirmation proof generation failed: %s",
+            esp_err_to_name(result));
+
+        mathos_pairing_session_reset(
+            session);
+
+        goto cleanup;
+    }
+
+    if (!mathos_pairing_proof_is_valid(
+            &candidate_gateway_proof))
+    {
+        ESP_LOGE(
+            TAG,
+            "Gateway confirmation proof failed validation");
+
+        mathos_pairing_session_reset(
+            session);
+
+        result = ESP_FAIL;
+        goto cleanup;
+    }
+
+    /*
+        Publish the confirmation only after RC proof
+        verification and Gateway proof generation succeed.
+    */
+    session->gateway_proof =
+        candidate_gateway_proof;
+
+    session->state =
+        MATHOS_PAIRING_SESSION_GATEWAY_PROOF_READY;
+
+    ESP_LOGI(
+        TAG,
+        "Gateway pairing response prepared "
+        "rc_id=%u gateway_id=%u "
+        "key_generation=%lu state=%u",
+        session->gateway_proof.rc_id,
+        session->gateway_proof.gateway_id,
+        (unsigned long)
+            session->gateway_proof.key_generation,
+        (unsigned int)
+            session->state);
+
+    result = ESP_OK;
+    goto cleanup;
+
+attempt_failed:
+
+    /*
+        Remove the rejected candidate and RC proof before
+        allowing another passphrase attempt.
+
+        The public package and challenge remain available
+        until the retry limit or session timeout is reached.
+    */
+    maintenance_clear_sensitive_memory(
+        &session->rc_candidate,
+        sizeof(session->rc_candidate));
+
+    mathos_rc_pairing_config_set_defaults(
+        &session->rc_candidate);
+
+    maintenance_clear_sensitive_memory(
+        &session->rc_proof,
+        sizeof(session->rc_proof));
+
+    mathos_pairing_proof_set_defaults(
+        &session->rc_proof);
+
+    if (mathos_pairing_session_register_failure(
+            session))
+    {
+        session->state =
+            MATHOS_PAIRING_SESSION_CHALLENGE_READY;
+
+        ESP_LOGI(
+            TAG,
+            "pairing session returned to "
+            "CHALLENGE_READY after rejected RC proof");
+    }
+
+cleanup:
+
+    /*
+        The temporary proof contains authentication
+        material derived from the Gateway root key.
+    */
+    maintenance_clear_sensitive_memory(
+        &candidate_gateway_proof,
+        sizeof(candidate_gateway_proof));
+
+    return result;
+}
+static esp_err_t maintenance_run_pairing_bench_self_test(
+    void)
+{
+    /*
+        This passphrase exists only for the temporary
+        bench self-test.
+
+        It is never written to NVS or transmitted.
+    */
+    char test_passphrase[] =
+        "MATHOS-BENCH-SELFTEST-2026";
+
+    char wrong_test_passphrase[] =
+        "MATHOS-WRONG-SELFTEST-2026";
+
+    mathos_gateway_config_t gateway_config = {0};
+
+    mathos_rc_pairing_config_t current_rc_config = {0};
+
+    mathos_pairing_package_t package = {0};
+
+    mathos_pairing_session_t session = {0};
+
+    esp_err_t result = ESP_OK;
+
+    ESP_LOGI(
+        TAG,
+        "PAIRING SELF-TEST START");
+
+    /*
+        Build a fresh, provisioned Gateway configuration
+        entirely in RAM.
+    */
+    mathos_gateway_config_set_defaults(
+        &gateway_config);
+
+    result =
+        mathos_maintenance_generate_pairing_salt(
+            gateway_config.pairing_salt);
+
+    if (result != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "PAIRING SELF-TEST FAIL: "
+            "salt generation");
+
+        goto cleanup;
+    }
+
+    /*
+        Use the minimum permitted iteration count for this
+        temporary startup test.
+
+        The production default of 100,000 iterations has
+        already been measured separately.
+    */
+    gateway_config.kdf_iteration_count =
+        MATHOS_PAIRING_KDF_MIN_ITERATIONS;
+
+    result =
+        mathos_maintenance_derive_root_key_from_passphrase(
+            test_passphrase,
+            gateway_config.pairing_salt,
+            gateway_config.kdf_iteration_count,
+            gateway_config.root_key);
+
+    if (result != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "PAIRING SELF-TEST FAIL: "
+            "Gateway key derivation");
+
+        goto cleanup;
+    }
+
+    gateway_config.key_derivation_method =
+        MATHOS_GATEWAY_KEY_DERIVATION_PBKDF2_SHA256;
+
+    gateway_config.key_generation = 1;
+
+    gateway_config.crc32 = 0;
+
+    gateway_config.crc32 =
+        mathos_gateway_config_calculate_crc32(
+            &gateway_config);
+
+    if (!mathos_gateway_config_is_valid(
+            &gateway_config))
+    {
+        ESP_LOGE(
+            TAG,
+            "PAIRING SELF-TEST FAIL: "
+            "Gateway configuration validation");
+
+        result = ESP_FAIL;
+        goto cleanup;
+    }
+
+    /*
+        Begin with a valid unpaired RC configuration.
+    */
+    mathos_rc_pairing_config_set_defaults(
+        &current_rc_config);
+
+    /*
+        Export the Gateway's public pairing parameters.
+
+        The package contains no root key.
+    */
+    result =
+        mathos_pairing_package_from_gateway_config(
+            &gateway_config,
+            &package);
+
+    if (result != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "PAIRING SELF-TEST FAIL: "
+            "package creation");
+
+        goto cleanup;
+    }
+
+    /*
+        Create a fresh challenge and start the controlled
+        pairing session.
+    */
+    mathos_pairing_session_set_defaults(
+        &session);
+
+    result =
+        mathos_pairing_session_start(
+            &session,
+            &package);
+
+    if (result != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "PAIRING SELF-TEST FAIL: "
+            "session start");
+
+        goto cleanup;
+    }
+    /*
+        First test the hostile path.
+
+        The RC can derive a key and create a structurally
+        valid proof using the wrong passphrase, but the
+        Gateway must reject that proof because its HMAC
+        will not match.
+    */
+    result =
+        mathos_pairing_session_prepare_rc_response(
+            &session,
+            &current_rc_config,
+            wrong_test_passphrase);
+
+    if (result != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "PAIRING SELF-TEST FAIL: "
+            "wrong-passphrase RC proof preparation");
+
+        goto cleanup;
+    }
+
+    /*
+        Gateway verification must fail here.
+
+        Returning ESP_OK would mean the wrong passphrase
+        was incorrectly accepted.
+    */
+    result =
+        mathos_pairing_session_prepare_gateway_response(
+            &session,
+            &gateway_config);
+
+    if (result == ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "PAIRING SELF-TEST FAIL: "
+            "wrong passphrase was accepted");
+
+        result = ESP_FAIL;
+        goto cleanup;
+    }
+
+    /*
+        After the first rejected proof, the session should
+        remain active and return to CHALLENGE_READY so the
+        operator may retry.
+
+        The retry counter must now equal one.
+    */
+    if (!session.active ||
+        session.state !=
+            MATHOS_PAIRING_SESSION_CHALLENGE_READY ||
+        session.retry_count != 1U)
+    {
+        ESP_LOGE(
+            TAG,
+            "PAIRING SELF-TEST FAIL: "
+            "wrong-passphrase recovery state "
+            "active=%u state=%u retry=%u",
+            session.active,
+            (unsigned int)session.state,
+            session.retry_count);
+
+        result = ESP_FAIL;
+        goto cleanup;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "PAIRING WRONG-PASSPHRASE REJECTION PASSED "
+        "retry=%u state=%u",
+        session.retry_count,
+        (unsigned int)session.state);
+
+    /*
+        The rejection above intentionally returned an error.
+
+        Clear that expected result before continuing with
+        the correct passphrase.
+    */
+    result = ESP_OK;
+    /*
+        The RC derives its candidate key from the same
+        passphrase and creates the role-1 proof.
+    */
+    result =
+        mathos_pairing_session_prepare_rc_response(
+            &session,
+            &current_rc_config,
+            test_passphrase);
+
+    if (result != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "PAIRING SELF-TEST FAIL: "
+            "RC response preparation");
+
+        goto cleanup;
+    }
+    /*
+        Tamper with one HMAC byte after a completely valid
+        RC proof has been created.
+
+        Recalculate the CRC so the record remains
+        structurally valid. The Gateway must reject it
+        because the cryptographic HMAC is wrong.
+    */
+    session.rc_proof.proof[0] ^=
+        0x01U;
+
+    session.rc_proof.crc32 = 0;
+
+    session.rc_proof.crc32 =
+        mathos_pairing_proof_calculate_crc32(
+            &session.rc_proof);
+
+    /*
+        Confirm that CRC and structural validation still pass.
+
+        This ensures the following rejection is caused by
+        HMAC authentication, not by packet corruption rules.
+    */
+    if (!mathos_pairing_proof_is_valid(
+            &session.rc_proof))
+    {
+        ESP_LOGE(
+            TAG,
+            "PAIRING SELF-TEST FAIL: "
+            "tampered proof is not structurally valid");
+
+        result = ESP_FAIL;
+        goto cleanup;
+    }
+
+    /*
+        The Gateway must reject the altered HMAC.
+    */
+    result =
+        mathos_pairing_session_prepare_gateway_response(
+            &session,
+            &gateway_config);
+
+    if (result == ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "PAIRING SELF-TEST FAIL: "
+            "tampered proof was accepted");
+
+        result = ESP_FAIL;
+        goto cleanup;
+    }
+
+    /*
+        This is the second expected failure:
+
+            retry 1 = wrong passphrase
+            retry 2 = tampered proof
+
+        The session must remain available for one final
+        correct attempt.
+    */
+    if (!session.active ||
+        session.state !=
+            MATHOS_PAIRING_SESSION_CHALLENGE_READY ||
+        session.retry_count != 2U)
+    {
+        ESP_LOGE(
+            TAG,
+            "PAIRING SELF-TEST FAIL: "
+            "tampered-proof recovery state "
+            "active=%u state=%u retry=%u",
+            session.active,
+            (unsigned int)session.state,
+            session.retry_count);
+
+        result = ESP_FAIL;
+        goto cleanup;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "PAIRING TAMPERED-PROOF REJECTION PASSED "
+        "retry=%u state=%u",
+        session.retry_count,
+        (unsigned int)session.state);
+
+    /*
+        The Gateway rejection was expected.
+    */
+    result = ESP_OK;
+    /*
+        The Gateway verifies the RC proof and creates its
+        role-2 confirmation proof.
+    */
+    /*
+     Recreate the RC candidate and proof after the
+     deliberately tampered attempt was rejected.
+ */
+    result =
+        mathos_pairing_session_prepare_rc_response(
+            &session,
+            &current_rc_config,
+            test_passphrase);
+
+    if (result != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "PAIRING SELF-TEST FAIL: "
+            "RC response recreation after tamper");
+
+        goto cleanup;
+    }
+    result =
+        mathos_pairing_session_prepare_gateway_response(
+            &session,
+            &gateway_config);
+
+    if (result != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "PAIRING SELF-TEST FAIL: "
+            "Gateway response preparation");
+
+        goto cleanup;
+    }
+
+    /*
+        The RC verifies the Gateway confirmation using
+        only its candidate key.
+    */
+    result =
+        mathos_pairing_proof_verify(
+            session.rc_candidate.root_key,
+            &session.challenge,
+            &session.gateway_proof,
+            MATHOS_PAIRING_PROOF_ROLE_GATEWAY);
+
+    if (result != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "PAIRING SELF-TEST FAIL: "
+            "Gateway confirmation verification");
+
+        goto cleanup;
+    }
+
+    session.state =
+        MATHOS_PAIRING_SESSION_GATEWAY_PROOF_VERIFIED;
+
+    /*
+        Confirm independently that both sides derived the
+        same complete 256-bit root key.
+    */
+    uint8_t key_mismatch = 0;
+
+    for (size_t i = 0;
+         i < MATHOS_GATEWAY_ROOT_KEY_LEN;
+         i++)
+    {
+        key_mismatch |=
+            (uint8_t)(gateway_config.root_key[i] ^
+                      session.rc_candidate.root_key[i]);
+    }
+
+    if (key_mismatch != 0)
+    {
+        ESP_LOGE(
+            TAG,
+            "PAIRING SELF-TEST FAIL: "
+            "derived root keys differ");
+
+        result = ESP_FAIL;
+        goto cleanup;
+    }
+
+    session.state =
+        MATHOS_PAIRING_SESSION_COMMIT_READY;
+
+    ESP_LOGI(
+        TAG,
+        "PAIRING SELF-TEST PASSED "
+        "rc_id=%u gateway_id=%u "
+        "key_generation=%lu state=%u",
+        session.rc_candidate.rc_id,
+        session.rc_candidate.authorised_gateway_id,
+        (unsigned long)
+            session.rc_candidate.key_generation,
+        (unsigned int)
+            session.state);
+
+    result = ESP_OK;
+
+cleanup:
+
+    /*
+        The test deliberately persists nothing.
+
+        Remove all passphrase, key, salt, challenge and
+        proof material before returning.
+    */
+    maintenance_clear_sensitive_memory(
+        test_passphrase,
+        sizeof(test_passphrase));
+
+    maintenance_clear_sensitive_memory(
+        wrong_test_passphrase,
+        sizeof(wrong_test_passphrase));
+
+    maintenance_clear_sensitive_memory(
+        &gateway_config,
+        sizeof(gateway_config));
+
+    maintenance_clear_sensitive_memory(
+        &current_rc_config,
+        sizeof(current_rc_config));
+
+    maintenance_clear_sensitive_memory(
+        &package,
+        sizeof(package));
+
+    maintenance_clear_sensitive_memory(
+        &session,
+        sizeof(session));
+
+    if (result != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "PAIRING SELF-TEST FINAL RESULT: FAILED");
+    }
+
+    return result;
+}
+
+int mathos_pairing_proof_is_valid(
+    const mathos_pairing_proof_t *proof)
+{
+    if (proof == NULL)
+    {
+        return 0;
+    }
+
+    if (proof->magic !=
+        MATHOS_PAIRING_PROOF_MAGIC)
+    {
+        return 0;
+    }
+
+    if (proof->version !=
+        MATHOS_PAIRING_PROOF_VERSION)
+    {
+        return 0;
+    }
+
+    if (proof->record_size !=
+        sizeof(mathos_pairing_proof_t))
+    {
+        return 0;
+    }
+
+    /*
+        Device identities must use values
+        from 1 through 254.
+    */
+    if (proof->rc_id == 0 ||
+        proof->rc_id == UINT8_MAX)
+    {
+        return 0;
+    }
+
+    if (proof->gateway_id == 0 ||
+        proof->gateway_id == UINT8_MAX)
+    {
+        return 0;
+    }
+
+    if (proof->rc_id ==
+        proof->gateway_id)
+    {
+        return 0;
+    }
+
+    /*
+        Reserved version-1 fields must remain zero.
+    */
+    if (proof->reserved0 != 0)
+    {
+        return 0;
+    }
+
+    int nonce_is_set = 0;
+    int proof_bytes_are_set = 0;
+
+    for (size_t i = 0;
+         i < sizeof(proof->nonce);
+         i++)
+    {
+        if (proof->nonce[i] != 0)
+        {
+            nonce_is_set = 1;
+            break;
+        }
+    }
+
+    for (size_t i = 0;
+         i < sizeof(proof->proof);
+         i++)
+    {
+        if (proof->proof[i] != 0)
+        {
+            proof_bytes_are_set = 1;
+            break;
+        }
+    }
+
+    /*
+        Generation zero represents an empty proof.
+
+        No role, nonce or HMAC bytes may exist in this
+        inactive state.
+    */
+    if (proof->key_generation == 0)
+    {
+        if (proof->proof_role != 0 ||
+            nonce_is_set ||
+            proof_bytes_are_set)
+        {
+            return 0;
+        }
+    }
+    else
+    {
+        /*
+            A real proof must identify which side
+            generated it.
+        */
+        if (proof->proof_role !=
+                MATHOS_PAIRING_PROOF_ROLE_RC &&
+            proof->proof_role !=
+                MATHOS_PAIRING_PROOF_ROLE_GATEWAY)
+        {
+            return 0;
+        }
+
+        if (!nonce_is_set ||
+            !proof_bytes_are_set)
+        {
+            return 0;
+        }
+    }
+
+    /*
+        Verify accidental-corruption protection last.
+    */
+    uint32_t expected_crc =
+        mathos_pairing_proof_calculate_crc32(
+            proof);
+
+    if (proof->crc32 != expected_crc)
+    {
+        return 0;
+    }
+
+    return 1;
+}
+esp_err_t mathos_pairing_proof_create(
+    const uint8_t root_key[MATHOS_GATEWAY_ROOT_KEY_LEN],
+    const mathos_pairing_challenge_t *challenge,
+    uint8_t proof_role,
+    mathos_pairing_proof_t *proof)
+{
+    if (root_key == NULL ||
+        challenge == NULL ||
+        proof == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Begin with a valid empty proof.
+
+        If any operation fails, the caller will not receive
+        stale or partially generated authentication data.
+    */
+    mathos_pairing_proof_set_defaults(
+        proof);
+
+    /*
+        Only a complete, active challenge may be
+        authenticated.
+    */
+    if (!mathos_pairing_challenge_is_valid(
+            challenge))
+    {
+        ESP_LOGE(
+            TAG,
+            "pairing proof creation rejected: "
+            "invalid challenge");
+
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (challenge->key_generation == 0)
+    {
+        ESP_LOGW(
+            TAG,
+            "pairing proof creation rejected: "
+            "challenge is inactive");
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+        The proof role prevents an RC proof from being
+        reused as a Gateway confirmation, or vice versa.
+    */
+    if (proof_role !=
+            MATHOS_PAIRING_PROOF_ROLE_RC &&
+        proof_role !=
+            MATHOS_PAIRING_PROOF_ROLE_GATEWAY)
+    {
+        ESP_LOGE(
+            TAG,
+            "pairing proof creation rejected: "
+            "invalid proof role=%u",
+            proof_role);
+
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        An all-zero root key represents the unprovisioned
+        state and must never authenticate a challenge.
+    */
+    int root_key_is_set = 0;
+
+    for (size_t i = 0;
+         i < MATHOS_GATEWAY_ROOT_KEY_LEN;
+         i++)
+    {
+        if (root_key[i] != 0)
+        {
+            root_key_is_set = 1;
+            break;
+        }
+    }
+
+    if (!root_key_is_set)
+    {
+        ESP_LOGW(
+            TAG,
+            "pairing proof creation rejected: "
+            "root key is not provisioned");
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+        Build a fixed byte sequence for HMAC.
+
+        Do not authenticate a raw C structure because
+        compiler padding and CPU byte order could differ
+        between future implementations.
+    */
+    uint8_t authenticated_data[4U +
+                               1U +
+                               1U +
+                               1U +
+                               1U +
+                               4U +
+                               MATHOS_PAIRING_NONCE_LEN] = {0};
+
+    size_t offset = 0;
+
+    /*
+        Domain separator: "MPR1"
+
+        This ensures the HMAC cannot be confused with
+        another MATHOS protocol message.
+    */
+    authenticated_data[offset++] = 'M';
+    authenticated_data[offset++] = 'P';
+    authenticated_data[offset++] = 'R';
+    authenticated_data[offset++] = '1';
+
+    authenticated_data[offset++] =
+        proof_role;
+
+    authenticated_data[offset++] =
+        challenge->rc_id;
+
+    authenticated_data[offset++] =
+        challenge->gateway_id;
+
+    authenticated_data[offset++] =
+        MATHOS_PAIRING_PROOF_VERSION;
+
+    /*
+        Encode the generation explicitly in big-endian
+        byte order.
+    */
+    authenticated_data[offset++] =
+        (uint8_t)(challenge->key_generation >> 24);
+
+    authenticated_data[offset++] =
+        (uint8_t)(challenge->key_generation >> 16);
+
+    authenticated_data[offset++] =
+        (uint8_t)(challenge->key_generation >> 8);
+
+    authenticated_data[offset++] =
+        (uint8_t)
+            challenge->key_generation;
+
+    memcpy(
+        &authenticated_data[offset],
+        challenge->nonce,
+        MATHOS_PAIRING_NONCE_LEN);
+
+    offset +=
+        MATHOS_PAIRING_NONCE_LEN;
+
+    if (offset != sizeof(authenticated_data))
+    {
+        ESP_LOGE(
+            TAG,
+            "pairing proof authenticated-data "
+            "length mismatch");
+
+        maintenance_clear_sensitive_memory(
+            authenticated_data,
+            sizeof(authenticated_data));
+
+        return ESP_FAIL;
+    }
+
+    const mbedtls_md_info_t *sha256_info =
+        mbedtls_md_info_from_type(
+            MBEDTLS_MD_SHA256);
+
+    if (sha256_info == NULL)
+    {
+        ESP_LOGE(
+            TAG,
+            "pairing proof SHA-256 implementation "
+            "is unavailable");
+
+        maintenance_clear_sensitive_memory(
+            authenticated_data,
+            sizeof(authenticated_data));
+
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    proof->rc_id =
+        challenge->rc_id;
+
+    proof->gateway_id =
+        challenge->gateway_id;
+
+    proof->proof_role =
+        proof_role;
+
+    proof->reserved0 = 0;
+
+    proof->key_generation =
+        challenge->key_generation;
+
+    memcpy(
+        proof->nonce,
+        challenge->nonce,
+        sizeof(proof->nonce));
+
+    int hmac_result =
+        mbedtls_md_hmac(
+            sha256_info,
+            root_key,
+            MATHOS_GATEWAY_ROOT_KEY_LEN,
+            authenticated_data,
+            sizeof(authenticated_data),
+            proof->proof);
+
+    maintenance_clear_sensitive_memory(
+        authenticated_data,
+        sizeof(authenticated_data));
+
+    if (hmac_result != 0)
+    {
+        ESP_LOGE(
+            TAG,
+            "pairing proof HMAC generation failed: "
+            "-0x%04X",
+            (unsigned int)(-hmac_result));
+
+        mathos_pairing_proof_set_defaults(
+            proof);
+
+        return ESP_FAIL;
+    }
+
+    /*
+        An all-zero HMAC is treated as invalid even though
+        a legitimate SHA-256 HMAC producing this value is
+        practically impossible.
+    */
+    int proof_is_set = 0;
+
+    for (size_t i = 0;
+         i < sizeof(proof->proof);
+         i++)
+    {
+        if (proof->proof[i] != 0)
+        {
+            proof_is_set = 1;
+            break;
+        }
+    }
+
+    if (!proof_is_set)
+    {
+        ESP_LOGE(
+            TAG,
+            "pairing proof HMAC is unexpectedly zero");
+
+        mathos_pairing_proof_set_defaults(
+            proof);
+
+        return ESP_FAIL;
+    }
+
+    proof->crc32 = 0;
+
+    proof->crc32 =
+        mathos_pairing_proof_calculate_crc32(
+            proof);
+
+    if (!mathos_pairing_proof_is_valid(
+            proof))
+    {
+        ESP_LOGE(
+            TAG,
+            "generated pairing proof failed validation");
+
+        mathos_pairing_proof_set_defaults(
+            proof);
+
+        return ESP_FAIL;
+    }
+
+    /*
+        Never log the HMAC, nonce or root key.
+    */
+    ESP_LOGI(
+        TAG,
+        "pairing proof created "
+        "role=%u rc_id=%u gateway_id=%u "
+        "key_generation=%lu crc=0x%08lx",
+        proof->proof_role,
+        proof->rc_id,
+        proof->gateway_id,
+        (unsigned long)
+            proof->key_generation,
+        (unsigned long)
+            proof->crc32);
+
+    return ESP_OK;
+}
+
+esp_err_t mathos_pairing_proof_verify(
+    const uint8_t root_key[MATHOS_GATEWAY_ROOT_KEY_LEN],
+    const mathos_pairing_challenge_t *challenge,
+    const mathos_pairing_proof_t *proof,
+    uint8_t expected_proof_role)
+{
+    if (root_key == NULL ||
+        challenge == NULL ||
+        proof == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    mathos_pairing_proof_t expected_proof = {0};
+
+    esp_err_t result = ESP_OK;
+
+    /*
+        Only the two defined pairing-proof roles may
+        be requested.
+    */
+    if (expected_proof_role !=
+            MATHOS_PAIRING_PROOF_ROLE_RC &&
+        expected_proof_role !=
+            MATHOS_PAIRING_PROOF_ROLE_GATEWAY)
+    {
+        ESP_LOGE(
+            TAG,
+            "pairing proof verification rejected: "
+            "invalid expected role=%u",
+            expected_proof_role);
+
+        result = ESP_ERR_INVALID_ARG;
+        goto cleanup;
+    }
+
+    /*
+        Validate both records before comparing their
+        identities, generation or nonce.
+    */
+    if (!mathos_pairing_challenge_is_valid(
+            challenge))
+    {
+        ESP_LOGW(
+            TAG,
+            "pairing proof verification rejected: "
+            "invalid challenge");
+
+        result = ESP_ERR_INVALID_ARG;
+        goto cleanup;
+    }
+
+    if (challenge->key_generation == 0)
+    {
+        ESP_LOGW(
+            TAG,
+            "pairing proof verification rejected: "
+            "challenge is inactive");
+
+        result = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+
+    if (!mathos_pairing_proof_is_valid(
+            proof))
+    {
+        ESP_LOGW(
+            TAG,
+            "pairing proof verification rejected: "
+            "invalid proof record");
+
+        result = ESP_ERR_INVALID_ARG;
+        goto cleanup;
+    }
+
+    /*
+        An RC proof cannot be accepted as a Gateway
+        confirmation, or vice versa.
+    */
+    if (proof->proof_role !=
+        expected_proof_role)
+    {
+        ESP_LOGW(
+            TAG,
+            "pairing proof verification rejected: "
+            "role mismatch expected=%u received=%u",
+            expected_proof_role,
+            proof->proof_role);
+
+        result = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+
+    /*
+        The proof must belong to the exact challenge
+        identities and key generation.
+    */
+    if (proof->rc_id !=
+            challenge->rc_id ||
+        proof->gateway_id !=
+            challenge->gateway_id ||
+        proof->key_generation !=
+            challenge->key_generation)
+    {
+        ESP_LOGW(
+            TAG,
+            "pairing proof verification rejected: "
+            "challenge metadata mismatch");
+
+        result = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+
+    /*
+        The response must echo the exact random nonce
+        generated for this pairing attempt.
+    */
+    if (memcmp(
+            proof->nonce,
+            challenge->nonce,
+            sizeof(proof->nonce)) != 0)
+    {
+        ESP_LOGW(
+            TAG,
+            "pairing proof verification rejected: "
+            "challenge nonce mismatch");
+
+        result = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+
+    /*
+        Recreate the expected HMAC using the supplied
+        root key, challenge and expected role.
+    */
+    result =
+        mathos_pairing_proof_create(
+            root_key,
+            challenge,
+            expected_proof_role,
+            &expected_proof);
+
+    if (result != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "pairing proof verification failed: "
+            "expected proof could not be generated");
+
+        goto cleanup;
+    }
+
+    /*
+        Compare every HMAC byte.
+
+        Do not stop when the first mismatch is found.
+    */
+    uint8_t proof_mismatch = 0;
+
+    for (size_t i = 0;
+         i < MATHOS_PAIRING_PROOF_LEN;
+         i++)
+    {
+        proof_mismatch |=
+            (uint8_t)(proof->proof[i] ^
+                      expected_proof.proof[i]);
+    }
+
+    if (proof_mismatch != 0)
+    {
+        ESP_LOGW(
+            TAG,
+            "pairing proof verification rejected: "
+            "HMAC mismatch");
+
+        result = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+
+    /*
+        Never log the HMAC, nonce or root key.
+    */
+    ESP_LOGI(
+        TAG,
+        "pairing proof verified "
+        "role=%u rc_id=%u gateway_id=%u "
+        "key_generation=%lu",
+        proof->proof_role,
+        proof->rc_id,
+        proof->gateway_id,
+        (unsigned long)
+            proof->key_generation);
+
+    result = ESP_OK;
+
+cleanup:
+
+    /*
+        The temporary record contains authentication
+        material generated using the root key.
+    */
+    maintenance_clear_sensitive_memory(
+        &expected_proof,
+        sizeof(expected_proof));
+
+    return result;
+}
+
+int mathos_pairing_challenge_is_valid(
+    const mathos_pairing_challenge_t *challenge)
+{
+    if (challenge == NULL)
+    {
+        return 0;
+    }
+
+    if (challenge->magic !=
+        MATHOS_PAIRING_CHALLENGE_MAGIC)
+    {
+        return 0;
+    }
+
+    if (challenge->version !=
+        MATHOS_PAIRING_CHALLENGE_VERSION)
+    {
+        return 0;
+    }
+
+    if (challenge->record_size !=
+        sizeof(mathos_pairing_challenge_t))
+    {
+        return 0;
+    }
+
+    /*
+        Device identities must use values 1 through 254.
+    */
+    if (challenge->rc_id == 0 ||
+        challenge->rc_id == UINT8_MAX)
+    {
+        return 0;
+    }
+
+    if (challenge->gateway_id == 0 ||
+        challenge->gateway_id == UINT8_MAX)
+    {
+        return 0;
+    }
+
+    if (challenge->rc_id ==
+        challenge->gateway_id)
+    {
+        return 0;
+    }
+
+    /*
+        Reserved version-1 bytes must remain zero.
+    */
+    for (size_t i = 0;
+         i < sizeof(challenge->reserved0);
+         i++)
+    {
+        if (challenge->reserved0[i] != 0)
+        {
+            return 0;
+        }
+    }
+
+    int nonce_is_set = 0;
+
+    for (size_t i = 0;
+         i < sizeof(challenge->nonce);
+         i++)
+    {
+        if (challenge->nonce[i] != 0)
+        {
+            nonce_is_set = 1;
+            break;
+        }
+    }
+
+    /*
+        Generation zero is the empty challenge state.
+
+        A real challenge requires both a positive generation
+        and a nonzero nonce.
+    */
+    if (challenge->key_generation == 0)
+    {
+        if (nonce_is_set)
+        {
+            return 0;
+        }
+    }
+    else
+    {
+        if (!nonce_is_set)
+        {
+            return 0;
+        }
+    }
+
+    uint32_t expected_crc =
+        mathos_pairing_challenge_calculate_crc32(
+            challenge);
+
+    if (challenge->crc32 != expected_crc)
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
+esp_err_t mathos_pairing_challenge_from_package(
+    const mathos_pairing_package_t *package,
+    mathos_pairing_challenge_t *challenge)
+{
+    if (package == NULL ||
+        challenge == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Always begin with a valid empty challenge.
+
+        If generation fails, no partial nonce or stale
+        pairing information remains in the output.
+    */
+    mathos_pairing_challenge_set_defaults(
+        challenge);
+
+    /*
+        Only a completely valid pairing package may
+        create a challenge.
+    */
+    if (!mathos_pairing_package_is_valid(
+            package))
+    {
+        ESP_LOGE(
+            TAG,
+            "pairing challenge creation rejected: "
+            "invalid pairing package");
+
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Generation zero represents an empty package,
+        not an active pairing request.
+    */
+    if (package->key_generation == 0)
+    {
+        ESP_LOGW(
+            TAG,
+            "pairing challenge creation rejected: "
+            "pairing package is empty");
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    challenge->rc_id =
+        package->rc_id;
+
+    challenge->gateway_id =
+        package->gateway_id;
+
+    challenge->key_generation =
+        package->key_generation;
+
+    memset(
+        challenge->reserved0,
+        0,
+        sizeof(challenge->reserved0));
+
+    /*
+        An all-zero nonce is reserved for the inactive
+        challenge state.
+
+        Retry explicitly, even though sixteen random zero
+        bytes are extraordinarily unlikely.
+    */
+    int nonce_generated = 0;
+
+    for (uint32_t attempt = 0;
+         attempt < 4U;
+         attempt++)
+    {
+        esp_fill_random(
+            challenge->nonce,
+            sizeof(challenge->nonce));
+
+        for (size_t i = 0;
+             i < sizeof(challenge->nonce);
+             i++)
+        {
+            if (challenge->nonce[i] != 0)
+            {
+                nonce_generated = 1;
+                break;
+            }
+        }
+
+        if (nonce_generated)
+        {
+            break;
+        }
+    }
+
+    if (!nonce_generated)
+    {
+        ESP_LOGE(
+            TAG,
+            "pairing challenge nonce generation failed");
+
+        mathos_pairing_challenge_set_defaults(
+            challenge);
+
+        return ESP_FAIL;
+    }
+
+    challenge->crc32 = 0;
+
+    challenge->crc32 =
+        mathos_pairing_challenge_calculate_crc32(
+            challenge);
+
+    /*
+        Validate the finished challenge before exposing it
+        to the caller or transport layer.
+    */
+    if (!mathos_pairing_challenge_is_valid(
+            challenge))
+    {
+        ESP_LOGE(
+            TAG,
+            "generated pairing challenge failed validation");
+
+        mathos_pairing_challenge_set_defaults(
+            challenge);
+
+        return ESP_FAIL;
+    }
+
+    /*
+        The nonce is not secret, but it is deliberately not
+        printed to keep security logs compact.
+    */
+    ESP_LOGI(
+        TAG,
+        "pairing challenge created "
+        "rc_id=%u gateway_id=%u "
+        "key_generation=%lu crc=0x%08lx",
+        challenge->rc_id,
+        challenge->gateway_id,
+        (unsigned long)
+            challenge->key_generation,
+        (unsigned long)
+            challenge->crc32);
+
+    return ESP_OK;
+}
+
+int mathos_pairing_package_is_valid(
+    const mathos_pairing_package_t *package)
+{
+    if (package == NULL)
+    {
+        return 0;
+    }
+
+    /*
+        Confirm the expected pairing-package format.
+    */
+    if (package->magic !=
+        MATHOS_PAIRING_PACKAGE_MAGIC)
+    {
+        return 0;
+    }
+
+    if (package->version !=
+        MATHOS_PAIRING_PACKAGE_VERSION)
+    {
+        return 0;
+    }
+
+    if (package->record_size !=
+        sizeof(mathos_pairing_package_t))
+    {
+        return 0;
+    }
+
+    /*
+        Device identities must use the valid range
+        1 through 254.
+    */
+    if (package->rc_id == 0 ||
+        package->rc_id == UINT8_MAX)
+    {
+        return 0;
+    }
+
+    if (package->gateway_id == 0 ||
+        package->gateway_id == UINT8_MAX)
+    {
+        return 0;
+    }
+
+    /*
+        The two devices cannot share the same identity.
+    */
+    if (package->rc_id ==
+        package->gateway_id)
+    {
+        return 0;
+    }
+
+    /*
+        Reserved version-1 fields must remain zero.
+    */
+    if (package->reserved0 != 0)
+    {
+        return 0;
+    }
+
+    for (size_t i = 0;
+         i < sizeof(package->reserved1);
+         i++)
+    {
+        if (package->reserved1[i] != 0)
+        {
+            return 0;
+        }
+    }
+
+    /*
+        Determine whether the package contains a
+        nonzero pairing salt.
+    */
+    int pairing_salt_is_set = 0;
+
+    for (size_t i = 0;
+         i < sizeof(package->pairing_salt);
+         i++)
+    {
+        if (package->pairing_salt[i] != 0)
+        {
+            pairing_salt_is_set = 1;
+            break;
+        }
+    }
+
+    /*
+        Generation zero represents an empty package.
+
+        No derivation method, salt or iteration count
+        may exist in this state.
+    */
+    if (package->key_generation == 0)
+    {
+        if (package->key_derivation_method !=
+                MATHOS_GATEWAY_KEY_DERIVATION_NONE ||
+            package->kdf_iteration_count != 0 ||
+            pairing_salt_is_set)
+        {
+            return 0;
+        }
+    }
+
+    /*
+        A real pairing package currently supports only
+        PBKDF2-HMAC-SHA256.
+
+        RAW_HEX is not allowed because this package never
+        transports the root key itself.
+    */
+    else
+    {
+        if (package->key_derivation_method !=
+            MATHOS_GATEWAY_KEY_DERIVATION_PBKDF2_SHA256)
+        {
+            return 0;
+        }
+
+        if (!pairing_salt_is_set)
+        {
+            return 0;
+        }
+
+        if (package->kdf_iteration_count <
+                MATHOS_PAIRING_KDF_MIN_ITERATIONS ||
+            package->kdf_iteration_count >
+                MATHOS_PAIRING_KDF_MAX_ITERATIONS)
+        {
+            return 0;
+        }
+    }
+
+    /*
+        Verify package integrity last.
+    */
+    uint32_t expected_crc =
+        mathos_pairing_package_calculate_crc32(
+            package);
+
+    if (package->crc32 != expected_crc)
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
+esp_err_t mathos_pairing_package_from_gateway_config(
+    const mathos_gateway_config_t *gateway_config,
+    mathos_pairing_package_t *package)
+{
+    if (gateway_config == NULL ||
+        package == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Always begin with a valid empty package.
+
+        If conversion fails, the caller will not receive
+        stale or partially written pairing parameters.
+    */
+    mathos_pairing_package_set_defaults(
+        package);
+
+    /*
+        Only a completely valid Gateway configuration may
+        be used to create a pairing package.
+    */
+    if (!mathos_gateway_config_is_valid(
+            gateway_config))
+    {
+        ESP_LOGE(
+            TAG,
+            "pairing package creation rejected: "
+            "invalid Gateway configuration");
+
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        An unprovisioned Gateway has no real pairing offer.
+    */
+    if (gateway_config->key_generation == 0)
+    {
+        ESP_LOGW(
+            TAG,
+            "pairing package creation rejected: "
+            "Gateway key is not provisioned");
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+        A shared pairing package currently supports only
+        passphrase-derived PBKDF2 keys.
+
+        RAW_HEX cannot be exported because the package
+        deliberately contains no root key.
+    */
+    if (gateway_config->key_derivation_method !=
+        MATHOS_GATEWAY_KEY_DERIVATION_PBKDF2_SHA256)
+    {
+        ESP_LOGW(
+            TAG,
+            "pairing package creation rejected: "
+            "unsupported derivation method=%u",
+            gateway_config->key_derivation_method);
+
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    /*
+        Copy only the public pairing parameters required
+        by the RC to derive the same root key.
+    */
+    package->rc_id =
+        gateway_config->authorised_rc_id;
+
+    package->gateway_id =
+        gateway_config->gateway_id;
+
+    package->key_derivation_method =
+        gateway_config->key_derivation_method;
+
+    package->key_generation =
+        gateway_config->key_generation;
+
+    package->kdf_iteration_count =
+        gateway_config->kdf_iteration_count;
+
+    memcpy(
+        package->pairing_salt,
+        gateway_config->pairing_salt,
+        sizeof(package->pairing_salt));
+
+    /*
+        The Gateway root key is intentionally not copied.
+        mathos_pairing_package_t has no root-key field.
+    */
+
+    package->reserved0 = 0;
+
+    memset(
+        package->reserved1,
+        0,
+        sizeof(package->reserved1));
+
+    package->crc32 = 0;
+
+    package->crc32 =
+        mathos_pairing_package_calculate_crc32(
+            package);
+
+    /*
+        Validate the finished package before returning it
+        to the caller.
+    */
+    if (!mathos_pairing_package_is_valid(
+            package))
+    {
+        ESP_LOGE(
+            TAG,
+            "generated pairing package failed validation");
+
+        mathos_pairing_package_set_defaults(
+            package);
+
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "pairing package created "
+        "rc_id=%u gateway_id=%u "
+        "key_generation=%lu iterations=%lu "
+        "crc=0x%08lx",
+        package->rc_id,
+        package->gateway_id,
+        (unsigned long)
+            package->key_generation,
+        (unsigned long)
+            package->kdf_iteration_count,
+        (unsigned long)
+            package->crc32);
+
+    return ESP_OK;
+}
+
+esp_err_t mathos_rc_pairing_config_prepare_from_package(
+    const mathos_rc_pairing_config_t *current_config,
+    const mathos_pairing_package_t *package,
+    const char *passphrase,
+    mathos_rc_pairing_config_t *candidate_config)
+{
+    if (current_config == NULL ||
+        package == NULL ||
+        passphrase == NULL ||
+        candidate_config == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Build everything in temporary storage.
+
+        The caller's output configuration is modified only
+        after the complete candidate passes validation.
+    */
+    uint8_t derived_root_key[MATHOS_GATEWAY_ROOT_KEY_LEN] = {0};
+
+    mathos_rc_pairing_config_t candidate = {0};
+
+    esp_err_t result = ESP_OK;
+
+    /*
+        The existing RC record must already be valid.
+
+        This includes the safe unpaired default record.
+    */
+    if (!mathos_rc_pairing_config_is_valid(
+            current_config))
+    {
+        ESP_LOGE(
+            TAG,
+            "RC pairing candidate rejected: "
+            "current configuration is invalid");
+
+        result = ESP_ERR_INVALID_ARG;
+        goto cleanup;
+    }
+
+    /*
+        Never derive a key from an invalid or corrupted
+        pairing package.
+    */
+    if (!mathos_pairing_package_is_valid(
+            package))
+    {
+        ESP_LOGE(
+            TAG,
+            "RC pairing candidate rejected: "
+            "pairing package is invalid");
+
+        result = ESP_ERR_INVALID_ARG;
+        goto cleanup;
+    }
+
+    /*
+        Generation zero represents an empty package and
+        cannot create a provisioned RC configuration.
+    */
+    if (package->key_generation == 0)
+    {
+        ESP_LOGW(
+            TAG,
+            "RC pairing candidate rejected: "
+            "pairing package is empty");
+
+        result = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+
+    /*
+        Real shared pairing packages currently support
+        PBKDF2-HMAC-SHA256 only.
+    */
+    if (package->key_derivation_method !=
+        MATHOS_GATEWAY_KEY_DERIVATION_PBKDF2_SHA256)
+    {
+        ESP_LOGW(
+            TAG,
+            "RC pairing candidate rejected: "
+            "unsupported derivation method=%u",
+            package->key_derivation_method);
+
+        result = ESP_ERR_NOT_SUPPORTED;
+        goto cleanup;
+    }
+
+    /*
+        Reject an older key generation.
+
+        This prevents a previously captured pairing package
+        from rolling the RC back to an obsolete key.
+    */
+    if (current_config->key_generation != 0 &&
+        package->key_generation <
+            current_config->key_generation)
+    {
+        ESP_LOGW(
+            TAG,
+            "RC pairing candidate rejected: "
+            "generation rollback current=%lu received=%lu",
+            (unsigned long)
+                current_config->key_generation,
+            (unsigned long)
+                package->key_generation);
+
+        result = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+
+    /*
+        The same generation number must always refer to the
+        same identities, KDF parameters and salt.
+
+        A difference would indicate a generation collision
+        or a corrupted pairing workflow.
+    */
+    if (current_config->key_generation != 0 &&
+        package->key_generation ==
+            current_config->key_generation)
+    {
+        if (current_config->rc_id !=
+                package->rc_id ||
+            current_config->authorised_gateway_id !=
+                package->gateway_id ||
+            current_config->key_derivation_method !=
+                package->key_derivation_method ||
+            current_config->kdf_iteration_count !=
+                package->kdf_iteration_count ||
+            memcmp(
+                current_config->pairing_salt,
+                package->pairing_salt,
+                sizeof(package->pairing_salt)) != 0)
+        {
+            ESP_LOGW(
+                TAG,
+                "RC pairing candidate rejected: "
+                "same generation has different parameters");
+
+            result = ESP_ERR_INVALID_STATE;
+            goto cleanup;
+        }
+    }
+
+    /*
+        Derive the root key using exactly the salt and
+        iteration count supplied by the Gateway package.
+    */
+    result =
+        mathos_maintenance_derive_root_key_from_passphrase(
+            passphrase,
+            package->pairing_salt,
+            package->kdf_iteration_count,
+            derived_root_key);
+
+    if (result != ESP_OK)
+    {
+        ESP_LOGW(
+            TAG,
+            "RC pairing candidate rejected: "
+            "root-key derivation failed");
+
+        goto cleanup;
+    }
+
+    /*
+        When reprocessing the same generation, the derived
+        key must match the key already stored by the RC.
+
+        Compare every byte before deciding, rather than
+        returning at the first mismatch.
+    */
+    if (current_config->key_generation != 0 &&
+        package->key_generation ==
+            current_config->key_generation)
+    {
+        uint8_t key_mismatch = 0;
+
+        for (size_t i = 0;
+             i < sizeof(derived_root_key);
+             i++)
+        {
+            key_mismatch |=
+                (uint8_t)(derived_root_key[i] ^
+                          current_config->root_key[i]);
+        }
+
+        if (key_mismatch != 0)
+        {
+            ESP_LOGW(
+                TAG,
+                "RC pairing candidate rejected: "
+                "passphrase does not match current generation");
+
+            result = ESP_ERR_INVALID_STATE;
+            goto cleanup;
+        }
+    }
+
+    /*
+        Preserve the current configuration counter.
+
+        mathos_rc_pairing_config_save() will increment it
+        only after the candidate has been authenticated.
+    */
+    candidate =
+        *current_config;
+
+    candidate.magic =
+        MATHOS_RC_PAIRING_CONFIG_MAGIC;
+
+    candidate.version =
+        MATHOS_RC_PAIRING_CONFIG_VERSION;
+
+    candidate.record_size =
+        sizeof(mathos_rc_pairing_config_t);
+
+    candidate.rc_id =
+        package->rc_id;
+
+    candidate.authorised_gateway_id =
+        package->gateway_id;
+
+    candidate.key_derivation_method =
+        package->key_derivation_method;
+
+    candidate.reserved0 = 0;
+
+    candidate.key_generation =
+        package->key_generation;
+
+    candidate.kdf_iteration_count =
+        package->kdf_iteration_count;
+
+    memcpy(
+        candidate.root_key,
+        derived_root_key,
+        sizeof(candidate.root_key));
+
+    memcpy(
+        candidate.pairing_salt,
+        package->pairing_salt,
+        sizeof(candidate.pairing_salt));
+
+    memset(
+        candidate.reserved1,
+        0,
+        sizeof(candidate.reserved1));
+
+    candidate.crc32 = 0;
+
+    candidate.crc32 =
+        mathos_rc_pairing_config_calculate_crc32(
+            &candidate);
+
+    if (!mathos_rc_pairing_config_is_valid(
+            &candidate))
+    {
+        ESP_LOGE(
+            TAG,
+            "prepared RC pairing candidate "
+            "failed validation");
+
+        result = ESP_FAIL;
+        goto cleanup;
+    }
+
+    /*
+        Publish the candidate only after all checks pass.
+    */
+    *candidate_config =
+        candidate;
+
+    ESP_LOGI(
+        TAG,
+        "RC pairing candidate prepared "
+        "rc_id=%u gateway_id=%u "
+        "key_generation=%lu iterations=%lu",
+        candidate.rc_id,
+        candidate.authorised_gateway_id,
+        (unsigned long)
+            candidate.key_generation,
+        (unsigned long)
+            candidate.kdf_iteration_count);
+
+    result = ESP_OK;
+
+cleanup:
+
+    /*
+        Temporary structures contain derived key material.
+    */
+    maintenance_clear_sensitive_memory(
+        derived_root_key,
+        sizeof(derived_root_key));
+
+    maintenance_clear_sensitive_memory(
+        &candidate,
+        sizeof(candidate));
+
+    return result;
+}
+
+int mathos_rc_pairing_config_is_valid(
+    const mathos_rc_pairing_config_t *config)
+{
+    if (config == NULL)
+    {
+        return 0;
+    }
+
+    /*
+        Confirm that this is the expected RC pairing
+        record version and exact structure size.
+    */
+    if (config->magic !=
+        MATHOS_RC_PAIRING_CONFIG_MAGIC)
+    {
+        return 0;
+    }
+
+    if (config->version !=
+        MATHOS_RC_PAIRING_CONFIG_VERSION)
+    {
+        return 0;
+    }
+
+    if (config->record_size !=
+        sizeof(mathos_rc_pairing_config_t))
+    {
+        return 0;
+    }
+
+    /*
+        Device IDs must be between 1 and 254.
+
+        Zero and 255 remain reserved.
+    */
+    if (config->rc_id == 0 ||
+        config->rc_id == UINT8_MAX)
+    {
+        return 0;
+    }
+
+    if (config->authorised_gateway_id == 0 ||
+        config->authorised_gateway_id ==
+            UINT8_MAX)
+    {
+        return 0;
+    }
+
+    /*
+        The RC and Gateway must not use the same
+        device identity.
+    */
+    if (config->rc_id ==
+        config->authorised_gateway_id)
+    {
+        return 0;
+    }
+
+    /*
+        Reserved version-1 fields must remain zero.
+    */
+    if (config->reserved0 != 0)
+    {
+        return 0;
+    }
+
+    for (size_t i = 0;
+         i < sizeof(config->reserved1);
+         i++)
+    {
+        if (config->reserved1[i] != 0)
+        {
+            return 0;
+        }
+    }
+
+    /*
+        Determine whether pairing material exists.
+    */
+    int root_key_is_provisioned = 0;
+    int pairing_salt_is_set = 0;
+
+    for (size_t i = 0;
+         i < sizeof(config->root_key);
+         i++)
+    {
+        if (config->root_key[i] != 0)
+        {
+            root_key_is_provisioned = 1;
+            break;
+        }
+    }
+
+    for (size_t i = 0;
+         i < sizeof(config->pairing_salt);
+         i++)
+    {
+        if (config->pairing_salt[i] != 0)
+        {
+            pairing_salt_is_set = 1;
+            break;
+        }
+    }
+
+    /*
+        Generation zero represents a completely
+        unpaired RC.
+    */
+    if (config->key_generation == 0)
+    {
+        if (root_key_is_provisioned ||
+            pairing_salt_is_set ||
+            config->key_derivation_method !=
+                MATHOS_GATEWAY_KEY_DERIVATION_NONE ||
+            config->kdf_iteration_count != 0)
+        {
+            return 0;
+        }
+    }
+
+    /*
+        Temporary compatibility with the older raw
+        hexadecimal key workflow.
+    */
+    else if (config->key_derivation_method ==
+             MATHOS_GATEWAY_KEY_DERIVATION_RAW_HEX)
+    {
+        if (!root_key_is_provisioned ||
+            pairing_salt_is_set ||
+            config->kdf_iteration_count != 0)
+        {
+            return 0;
+        }
+    }
+
+    /*
+        Normal passphrase-derived pairing record.
+    */
+    else if (config->key_derivation_method ==
+             MATHOS_GATEWAY_KEY_DERIVATION_PBKDF2_SHA256)
+    {
+        if (!root_key_is_provisioned ||
+            !pairing_salt_is_set)
+        {
+            return 0;
+        }
+
+        if (config->kdf_iteration_count <
+                MATHOS_PAIRING_KDF_MIN_ITERATIONS ||
+            config->kdf_iteration_count >
+                MATHOS_PAIRING_KDF_MAX_ITERATIONS)
+        {
+            return 0;
+        }
+    }
+
+    /*
+        Any unknown derivation method is rejected.
+    */
+    else
+    {
+        return 0;
+    }
+
+    /*
+        Validate record integrity last.
+    */
+    uint32_t expected_crc =
+        mathos_rc_pairing_config_calculate_crc32(
+            config);
+
+    if (config->crc32 != expected_crc)
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
+static int mathos_gateway_uart_baud_is_valid(
+    uint32_t baud)
+{
+    switch (baud)
+    {
+    case 9600:
+    case 19200:
+    case 38400:
+    case 57600:
+    case 115200:
+    case 230400:
+    case 460800:
+    case 921600:
+        return 1;
+
+    default:
+        return 0;
+    }
+}
+int mathos_gateway_config_is_valid(
+    const mathos_gateway_config_t *config)
+{
+    if (config == NULL)
+    {
+        return 0;
+    }
+
+    /*
+        Confirm record identity, version and exact size.
+    */
+    if (config->magic !=
+        MATHOS_GATEWAY_CONFIG_MAGIC)
+    {
+        return 0;
+    }
+
+    if (config->version !=
+        MATHOS_GATEWAY_CONFIG_VERSION)
+    {
+        return 0;
+    }
+
+    if (config->record_size !=
+        sizeof(mathos_gateway_config_t))
+    {
+        return 0;
+    }
+
+    /*
+        Device IDs must be between 1 and 254.
+
+        Zero and 255 are reserved.
+    */
+    if (config->gateway_id == 0 ||
+        config->gateway_id == UINT8_MAX)
+    {
+        return 0;
+    }
+
+    if (config->authorised_rc_id == 0 ||
+        config->authorised_rc_id == UINT8_MAX)
+    {
+        return 0;
+    }
+
+    if (config->gateway_id ==
+        config->authorised_rc_id)
+    {
+        return 0;
+    }
+
+    /*
+        Only supported failsafe policies are accepted.
+    */
+    if (config->failsafe_policy !=
+            MATHOS_GATEWAY_FAILSAFE_FC_NATIVE &&
+        config->failsafe_policy !=
+            MATHOS_GATEWAY_FAILSAFE_RTL)
+    {
+        return 0;
+    }
+
+    /*
+        Reserved version-2 fields must remain zero.
+    */
+    for (size_t i = 0;
+         i < sizeof(config->reserved1);
+         i++)
+    {
+        if (config->reserved1[i] != 0)
+        {
+            return 0;
+        }
+    }
+
+    /*
+        Accept only known UART baud rates.
+    */
+    if (!mathos_gateway_uart_baud_is_valid(
+            config->link_uart_baud))
+    {
+        return 0;
+    }
+
+    if (!mathos_gateway_uart_baud_is_valid(
+            config->fc_uart_baud))
+    {
+        return 0;
+    }
+
+    /*
+        RC packet timeout.
+
+        Too short creates false link-loss events.
+        Too long delays failsafe detection.
+    */
+    if (config->rc_packet_timeout_ms < 100 ||
+        config->rc_packet_timeout_ms > 5000)
+    {
+        return 0;
+    }
+
+    /*
+        ArduPilot normally sends HEARTBEAT at roughly
+        one-second intervals.
+    */
+    if (config->fc_heartbeat_timeout_ms < 1000 ||
+        config->fc_heartbeat_timeout_ms > 10000)
+    {
+        return 0;
+    }
+
+    /*
+        Gateway status and telemetry reporting periods.
+    */
+    if (config->status_tx_period_ms < 50 ||
+        config->status_tx_period_ms > 5000)
+    {
+        return 0;
+    }
+
+    if (config->telemetry_tx_period_ms < 50 ||
+        config->telemetry_tx_period_ms > 5000)
+    {
+        return 0;
+    }
+
+    /*
+        Determine whether the stored root key and pairing
+        salt contain any nonzero bytes.
+    */
+    int root_key_is_provisioned = 0;
+    int pairing_salt_is_set = 0;
+
+    for (size_t i = 0;
+         i < sizeof(config->root_key);
+         i++)
+    {
+        if (config->root_key[i] != 0)
+        {
+            root_key_is_provisioned = 1;
+            break;
+        }
+    }
+
+    for (size_t i = 0;
+         i < sizeof(config->pairing_salt);
+         i++)
+    {
+        if (config->pairing_salt[i] != 0)
+        {
+            pairing_salt_is_set = 1;
+            break;
+        }
+    }
+
+    /*
+        Completely unprovisioned state.
+
+        No key, salt, derivation method, or KDF iteration
+        count may exist while generation is zero.
+    */
+    if (config->key_generation == 0)
+    {
+        if (root_key_is_provisioned ||
+            pairing_salt_is_set ||
+            config->key_derivation_method !=
+                MATHOS_GATEWAY_KEY_DERIVATION_NONE ||
+            config->kdf_iteration_count != 0)
+        {
+            return 0;
+        }
+    }
+
+    /*
+        Provisioned using the temporary hexadecimal-key
+        workflow.
+
+        A root key must exist, but no salt or KDF iteration
+        count is used.
+    */
+    else if (config->key_derivation_method ==
+             MATHOS_GATEWAY_KEY_DERIVATION_RAW_HEX)
+    {
+        if (!root_key_is_provisioned ||
+            pairing_salt_is_set ||
+            config->kdf_iteration_count != 0)
+        {
+            return 0;
+        }
+    }
+
+    /*
+        Provisioned from a passphrase using
+        PBKDF2-HMAC-SHA256.
+    */
+    else if (config->key_derivation_method ==
+             MATHOS_GATEWAY_KEY_DERIVATION_PBKDF2_SHA256)
+    {
+        if (!root_key_is_provisioned ||
+            !pairing_salt_is_set)
+        {
+            return 0;
+        }
+
+        if (config->kdf_iteration_count <
+                MATHOS_PAIRING_KDF_MIN_ITERATIONS ||
+            config->kdf_iteration_count >
+                MATHOS_PAIRING_KDF_MAX_ITERATIONS)
+        {
+            return 0;
+        }
+    }
+
+    /*
+        A positive key generation with any unknown
+        derivation method is invalid.
+    */
+    else
+    {
+        return 0;
+    }
+
+    /*
+        Validate record integrity last.
+    */
+    uint32_t expected_crc =
+        mathos_gateway_config_calculate_crc32(
+            config);
+
+    if (config->crc32 != expected_crc)
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
+esp_err_t mathos_gateway_config_save(
+    const mathos_gateway_config_t *config)
+{
+    if (config == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Work on a local copy so the caller's RAM
+        configuration is not modified directly.
+    */
+    mathos_gateway_config_t record =
+        *config;
+
+    /*
+        Refresh the fixed record metadata before saving.
+    */
+    record.magic =
+        MATHOS_GATEWAY_CONFIG_MAGIC;
+
+    record.version =
+        MATHOS_GATEWAY_CONFIG_VERSION;
+
+    record.record_size =
+        sizeof(mathos_gateway_config_t);
+
+    /*
+        Version 2 requires the reserved byte to remain zero.
+    */
+    memset(
+        record.reserved1,
+        0,
+        sizeof(record.reserved1));
+
+    record.configuration_counter =
+        config->configuration_counter + 1U;
+
+    /*
+        Protect against uint32_t wrap-around returning
+        the counter to the reserved value zero.
+    */
+    if (record.configuration_counter == 0)
+    {
+        record.configuration_counter = 1U;
+    }
+
+    /*
+        Recalculate the CRC after every stored field has
+        reached its final value.
+    */
+    record.crc32 = 0;
+
+    record.crc32 =
+        mathos_gateway_config_calculate_crc32(
+            &record);
+
+    /*
+        Never write an invalid Gateway configuration
+        into NVS.
+    */
+    if (!mathos_gateway_config_is_valid(
+            &record))
+    {
+        ESP_LOGE(
+            TAG,
+            "gateway configuration save rejected: "
+            "invalid fields");
+
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t handle;
+
+    esp_err_t err =
+        nvs_open(
+            MATHOS_MAINTENANCE_NVS_NAMESPACE,
+            NVS_READWRITE,
+            &handle);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "failed to open gateway configuration NVS: %s",
+            esp_err_to_name(err));
+
+        return err;
+    }
+
+    /*
+        Store the Gateway configuration under its own key.
+
+        RC configuration:
+            config_v1
+
+        Gateway configuration:
+            gateway_v2
+    */
+    err =
+        nvs_set_blob(
+            handle,
+            MATHOS_GATEWAY_NVS_KEY,
+            &record,
+            sizeof(record));
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "failed to write gateway configuration: %s",
+            esp_err_to_name(err));
+
+        nvs_close(handle);
+        return err;
+    }
+
+    err =
+        nvs_commit(
+            handle);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "failed to commit gateway configuration: %s",
+            esp_err_to_name(err));
+
+        nvs_close(handle);
+        return err;
+    }
+
+    /*
+        Read the committed record back before declaring
+        the save successful.
+    */
+    mathos_gateway_config_t verified = {0};
+
+    size_t verified_size =
+        sizeof(verified);
+
+    err =
+        nvs_get_blob(
+            handle,
+            MATHOS_GATEWAY_NVS_KEY,
+            &verified,
+            &verified_size);
+
+    nvs_close(handle);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "gateway configuration read-back failed: %s",
+            esp_err_to_name(err));
+
+        return err;
+    }
+
+    if (verified_size != sizeof(verified))
+    {
+        ESP_LOGE(
+            TAG,
+            "gateway configuration read-back size mismatch "
+            "stored=%u expected=%u",
+            (unsigned int)verified_size,
+            (unsigned int)sizeof(verified));
+
+        return ESP_FAIL;
+    }
+
+    /*
+        Validate the record read from flash independently.
+    */
+    if (!mathos_gateway_config_is_valid(
+            &verified))
+    {
+        ESP_LOGE(
+            TAG,
+            "gateway configuration read-back "
+            "validation failed");
+
+        return ESP_FAIL;
+    }
+
+    /*
+        The record in flash must exactly match the record
+        that we attempted to save.
+    */
+    if (memcmp(
+            &record,
+            &verified,
+            sizeof(record)) != 0)
+    {
+        ESP_LOGE(
+            TAG,
+            "gateway configuration read-back differs "
+            "from written record");
+
+        return ESP_FAIL;
+    }
+
+    /*
+        Never print the root key.
+
+        Only report whether a key generation exists.
+    */
+    ESP_LOGI(
+        TAG,
+        "gateway configuration saved and verified "
+        "gateway_id=%u rc_id=%u "
+        "key_generation=%lu counter=%lu "
+        "key_provisioned=%u crc=0x%08lx",
+        verified.gateway_id,
+        verified.authorised_rc_id,
+        (unsigned long)verified.key_generation,
+        (unsigned long)verified.configuration_counter,
+        verified.key_generation != 0 ? 1U : 0U,
+        (unsigned long)verified.crc32);
+
+    return ESP_OK;
+}
+
+esp_err_t mathos_gateway_config_load(
+    mathos_gateway_config_t *config,
+    int *loaded_from_nvs)
+{
+    if (config == NULL ||
+        loaded_from_nvs == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Always begin with a complete and valid safe
+        Gateway configuration.
+
+        If NVS is empty, corrupted or incompatible,
+        these defaults remain available to the caller.
+    */
+    mathos_gateway_config_set_defaults(
+        config);
+
+    *loaded_from_nvs = 0;
+
+    nvs_handle_t handle;
+
+    esp_err_t err =
+        nvs_open(
+            MATHOS_MAINTENANCE_NVS_NAMESPACE,
+            NVS_READONLY,
+            &handle);
+
+    /*
+        A new Gateway may not have an NVS namespace yet.
+        This is normal and not a fatal condition.
+    */
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        ESP_LOGI(
+            TAG,
+            "no saved gateway configuration; "
+            "using defaults");
+
+        return ESP_OK;
+    }
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "failed to open gateway configuration NVS: %s",
+            esp_err_to_name(err));
+
+        return err;
+    }
+
+    /*
+        Read the stored blob size first.
+
+        This prevents an older or incompatible record
+        from being read into the current structure.
+    */
+    size_t stored_size = 0;
+
+    err =
+        nvs_get_blob(
+            handle,
+            MATHOS_GATEWAY_NVS_KEY,
+            NULL,
+            &stored_size);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        ESP_LOGI(
+            TAG,
+            "no saved gateway configuration; "
+            "using defaults");
+
+        nvs_close(handle);
+        return ESP_OK;
+    }
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "failed to read gateway configuration size: %s",
+            esp_err_to_name(err));
+
+        nvs_close(handle);
+        return err;
+    }
+
+    if (stored_size !=
+        sizeof(mathos_gateway_config_t))
+    {
+        ESP_LOGE(
+            TAG,
+            "gateway configuration size mismatch "
+            "stored=%u expected=%u; using defaults",
+            (unsigned int)stored_size,
+            (unsigned int)sizeof(mathos_gateway_config_t));
+
+        nvs_close(handle);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    mathos_gateway_config_t stored = {0};
+
+    size_t read_size =
+        sizeof(stored);
+
+    err =
+        nvs_get_blob(
+            handle,
+            MATHOS_GATEWAY_NVS_KEY,
+            &stored,
+            &read_size);
+
+    nvs_close(handle);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "failed to read gateway configuration: %s",
+            esp_err_to_name(err));
+
+        return err;
+    }
+
+    if (read_size != sizeof(stored))
+    {
+        ESP_LOGE(
+            TAG,
+            "gateway configuration read size mismatch "
+            "read=%u expected=%u; using defaults",
+            (unsigned int)read_size,
+            (unsigned int)sizeof(stored));
+
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    /*
+        This validates:
+
+        - magic
+        - version
+        - structure size
+        - device identities
+        - failsafe policy
+        - UART baud rates
+        - timeout ranges
+        - root-key generation rules
+        - CRC32
+    */
+    if (!mathos_gateway_config_is_valid(
+            &stored))
+    {
+        ESP_LOGE(
+            TAG,
+            "saved gateway configuration is invalid; "
+            "using defaults");
+
+        return ESP_FAIL;
+    }
+
+    /*
+        Activate the saved configuration only after
+        complete validation.
+    */
+    *config = stored;
+    *loaded_from_nvs = 1;
+
+    /*
+        Never print the cryptographic root key.
+    */
+    ESP_LOGI(
+        TAG,
+        "gateway configuration loaded "
+        "gateway_id=%u rc_id=%u "
+        "key_generation=%lu "
+        "key_provisioned=%u "
+        "link_baud=%lu fc_baud=%lu "
+        "rc_timeout=%u fc_timeout=%u "
+        "status_period=%u telemetry_period=%u "
+        "failsafe_policy=%u counter=%lu "
+        "crc=0x%08lx",
+        config->gateway_id,
+        config->authorised_rc_id,
+        (unsigned long)
+            config->key_generation,
+        config->key_generation != 0
+            ? 1U
+            : 0U,
+        (unsigned long)
+            config->link_uart_baud,
+        (unsigned long)
+            config->fc_uart_baud,
+        config->rc_packet_timeout_ms,
+        config->fc_heartbeat_timeout_ms,
+        config->status_tx_period_ms,
+        config->telemetry_tx_period_ms,
+        config->failsafe_policy,
+        (unsigned long)
+            config->configuration_counter,
+        (unsigned long)
+            config->crc32);
+
+    return ESP_OK;
+}
 void mathos_maintenance_config_set_defaults(
     mathos_maintenance_config_t *config)
 {
@@ -970,6 +5287,17 @@ static esp_err_t maintenance_build_role_section(
     switch (role)
     {
     case MATHOS_MAINTENANCE_ROLE_RC:
+    {
+        const char *pairing_source_text =
+            maintenance_rc_pairing_config_loaded_from_nvs
+                ? "Saved pairing"
+                : "Unpaired defaults";
+
+        const char *pairing_state_text =
+            maintenance_active_rc_pairing_config
+                        .key_generation != 0
+                ? "Paired"
+                : "Not paired";
 
         written = snprintf(
             destination,
@@ -977,6 +5305,21 @@ static esp_err_t maintenance_build_role_section(
 
             "<div class=\"label\">Configuration source</div>"
             "<div class=\"value\">%s</div>"
+
+            "<div class=\"label\">Pairing source</div>"
+            "<div class=\"value\">%s</div>"
+
+            "<div class=\"label\">Pairing status</div>"
+            "<div class=\"value\">%s</div>"
+
+            "<div class=\"label\">RC ID</div>"
+            "<div class=\"value\">%u</div>"
+
+            "<div class=\"label\">Authorised Gateway ID</div>"
+            "<div class=\"value\">%u</div>"
+
+            "<div class=\"label\">Key generation</div>"
+            "<div class=\"value\">%lu</div>"
 
             "<div class=\"label\">Telemetry forwarding</div>"
             "<div class=\"value\">%s</div>"
@@ -1046,6 +5389,18 @@ static esp_err_t maintenance_build_role_section(
             "</section>",
 
             config_source_text,
+            pairing_source_text,
+            pairing_state_text,
+
+            maintenance_active_rc_pairing_config.rc_id,
+
+            maintenance_active_rc_pairing_config
+                .authorised_gateway_id,
+
+            (unsigned long)
+                maintenance_active_rc_pairing_config
+                    .key_generation,
+
             telemetry_state_text,
             wifi_ssid_html,
             server_host_html,
@@ -1056,30 +5411,260 @@ static esp_err_t maintenance_build_role_section(
             server_port_form);
 
         break;
-
+    }
     case MATHOS_MAINTENANCE_ROLE_GATEWAY:
+    {
+        const char *key_state_text =
+            maintenance_active_gateway_config.key_generation != 0
+                ? "Provisioned"
+                : "Not provisioned";
+
+        const char *failsafe_text =
+            maintenance_active_gateway_config.failsafe_policy ==
+                    MATHOS_GATEWAY_FAILSAFE_RTL
+                ? "Request RTL"
+                : "Flight-controller native";
+
+        const char *fc_native_selected =
+            maintenance_active_gateway_config.failsafe_policy ==
+                    MATHOS_GATEWAY_FAILSAFE_FC_NATIVE
+                ? " selected"
+                : "";
+
+        const char *rtl_selected =
+            maintenance_active_gateway_config.failsafe_policy ==
+                    MATHOS_GATEWAY_FAILSAFE_RTL
+                ? " selected"
+                : "";
 
         written = snprintf(
             destination,
             destination_size,
 
+            "<div class=\"label\">Configuration source</div>"
+            "<div class=\"value\">%s</div>"
+
+            "<div class=\"label\">Security key</div>"
+            "<div class=\"value\">%s</div>"
+
+            "<div class=\"label\">Key generation</div>"
+            "<div class=\"value\">%lu</div>"
+
+            "<div class=\"label\">Configuration counter</div>"
+            "<div class=\"value\">%lu</div>"
+
             "<section class=\"editor\">"
             "<h2>Gateway configuration</h2>"
 
+            "<form method=\"post\" action=\"/config/gateway\">"
+
+            "<label class=\"form-label\" "
+            "for=\"gateway_id\">Gateway ID</label>"
+
+            "<input class=\"form-input\" "
+            "id=\"gateway_id\" "
+            "name=\"gateway_id\" "
+            "type=\"number\" "
+            "min=\"1\" "
+            "max=\"254\" "
+            "value=\"%u\" "
+            "required>"
+
+            "<label class=\"form-label\" "
+            "for=\"authorised_rc_id\">Authorised RC ID</label>"
+
+            "<input class=\"form-input\" "
+            "id=\"authorised_rc_id\" "
+            "name=\"authorised_rc_id\" "
+            "type=\"number\" "
+            "min=\"1\" "
+            "max=\"254\" "
+            "value=\"%u\" "
+            "required>"
+
+            "<label class=\"form-label\" "
+            "for=\"pairing_passphrase\">"
+            "New pairing passphrase"
+            "</label>"
+
+            "<input class=\"form-input\" "
+            "id=\"pairing_passphrase\" "
+            "name=\"pairing_passphrase\" "
+            "type=\"password\" "
+            "minlength=\"16\" "
+            "maxlength=\"96\" "
+            "placeholder=\"16 to 96 characters\" "
+            "autocomplete=\"new-password\">"
+
+            "<label class=\"form-label\" "
+            "for=\"pairing_passphrase_confirm\">"
+            "Confirm pairing passphrase"
+            "</label>"
+
+            "<input class=\"form-input\" "
+            "id=\"pairing_passphrase_confirm\" "
+            "name=\"pairing_passphrase_confirm\" "
+            "type=\"password\" "
+            "minlength=\"16\" "
+            "maxlength=\"96\" "
+            "placeholder=\"Enter the same passphrase again\" "
+            "autocomplete=\"new-password\">"
+
             "<div class=\"warning\">"
-            "Gateway-specific flight-controller, MAVLink, "
-            "radio-link and telemetry-routing settings "
-            "will be configured here."
+            "Leave both fields empty to preserve the currently "
+            "provisioned key. The passphrase and derived key are "
+            "never displayed or logged."
+            "</div>"
+
+            "<label class=\"form-label\" "
+            "for=\"link_uart_baud\">RC-link UART baud</label>"
+
+            "<input class=\"form-input\" "
+            "id=\"link_uart_baud\" "
+            "name=\"link_uart_baud\" "
+            "type=\"number\" "
+            "list=\"gateway_baud_rates\" "
+            "value=\"%lu\" "
+            "required>"
+
+            "<label class=\"form-label\" "
+            "for=\"fc_uart_baud\">Flight-controller UART baud</label>"
+
+            "<input class=\"form-input\" "
+            "id=\"fc_uart_baud\" "
+            "name=\"fc_uart_baud\" "
+            "type=\"number\" "
+            "list=\"gateway_baud_rates\" "
+            "value=\"%lu\" "
+            "required>"
+
+            "<datalist id=\"gateway_baud_rates\">"
+            "<option value=\"9600\">"
+            "<option value=\"19200\">"
+            "<option value=\"38400\">"
+            "<option value=\"57600\">"
+            "<option value=\"115200\">"
+            "<option value=\"230400\">"
+            "<option value=\"460800\">"
+            "<option value=\"921600\">"
+            "</datalist>"
+
+            "<label class=\"form-label\" "
+            "for=\"rc_packet_timeout_ms\">RC packet timeout</label>"
+
+            "<input class=\"form-input\" "
+            "id=\"rc_packet_timeout_ms\" "
+            "name=\"rc_packet_timeout_ms\" "
+            "type=\"number\" "
+            "min=\"100\" "
+            "max=\"5000\" "
+            "value=\"%u\" "
+            "required>"
+
+            "<label class=\"form-label\" "
+            "for=\"fc_heartbeat_timeout_ms\">"
+            "FC heartbeat timeout"
+            "</label>"
+
+            "<input class=\"form-input\" "
+            "id=\"fc_heartbeat_timeout_ms\" "
+            "name=\"fc_heartbeat_timeout_ms\" "
+            "type=\"number\" "
+            "min=\"1000\" "
+            "max=\"10000\" "
+            "value=\"%u\" "
+            "required>"
+
+            "<label class=\"form-label\" "
+            "for=\"status_tx_period_ms\">"
+            "Status transmission period"
+            "</label>"
+
+            "<input class=\"form-input\" "
+            "id=\"status_tx_period_ms\" "
+            "name=\"status_tx_period_ms\" "
+            "type=\"number\" "
+            "min=\"50\" "
+            "max=\"5000\" "
+            "value=\"%u\" "
+            "required>"
+
+            "<label class=\"form-label\" "
+            "for=\"telemetry_tx_period_ms\">"
+            "Telemetry transmission period"
+            "</label>"
+
+            "<input class=\"form-input\" "
+            "id=\"telemetry_tx_period_ms\" "
+            "name=\"telemetry_tx_period_ms\" "
+            "type=\"number\" "
+            "min=\"50\" "
+            "max=\"5000\" "
+            "value=\"%u\" "
+            "required>"
+
+            "<label class=\"form-label\" "
+            "for=\"failsafe_policy\">Failsafe policy</label>"
+
+            "<select class=\"form-input\" "
+            "id=\"failsafe_policy\" "
+            "name=\"failsafe_policy\">"
+
+            "<option value=\"0\"%s>"
+            "Flight-controller native"
+            "</option>"
+
+            "<option value=\"1\"%s>"
+            "Request RTL"
+            "</option>"
+
+            "</select>"
+            "<button class=\"save-button\" "
+            "type=\"submit\">"
+            "Save Gateway configuration"
+            "</button>"
+
+            "<div class=\"warning\">"
+            "Current failsafe policy: %s."
             "</div>"
 
             "<div class=\"warning\">"
-            "RC joystick and calibration controls are "
-            "intentionally unavailable on the gateway."
+            "Changes are validated, saved to NVS and activated "
+            "after the Gateway restarts."
             "</div>"
 
-            "</section>");
+            "</form>"
+            "</section>",
+
+            config_source_text,
+            key_state_text,
+
+            (unsigned long)
+                maintenance_active_gateway_config.key_generation,
+
+            (unsigned long)
+                maintenance_active_gateway_config.configuration_counter,
+
+            maintenance_active_gateway_config.gateway_id,
+            maintenance_active_gateway_config.authorised_rc_id,
+
+            (unsigned long)
+                maintenance_active_gateway_config.link_uart_baud,
+
+            (unsigned long)
+                maintenance_active_gateway_config.fc_uart_baud,
+
+            maintenance_active_gateway_config.rc_packet_timeout_ms,
+            maintenance_active_gateway_config.fc_heartbeat_timeout_ms,
+            maintenance_active_gateway_config.status_tx_period_ms,
+            maintenance_active_gateway_config.telemetry_tx_period_ms,
+
+            fc_native_selected,
+            rtl_selected,
+            failsafe_text);
 
         break;
+    }
 
     default:
 
@@ -1176,10 +5761,24 @@ static esp_err_t maintenance_root_get_handler(httpd_req_t *request)
                 "Invalid value");
         }
     }
-    const char *config_source_text =
-        maintenance_config_loaded_from_nvs
-            ? "Saved configuration"
-            : "Safe defaults";
+    const char *config_source_text = "Safe defaults";
+
+    if (maintenance_active_role ==
+        MATHOS_MAINTENANCE_ROLE_RC)
+    {
+        config_source_text =
+            maintenance_config_loaded_from_nvs
+                ? "Saved configuration"
+                : "Safe defaults";
+    }
+    else if (maintenance_active_role ==
+             MATHOS_MAINTENANCE_ROLE_GATEWAY)
+    {
+        config_source_text =
+            maintenance_gateway_config_loaded_from_nvs
+                ? "Saved configuration"
+                : "Safe defaults";
+    }
 
     const char *telemetry_state_text =
         maintenance_active_config.telemetry_enabled
@@ -1493,7 +6092,6 @@ static esp_err_t maintenance_http_server_start(
         maintenance_http_server = NULL;
         return err;
     }
-
     if (role ==
         MATHOS_MAINTENANCE_ROLE_RC)
     {
@@ -1529,13 +6127,58 @@ static esp_err_t maintenance_http_server_start(
             TAG,
             "RC configuration endpoint registered");
     }
-    else
+    else if (role ==
+             MATHOS_MAINTENANCE_ROLE_GATEWAY)
     {
+        httpd_uri_t gateway_config_uri = {
+            .uri = "/config/gateway",
+            .method = HTTP_POST,
+            .handler =
+                maintenance_gateway_config_post_handler,
+            .user_ctx = NULL,
+        };
+
+        err =
+            httpd_register_uri_handler(
+                maintenance_http_server,
+                &gateway_config_uri);
+
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(
+                TAG,
+                "Gateway configuration URI "
+                "registration failed: %s",
+                esp_err_to_name(err));
+
+            httpd_stop(
+                maintenance_http_server);
+
+            maintenance_http_server = NULL;
+
+            return err;
+        }
+
         ESP_LOGI(
             TAG,
-            "RC configuration endpoint not registered "
-            "for gateway role");
+            "Gateway configuration endpoint registered");
     }
+    else
+    {
+        ESP_LOGE(
+            TAG,
+            "configuration endpoint rejected: "
+            "invalid maintenance role=%d",
+            (int)role);
+
+        httpd_stop(
+            maintenance_http_server);
+
+        maintenance_http_server = NULL;
+
+        return ESP_ERR_INVALID_ARG;
+    }
+
     char ip_text[16] =
         "Unavailable";
 
@@ -1616,6 +6259,995 @@ static esp_err_t maintenance_parse_server_port(
 
     return ESP_OK;
 }
+
+static esp_err_t maintenance_parse_u32_range(
+    const char *text,
+    uint32_t minimum,
+    uint32_t maximum,
+    uint32_t *value)
+{
+    if (text == NULL ||
+        value == NULL ||
+        minimum > maximum)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Gateway numeric fields are mandatory.
+
+        Reject empty values, spaces, signs, decimal
+        points and every other non-digit character.
+    */
+    if (text[0] == '\0')
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint32_t parsed = 0;
+
+    for (size_t i = 0;
+         text[i] != '\0';
+         i++)
+    {
+        if (text[i] < '0' ||
+            text[i] > '9')
+        {
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        uint32_t digit =
+            (uint32_t)(text[i] - '0');
+
+        /*
+            Detect overflow and values above the allowed
+            maximum before multiplying.
+        */
+        if (parsed > (maximum / 10U) ||
+            (parsed == (maximum / 10U) &&
+             digit > (maximum % 10U)))
+        {
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        parsed =
+            (parsed * 10U) +
+            digit;
+    }
+
+    if (parsed < minimum ||
+        parsed > maximum)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *value = parsed;
+
+    return ESP_OK;
+}
+
+static esp_err_t maintenance_parse_u16_range(
+    const char *text,
+    uint16_t minimum,
+    uint16_t maximum,
+    uint16_t *value)
+{
+    if (value == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint32_t parsed = 0;
+
+    esp_err_t err =
+        maintenance_parse_u32_range(
+            text,
+            minimum,
+            maximum,
+            &parsed);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    *value =
+        (uint16_t)parsed;
+
+    return ESP_OK;
+}
+
+static void maintenance_clear_sensitive_memory(
+    void *buffer,
+    size_t buffer_size)
+{
+    if (buffer == NULL)
+    {
+        return;
+    }
+
+    /*
+        Volatile prevents the compiler from removing this
+        clear operation as an unnecessary write.
+    */
+    volatile uint8_t *bytes =
+        (volatile uint8_t *)buffer;
+
+    while (buffer_size > 0)
+    {
+        *bytes = 0;
+
+        bytes++;
+        buffer_size--;
+    }
+}
+
+esp_err_t mathos_rc_pairing_config_save(
+    const mathos_rc_pairing_config_t *config)
+{
+    if (config == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Work on a local copy because the save operation
+        refreshes metadata, counter and CRC.
+    */
+    mathos_rc_pairing_config_t record =
+        *config;
+
+    mathos_rc_pairing_config_t verified = {0};
+
+    esp_err_t result = ESP_OK;
+
+    /*
+        Restore the fixed record metadata.
+    */
+    record.magic =
+        MATHOS_RC_PAIRING_CONFIG_MAGIC;
+
+    record.version =
+        MATHOS_RC_PAIRING_CONFIG_VERSION;
+
+    record.record_size =
+        sizeof(mathos_rc_pairing_config_t);
+
+    /*
+        Reserved version-1 fields must always remain zero.
+    */
+    record.reserved0 = 0;
+
+    memset(
+        record.reserved1,
+        0,
+        sizeof(record.reserved1));
+
+    /*
+        Increment the persistent configuration counter.
+
+        Counter zero is reserved for the initial
+        unsaved default record.
+    */
+    record.configuration_counter =
+        config->configuration_counter + 1U;
+
+    if (record.configuration_counter == 0)
+    {
+        record.configuration_counter = 1U;
+    }
+
+    /*
+        Calculate the CRC only after every stored field
+        has reached its final value.
+    */
+    record.crc32 = 0;
+
+    record.crc32 =
+        mathos_rc_pairing_config_calculate_crc32(
+            &record);
+
+    if (!mathos_rc_pairing_config_is_valid(
+            &record))
+    {
+        ESP_LOGE(
+            TAG,
+            "RC pairing configuration save rejected: "
+            "invalid fields");
+
+        result = ESP_ERR_INVALID_ARG;
+        goto cleanup;
+    }
+
+    nvs_handle_t handle;
+
+    esp_err_t err =
+        nvs_open(
+            MATHOS_MAINTENANCE_NVS_NAMESPACE,
+            NVS_READWRITE,
+            &handle);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "failed to open RC pairing NVS: %s",
+            esp_err_to_name(err));
+
+        result = err;
+        goto cleanup;
+    }
+
+    err =
+        nvs_set_blob(
+            handle,
+            MATHOS_RC_PAIRING_NVS_KEY,
+            &record,
+            sizeof(record));
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "failed to write RC pairing configuration: %s",
+            esp_err_to_name(err));
+
+        nvs_close(handle);
+
+        result = err;
+        goto cleanup;
+    }
+
+    err =
+        nvs_commit(
+            handle);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "failed to commit RC pairing configuration: %s",
+            esp_err_to_name(err));
+
+        nvs_close(handle);
+
+        result = err;
+        goto cleanup;
+    }
+
+    /*
+        Read the committed record back from NVS before
+        reporting success.
+    */
+    size_t verified_size =
+        sizeof(verified);
+
+    err =
+        nvs_get_blob(
+            handle,
+            MATHOS_RC_PAIRING_NVS_KEY,
+            &verified,
+            &verified_size);
+
+    nvs_close(handle);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "RC pairing configuration read-back failed: %s",
+            esp_err_to_name(err));
+
+        result = err;
+        goto cleanup;
+    }
+
+    if (verified_size !=
+        sizeof(verified))
+    {
+        ESP_LOGE(
+            TAG,
+            "RC pairing read-back size mismatch "
+            "stored=%u expected=%u",
+            (unsigned int)verified_size,
+            (unsigned int)sizeof(verified));
+
+        result = ESP_FAIL;
+        goto cleanup;
+    }
+
+    if (!mathos_rc_pairing_config_is_valid(
+            &verified))
+    {
+        ESP_LOGE(
+            TAG,
+            "RC pairing read-back validation failed");
+
+        result = ESP_FAIL;
+        goto cleanup;
+    }
+
+    if (memcmp(
+            &record,
+            &verified,
+            sizeof(record)) != 0)
+    {
+        ESP_LOGE(
+            TAG,
+            "RC pairing read-back differs from "
+            "written record");
+
+        result = ESP_FAIL;
+        goto cleanup;
+    }
+
+    /*
+        Never log the root key or pairing salt.
+    */
+    ESP_LOGI(
+        TAG,
+        "RC pairing configuration saved and verified "
+        "rc_id=%u gateway_id=%u "
+        "key_generation=%lu counter=%lu "
+        "key_provisioned=%u crc=0x%08lx",
+        verified.rc_id,
+        verified.authorised_gateway_id,
+        (unsigned long)
+            verified.key_generation,
+        (unsigned long)
+            verified.configuration_counter,
+        verified.key_generation != 0
+            ? 1U
+            : 0U,
+        (unsigned long)
+            verified.crc32);
+
+cleanup:
+
+    /*
+        Both local structures may contain the root key,
+        so erase them before returning.
+    */
+    maintenance_clear_sensitive_memory(
+        &record,
+        sizeof(record));
+
+    maintenance_clear_sensitive_memory(
+        &verified,
+        sizeof(verified));
+
+    return result;
+}
+
+esp_err_t mathos_rc_pairing_config_load(
+    mathos_rc_pairing_config_t *config,
+    int *loaded_from_nvs)
+{
+    if (config == NULL ||
+        loaded_from_nvs == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Always begin with a complete and valid unpaired
+        RC record.
+
+        If NVS is empty, corrupted or incompatible,
+        these safe defaults remain active.
+    */
+    mathos_rc_pairing_config_set_defaults(
+        config);
+
+    *loaded_from_nvs = 0;
+
+    nvs_handle_t handle;
+
+    esp_err_t err =
+        nvs_open(
+            MATHOS_MAINTENANCE_NVS_NAMESPACE,
+            NVS_READONLY,
+            &handle);
+
+    /*
+        A new RC may not have created the shared
+        maintenance namespace yet.
+    */
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        ESP_LOGI(
+            TAG,
+            "no saved RC pairing configuration; "
+            "using unpaired defaults");
+
+        return ESP_OK;
+    }
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "failed to open RC pairing NVS: %s",
+            esp_err_to_name(err));
+
+        return err;
+    }
+
+    /*
+        Query the stored blob size before reading it.
+
+        This prevents an old or incompatible record from
+        being copied into the current structure.
+    */
+    size_t stored_size = 0;
+
+    err =
+        nvs_get_blob(
+            handle,
+            MATHOS_RC_PAIRING_NVS_KEY,
+            NULL,
+            &stored_size);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        ESP_LOGI(
+            TAG,
+            "no saved RC pairing configuration; "
+            "using unpaired defaults");
+
+        nvs_close(handle);
+
+        return ESP_OK;
+    }
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "failed to read RC pairing record size: %s",
+            esp_err_to_name(err));
+
+        nvs_close(handle);
+
+        return err;
+    }
+
+    if (stored_size !=
+        sizeof(mathos_rc_pairing_config_t))
+    {
+        ESP_LOGE(
+            TAG,
+            "RC pairing record size mismatch "
+            "stored=%u expected=%u; "
+            "using unpaired defaults",
+            (unsigned int)stored_size,
+            (unsigned int)sizeof(mathos_rc_pairing_config_t));
+
+        nvs_close(handle);
+
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    mathos_rc_pairing_config_t stored = {0};
+
+    size_t read_size =
+        sizeof(stored);
+
+    err =
+        nvs_get_blob(
+            handle,
+            MATHOS_RC_PAIRING_NVS_KEY,
+            &stored,
+            &read_size);
+
+    nvs_close(handle);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "failed to read RC pairing configuration: %s",
+            esp_err_to_name(err));
+
+        maintenance_clear_sensitive_memory(
+            &stored,
+            sizeof(stored));
+
+        return err;
+    }
+
+    if (read_size != sizeof(stored))
+    {
+        ESP_LOGE(
+            TAG,
+            "RC pairing read size mismatch "
+            "read=%u expected=%u; "
+            "using unpaired defaults",
+            (unsigned int)read_size,
+            (unsigned int)sizeof(stored));
+
+        maintenance_clear_sensitive_memory(
+            &stored,
+            sizeof(stored));
+
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    /*
+        Validate the complete record before allowing its
+        key material to become active.
+    */
+    if (!mathos_rc_pairing_config_is_valid(
+            &stored))
+    {
+        ESP_LOGE(
+            TAG,
+            "saved RC pairing configuration is invalid; "
+            "using unpaired defaults");
+
+        maintenance_clear_sensitive_memory(
+            &stored,
+            sizeof(stored));
+
+        return ESP_FAIL;
+    }
+
+    /*
+        Activate the saved pairing record only after
+        every validation check succeeds.
+    */
+    *config = stored;
+
+    *loaded_from_nvs = 1;
+
+    /*
+        Never print the root key, salt or passphrase.
+    */
+    ESP_LOGI(
+        TAG,
+        "RC pairing configuration loaded "
+        "rc_id=%u gateway_id=%u "
+        "key_generation=%lu "
+        "key_provisioned=%u "
+        "counter=%lu crc=0x%08lx",
+        config->rc_id,
+        config->authorised_gateway_id,
+        (unsigned long)
+            config->key_generation,
+        config->key_generation != 0
+            ? 1U
+            : 0U,
+        (unsigned long)
+            config->configuration_counter,
+        (unsigned long)
+            config->crc32);
+
+    /*
+        The active configuration now contains the needed
+        copy. Erase the temporary stack copy.
+    */
+    maintenance_clear_sensitive_memory(
+        &stored,
+        sizeof(stored));
+
+    return ESP_OK;
+}
+
+esp_err_t mathos_maintenance_generate_pairing_salt(
+    uint8_t salt[MATHOS_PAIRING_SALT_LEN])
+{
+    if (salt == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Begin with a cleared output buffer.
+
+        A failed generation must not leave previous
+        salt material in the caller's buffer.
+    */
+    maintenance_clear_sensitive_memory(
+        salt,
+        MATHOS_PAIRING_SALT_LEN);
+
+    /*
+        An all-zero salt is reserved as the
+        unprovisioned configuration state.
+
+        It is astronomically unlikely for a secure random
+        generator to produce sixteen zero bytes, but retry
+        explicitly so the configuration rules remain exact.
+    */
+    for (uint32_t attempt = 0;
+         attempt < 4U;
+         attempt++)
+    {
+        esp_fill_random(
+            salt,
+            MATHOS_PAIRING_SALT_LEN);
+
+        int contains_nonzero_byte = 0;
+
+        for (size_t i = 0;
+             i < MATHOS_PAIRING_SALT_LEN;
+             i++)
+        {
+            if (salt[i] != 0)
+            {
+                contains_nonzero_byte = 1;
+                break;
+            }
+        }
+
+        if (contains_nonzero_byte)
+        {
+            return ESP_OK;
+        }
+    }
+
+    maintenance_clear_sensitive_memory(
+        salt,
+        MATHOS_PAIRING_SALT_LEN);
+
+    ESP_LOGE(
+        TAG,
+        "failed to generate a valid pairing salt");
+
+    return ESP_FAIL;
+}
+
+esp_err_t mathos_maintenance_derive_root_key_from_passphrase(
+    const char *passphrase,
+    const uint8_t salt[MATHOS_PAIRING_SALT_LEN],
+    uint32_t iteration_count,
+    uint8_t root_key[MATHOS_GATEWAY_ROOT_KEY_LEN])
+{
+    if (passphrase == NULL ||
+        salt == NULL ||
+        root_key == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (iteration_count <
+            MATHOS_PAIRING_KDF_MIN_ITERATIONS ||
+        iteration_count >
+            MATHOS_PAIRING_KDF_MAX_ITERATIONS)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Begin with a cleared output buffer.
+
+        A failed derivation must never leave a partial or
+        previously generated key in the caller's buffer.
+    */
+    maintenance_clear_sensitive_memory(
+        root_key,
+        MATHOS_GATEWAY_ROOT_KEY_LEN);
+
+    /*
+        strnlen prevents an unterminated or excessively long
+        passphrase from causing an unbounded memory scan.
+    */
+    size_t passphrase_length =
+        strnlen(
+            passphrase,
+            MATHOS_PAIRING_PASSPHRASE_MAX_LEN + 1U);
+
+    if (passphrase_length <
+            MATHOS_PAIRING_PASSPHRASE_MIN_LEN ||
+        passphrase_length >
+            MATHOS_PAIRING_PASSPHRASE_MAX_LEN)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Version 1 of the pairing interface accepts printable
+        ASCII only.
+
+        This avoids different Unicode encodings or
+        normalization rules producing different keys on the
+        RC and Gateway.
+    */
+    for (size_t i = 0;
+         i < passphrase_length;
+         i++)
+    {
+        unsigned char character =
+            (unsigned char)passphrase[i];
+
+        if (character < 0x20U ||
+            character > 0x7EU)
+        {
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+
+    /*
+        Reject accidental leading or trailing spaces.
+
+        Spaces inside the passphrase remain allowed.
+    */
+    if (passphrase[0] == ' ' ||
+        passphrase[passphrase_length - 1U] == ' ')
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        A production pairing salt must not be the all-zero
+        value.
+    */
+    int salt_contains_nonzero_byte = 0;
+
+    for (size_t i = 0;
+         i < MATHOS_PAIRING_SALT_LEN;
+         i++)
+    {
+        if (salt[i] != 0)
+        {
+            salt_contains_nonzero_byte = 1;
+            break;
+        }
+    }
+
+    if (!salt_contains_nonzero_byte)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    int64_t derivation_start_us =
+        esp_timer_get_time();
+    int result =
+        mbedtls_pkcs5_pbkdf2_hmac_ext(
+            MBEDTLS_MD_SHA256,
+
+            (const unsigned char *)passphrase,
+            passphrase_length,
+
+            salt,
+            MATHOS_PAIRING_SALT_LEN,
+
+            (unsigned int)iteration_count,
+
+            MATHOS_GATEWAY_ROOT_KEY_LEN,
+            root_key);
+    int64_t derivation_duration_us =
+        esp_timer_get_time() -
+        derivation_start_us;
+    if (result != 0)
+    {
+        maintenance_clear_sensitive_memory(
+            root_key,
+            MATHOS_GATEWAY_ROOT_KEY_LEN);
+
+        /*
+            Log only the Mbed TLS error code.
+
+            Never log the passphrase, salt-derived key,
+            or generated root key.
+        */
+        ESP_LOGE(
+            TAG,
+            "PBKDF2 root-key derivation failed: "
+            "-0x%04X",
+            (unsigned int)(-result));
+
+        return ESP_FAIL;
+    }
+
+    /*
+        PBKDF2 should not produce an all-zero result, but
+        explicitly reject it because MATHOS reserves an
+        all-zero root key for the unprovisioned state.
+    */
+    int key_contains_nonzero_byte = 0;
+
+    for (size_t i = 0;
+         i < MATHOS_GATEWAY_ROOT_KEY_LEN;
+         i++)
+    {
+        if (root_key[i] != 0)
+        {
+            key_contains_nonzero_byte = 1;
+            break;
+        }
+    }
+
+    if (!key_contains_nonzero_byte)
+    {
+        maintenance_clear_sensitive_memory(
+            root_key,
+            MATHOS_GATEWAY_ROOT_KEY_LEN);
+
+        ESP_LOGE(
+            TAG,
+            "PBKDF2 produced an invalid zero root key");
+
+        return ESP_FAIL;
+    }
+    ESP_LOGI(
+        TAG,
+        "PBKDF2 root-key derivation completed "
+        "iterations=%lu duration_ms=%lld",
+        (unsigned long)iteration_count,
+        (long long)(derivation_duration_us / 1000LL));
+    return ESP_OK;
+}
+
+static esp_err_t maintenance_parse_u8_range(
+    const char *text,
+    uint8_t minimum,
+    uint8_t maximum,
+    uint8_t *value)
+{
+    if (value == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint32_t parsed = 0;
+
+    esp_err_t err =
+        maintenance_parse_u32_range(
+            text,
+            minimum,
+            maximum,
+            &parsed);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    *value =
+        (uint8_t)parsed;
+
+    return ESP_OK;
+}
+
+static esp_err_t maintenance_prepare_gateway_passphrase_key(
+    const char *passphrase,
+    const char *passphrase_confirmation,
+    uint8_t root_key[MATHOS_GATEWAY_ROOT_KEY_LEN],
+    uint8_t pairing_salt[MATHOS_PAIRING_SALT_LEN],
+    int *key_was_provided)
+{
+    if (passphrase == NULL ||
+        passphrase_confirmation == NULL ||
+        root_key == NULL ||
+        pairing_salt == NULL ||
+        key_was_provided == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *key_was_provided = 0;
+
+    /*
+        Always clear the outputs first.
+
+        A failed operation must never leave old key or
+        salt material in the caller's buffers.
+    */
+    maintenance_clear_sensitive_memory(
+        root_key,
+        MATHOS_GATEWAY_ROOT_KEY_LEN);
+
+    maintenance_clear_sensitive_memory(
+        pairing_salt,
+        MATHOS_PAIRING_SALT_LEN);
+
+    /*
+        Both empty fields mean:
+
+        Preserve the currently provisioned key.
+    */
+    if (passphrase[0] == '\0' &&
+        passphrase_confirmation[0] == '\0')
+    {
+        return ESP_OK;
+    }
+
+    /*
+        Reject a submission where only one field
+        contains a value.
+    */
+    if (passphrase[0] == '\0' ||
+        passphrase_confirmation[0] == '\0')
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t passphrase_length =
+        strnlen(
+            passphrase,
+            MATHOS_PAIRING_PASSPHRASE_MAX_LEN + 1U);
+
+    size_t confirmation_length =
+        strnlen(
+            passphrase_confirmation,
+            MATHOS_PAIRING_PASSPHRASE_MAX_LEN + 1U);
+
+    if (passphrase_length <
+            MATHOS_PAIRING_PASSPHRASE_MIN_LEN ||
+        passphrase_length >
+            MATHOS_PAIRING_PASSPHRASE_MAX_LEN ||
+        confirmation_length !=
+            passphrase_length)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Compare the complete passphrases without returning
+        immediately at the first different character.
+    */
+    uint8_t mismatch = 0;
+
+    for (size_t i = 0;
+         i < passphrase_length;
+         i++)
+    {
+        mismatch |=
+            (uint8_t)((uint8_t)passphrase[i] ^
+                      (uint8_t)passphrase_confirmation[i]);
+    }
+
+    if (mismatch != 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Create a fresh random salt whenever a new
+        passphrase is provisioned.
+    */
+    esp_err_t salt_err =
+        mathos_maintenance_generate_pairing_salt(
+            pairing_salt);
+
+    if (salt_err != ESP_OK)
+    {
+        maintenance_clear_sensitive_memory(
+            pairing_salt,
+            MATHOS_PAIRING_SALT_LEN);
+
+        return salt_err;
+    }
+
+    /*
+        Derive the existing 256-bit MATHOS root key using
+        PBKDF2-HMAC-SHA256.
+    */
+    esp_err_t derive_err =
+        mathos_maintenance_derive_root_key_from_passphrase(
+            passphrase,
+            pairing_salt,
+            MATHOS_PAIRING_KDF_DEFAULT_ITERATIONS,
+            root_key);
+
+    if (derive_err != ESP_OK)
+    {
+        maintenance_clear_sensitive_memory(
+            root_key,
+            MATHOS_GATEWAY_ROOT_KEY_LEN);
+
+        maintenance_clear_sensitive_memory(
+            pairing_salt,
+            MATHOS_PAIRING_SALT_LEN);
+
+        return derive_err;
+    }
+
+    *key_was_provided = 1;
+
+    return ESP_OK;
+}
+
 static esp_err_t maintenance_rc_config_post_handler(
     httpd_req_t *request)
 {
@@ -1626,17 +7258,6 @@ static esp_err_t maintenance_rc_config_post_handler(
 
     if (maintenance_active_role !=
         MATHOS_MAINTENANCE_ROLE_RC)
-    {
-        ESP_LOGW(
-            TAG,
-            "RC configuration POST rejected for role=%d",
-            (int)maintenance_active_role);
-
-        return maintenance_send_text_response(
-            request,
-            "403 Forbidden",
-            "RC configuration is unavailable on this device.\n");
-    }
     {
         ESP_LOGW(
             TAG,
@@ -1975,6 +7596,722 @@ static esp_err_t maintenance_rc_config_post_handler(
         NULL,
         0);
 }
+
+static esp_err_t maintenance_gateway_config_post_handler(
+    httpd_req_t *request)
+{
+    if (request == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Never permit Gateway configuration through the
+        RC maintenance role.
+    */
+    if (maintenance_active_role !=
+        MATHOS_MAINTENANCE_ROLE_GATEWAY)
+    {
+        ESP_LOGW(
+            TAG,
+            "Gateway configuration POST rejected for role=%d",
+            (int)maintenance_active_role);
+
+        return maintenance_send_text_response(
+            request,
+            "403 Forbidden",
+            "Gateway configuration is unavailable "
+            "on this device.\n");
+    }
+
+    size_t content_length =
+        request->content_len;
+
+    if (content_length == 0 ||
+        content_length >
+            MATHOS_MAINTENANCE_FORM_BODY_MAX)
+    {
+        ESP_LOGW(
+            TAG,
+            "Gateway configuration POST rejected: "
+            "body size=%u",
+            (unsigned int)content_length);
+
+        return maintenance_send_text_response(
+            request,
+            "413 Payload Too Large",
+            "Invalid Gateway configuration form size.\n");
+    }
+
+    char *body =
+        malloc(
+            content_length + 1U);
+
+    if (body == NULL)
+    {
+        ESP_LOGE(
+            TAG,
+            "failed to allocate Gateway POST buffer");
+
+        return maintenance_send_text_response(
+            request,
+            "500 Internal Server Error",
+            "Insufficient memory.\n");
+    }
+
+    char gateway_id_text[4] = "";
+    char authorised_rc_id_text[4] = "";
+
+    char pairing_passphrase[MATHOS_PAIRING_PASSPHRASE_MAX_LEN + 1U] = "";
+
+    char pairing_passphrase_confirm[MATHOS_PAIRING_PASSPHRASE_MAX_LEN + 1U] = "";
+
+    char link_uart_baud_text[11] = "";
+    char fc_uart_baud_text[11] = "";
+
+    char rc_packet_timeout_text[11] = "";
+    char fc_heartbeat_timeout_text[11] = "";
+    char status_tx_period_text[11] = "";
+    char telemetry_tx_period_text[11] = "";
+
+    char failsafe_policy_text[4] = "";
+
+    uint8_t derived_root_key[MATHOS_GATEWAY_ROOT_KEY_LEN] = {0};
+
+    uint8_t generated_pairing_salt[MATHOS_PAIRING_SALT_LEN] = {0};
+
+    int key_was_provided = 0;
+
+    mathos_gateway_config_t candidate = {0};
+
+    size_t total_received = 0;
+    int timeout_count = 0;
+
+    while (total_received <
+           content_length)
+    {
+        int received =
+            httpd_req_recv(
+                request,
+                body + total_received,
+                content_length -
+                    total_received);
+
+        if (received ==
+            HTTPD_SOCK_ERR_TIMEOUT)
+        {
+            timeout_count++;
+
+            if (timeout_count > 2)
+            {
+                ESP_LOGW(
+                    TAG,
+                    "Gateway configuration POST "
+                    "receive timeout");
+
+                goto request_timeout;
+            }
+
+            continue;
+        }
+
+        if (received <= 0)
+        {
+            ESP_LOGW(
+                TAG,
+                "Gateway configuration POST "
+                "receive failed");
+
+            goto invalid_request;
+        }
+
+        total_received +=
+            (size_t)received;
+    }
+
+    body[total_received] = '\0';
+
+    esp_err_t field_err =
+        maintenance_form_get_value(
+            body,
+            "gateway_id",
+            gateway_id_text,
+            sizeof(gateway_id_text));
+
+    if (field_err != ESP_OK)
+    {
+        goto invalid_form;
+    }
+
+    field_err =
+        maintenance_form_get_value(
+            body,
+            "authorised_rc_id",
+            authorised_rc_id_text,
+            sizeof(authorised_rc_id_text));
+
+    if (field_err != ESP_OK)
+    {
+        goto invalid_form;
+    }
+
+    field_err =
+        maintenance_form_get_value(
+            body,
+            "pairing_passphrase",
+            pairing_passphrase,
+            sizeof(pairing_passphrase));
+
+    if (field_err != ESP_OK)
+    {
+        goto invalid_form;
+    }
+
+    field_err =
+        maintenance_form_get_value(
+            body,
+            "pairing_passphrase_confirm",
+            pairing_passphrase_confirm,
+            sizeof(pairing_passphrase_confirm));
+
+    if (field_err != ESP_OK)
+    {
+        goto invalid_form;
+    }
+
+    field_err =
+        maintenance_form_get_value(
+            body,
+            "link_uart_baud",
+            link_uart_baud_text,
+            sizeof(link_uart_baud_text));
+
+    if (field_err != ESP_OK)
+    {
+        goto invalid_form;
+    }
+
+    field_err =
+        maintenance_form_get_value(
+            body,
+            "fc_uart_baud",
+            fc_uart_baud_text,
+            sizeof(fc_uart_baud_text));
+
+    if (field_err != ESP_OK)
+    {
+        goto invalid_form;
+    }
+
+    field_err =
+        maintenance_form_get_value(
+            body,
+            "rc_packet_timeout_ms",
+            rc_packet_timeout_text,
+            sizeof(rc_packet_timeout_text));
+
+    if (field_err != ESP_OK)
+    {
+        goto invalid_form;
+    }
+
+    field_err =
+        maintenance_form_get_value(
+            body,
+            "fc_heartbeat_timeout_ms",
+            fc_heartbeat_timeout_text,
+            sizeof(fc_heartbeat_timeout_text));
+
+    if (field_err != ESP_OK)
+    {
+        goto invalid_form;
+    }
+
+    field_err =
+        maintenance_form_get_value(
+            body,
+            "status_tx_period_ms",
+            status_tx_period_text,
+            sizeof(status_tx_period_text));
+
+    if (field_err != ESP_OK)
+    {
+        goto invalid_form;
+    }
+
+    field_err =
+        maintenance_form_get_value(
+            body,
+            "telemetry_tx_period_ms",
+            telemetry_tx_period_text,
+            sizeof(telemetry_tx_period_text));
+
+    if (field_err != ESP_OK)
+    {
+        goto invalid_form;
+    }
+
+    field_err =
+        maintenance_form_get_value(
+            body,
+            "failsafe_policy",
+            failsafe_policy_text,
+            sizeof(failsafe_policy_text));
+
+    if (field_err != ESP_OK)
+    {
+        goto invalid_form;
+    }
+
+    maintenance_clear_sensitive_memory(
+        body,
+        content_length + 1U);
+
+    free(body);
+    body = NULL;
+
+    uint8_t gateway_id = 0;
+    uint8_t authorised_rc_id = 0;
+    uint8_t failsafe_policy = 0;
+
+    uint32_t link_uart_baud = 0;
+    uint32_t fc_uart_baud = 0;
+
+    uint16_t rc_packet_timeout_ms = 0;
+    uint16_t fc_heartbeat_timeout_ms = 0;
+    uint16_t status_tx_period_ms = 0;
+    uint16_t telemetry_tx_period_ms = 0;
+
+    field_err =
+        maintenance_parse_u8_range(
+            gateway_id_text,
+            1,
+            254,
+            &gateway_id);
+
+    if (field_err != ESP_OK)
+    {
+        goto invalid_form;
+    }
+
+    field_err =
+        maintenance_parse_u8_range(
+            authorised_rc_id_text,
+            1,
+            254,
+            &authorised_rc_id);
+
+    if (field_err != ESP_OK)
+    {
+        goto invalid_form;
+    }
+
+    if (gateway_id ==
+        authorised_rc_id)
+    {
+        goto invalid_form;
+    }
+
+    field_err =
+        maintenance_parse_u32_range(
+            link_uart_baud_text,
+            9600,
+            921600,
+            &link_uart_baud);
+
+    if (field_err != ESP_OK ||
+        !mathos_gateway_uart_baud_is_valid(
+            link_uart_baud))
+    {
+        goto invalid_form;
+    }
+
+    field_err =
+        maintenance_parse_u32_range(
+            fc_uart_baud_text,
+            9600,
+            921600,
+            &fc_uart_baud);
+
+    if (field_err != ESP_OK ||
+        !mathos_gateway_uart_baud_is_valid(
+            fc_uart_baud))
+    {
+        goto invalid_form;
+    }
+
+    field_err =
+        maintenance_parse_u16_range(
+            rc_packet_timeout_text,
+            100,
+            5000,
+            &rc_packet_timeout_ms);
+
+    if (field_err != ESP_OK)
+    {
+        goto invalid_form;
+    }
+
+    field_err =
+        maintenance_parse_u16_range(
+            fc_heartbeat_timeout_text,
+            1000,
+            10000,
+            &fc_heartbeat_timeout_ms);
+
+    if (field_err != ESP_OK)
+    {
+        goto invalid_form;
+    }
+
+    field_err =
+        maintenance_parse_u16_range(
+            status_tx_period_text,
+            50,
+            5000,
+            &status_tx_period_ms);
+
+    if (field_err != ESP_OK)
+    {
+        goto invalid_form;
+    }
+
+    field_err =
+        maintenance_parse_u16_range(
+            telemetry_tx_period_text,
+            50,
+            5000,
+            &telemetry_tx_period_ms);
+
+    if (field_err != ESP_OK)
+    {
+        goto invalid_form;
+    }
+
+    field_err =
+        maintenance_parse_u8_range(
+            failsafe_policy_text,
+            MATHOS_GATEWAY_FAILSAFE_FC_NATIVE,
+            MATHOS_GATEWAY_FAILSAFE_RTL,
+            &failsafe_policy);
+
+    if (field_err != ESP_OK)
+    {
+        goto invalid_form;
+    }
+
+    field_err =
+        maintenance_prepare_gateway_passphrase_key(
+            pairing_passphrase,
+            pairing_passphrase_confirm,
+            derived_root_key,
+            generated_pairing_salt,
+            &key_was_provided);
+
+    if (field_err != ESP_OK)
+    {
+        goto invalid_form;
+    }
+
+    /*
+        Start from the active verified configuration.
+
+        Empty passphrase fields preserve the currently
+        provisioned key, salt, derivation settings and
+        key generation.
+    */
+    candidate =
+        maintenance_active_gateway_config;
+
+    candidate.gateway_id =
+        gateway_id;
+
+    candidate.authorised_rc_id =
+        authorised_rc_id;
+
+    candidate.link_uart_baud =
+        link_uart_baud;
+
+    candidate.fc_uart_baud =
+        fc_uart_baud;
+
+    candidate.rc_packet_timeout_ms =
+        rc_packet_timeout_ms;
+
+    candidate.fc_heartbeat_timeout_ms =
+        fc_heartbeat_timeout_ms;
+
+    candidate.status_tx_period_ms =
+        status_tx_period_ms;
+
+    candidate.telemetry_tx_period_ms =
+        telemetry_tx_period_ms;
+
+    candidate.failsafe_policy =
+        failsafe_policy;
+
+    if (key_was_provided)
+    {
+        memcpy(
+            candidate.root_key,
+            derived_root_key,
+            sizeof(candidate.root_key));
+
+        memcpy(
+            candidate.pairing_salt,
+            generated_pairing_salt,
+            sizeof(candidate.pairing_salt));
+
+        candidate.key_derivation_method =
+            MATHOS_GATEWAY_KEY_DERIVATION_PBKDF2_SHA256;
+
+        candidate.kdf_iteration_count =
+            MATHOS_PAIRING_KDF_DEFAULT_ITERATIONS;
+
+        candidate.key_generation =
+            maintenance_active_gateway_config
+                .key_generation +
+            1U;
+
+        /*
+            Prevent wrap-around from creating generation
+            zero, which represents an unprovisioned key.
+        */
+        if (candidate.key_generation == 0)
+        {
+            candidate.key_generation = 1U;
+        }
+    }
+
+    esp_err_t save_err =
+        mathos_gateway_config_save(
+            &candidate);
+
+    maintenance_clear_sensitive_memory(
+        pairing_passphrase,
+        sizeof(pairing_passphrase));
+
+    maintenance_clear_sensitive_memory(
+        pairing_passphrase_confirm,
+        sizeof(pairing_passphrase_confirm));
+
+    maintenance_clear_sensitive_memory(
+        derived_root_key,
+        sizeof(derived_root_key));
+
+    maintenance_clear_sensitive_memory(
+        generated_pairing_salt,
+        sizeof(generated_pairing_salt));
+
+    maintenance_clear_sensitive_memory(
+        &candidate,
+        sizeof(candidate));
+
+    if (save_err != ESP_OK)
+    {
+        ESP_LOGW(
+            TAG,
+            "Gateway configuration save rejected: %s",
+            esp_err_to_name(save_err));
+
+        return maintenance_send_text_response(
+            request,
+            "400 Bad Request",
+            "Gateway configuration is incomplete "
+            "or invalid.\n");
+    }
+
+    /*
+        Reload the verified record instead of trusting
+        the submitted RAM candidate.
+    */
+    int loaded_from_nvs = 0;
+
+    esp_err_t load_err =
+        mathos_gateway_config_load(
+            &maintenance_active_gateway_config,
+            &loaded_from_nvs);
+
+    if (load_err != ESP_OK ||
+        !loaded_from_nvs)
+    {
+        ESP_LOGE(
+            TAG,
+            "saved Gateway configuration could not "
+            "be reloaded: %s",
+            esp_err_to_name(load_err));
+
+        return maintenance_send_text_response(
+            request,
+            "500 Internal Server Error",
+            "Gateway configuration was written but "
+            "verification failed.\n");
+    }
+
+    maintenance_gateway_config_loaded_from_nvs = 1;
+
+    ESP_LOGI(
+        TAG,
+        "Gateway configuration updated "
+        "gateway_id=%u rc_id=%u "
+        "key_generation=%lu "
+        "link_baud=%lu fc_baud=%lu "
+        "failsafe_policy=%u counter=%lu",
+        maintenance_active_gateway_config.gateway_id,
+        maintenance_active_gateway_config.authorised_rc_id,
+        (unsigned long)
+            maintenance_active_gateway_config.key_generation,
+        (unsigned long)
+            maintenance_active_gateway_config.link_uart_baud,
+        (unsigned long)
+            maintenance_active_gateway_config.fc_uart_baud,
+        maintenance_active_gateway_config.failsafe_policy,
+        (unsigned long)
+            maintenance_active_gateway_config
+                .configuration_counter);
+
+    /*
+        POST/Redirect/GET prevents accidental resubmission
+        when the browser refreshes the page.
+    */
+    esp_err_t response_err =
+        httpd_resp_set_status(
+            request,
+            "303 See Other");
+
+    if (response_err != ESP_OK)
+    {
+        return response_err;
+    }
+
+    response_err =
+        httpd_resp_set_hdr(
+            request,
+            "Location",
+            "/");
+
+    if (response_err != ESP_OK)
+    {
+        return response_err;
+    }
+
+    response_err =
+        httpd_resp_set_hdr(
+            request,
+            "Cache-Control",
+            "no-store");
+
+    if (response_err != ESP_OK)
+    {
+        return response_err;
+    }
+
+    return httpd_resp_send(
+        request,
+        NULL,
+        0);
+
+invalid_form:
+
+    ESP_LOGW(
+        TAG,
+        "Gateway configuration form contains "
+        "invalid or missing fields");
+
+    if (body != NULL)
+    {
+        maintenance_clear_sensitive_memory(
+            body,
+            content_length + 1U);
+
+        free(body);
+        body = NULL;
+    }
+
+    maintenance_clear_sensitive_memory(
+        pairing_passphrase,
+        sizeof(pairing_passphrase));
+
+    maintenance_clear_sensitive_memory(
+        pairing_passphrase_confirm,
+        sizeof(pairing_passphrase_confirm));
+
+    maintenance_clear_sensitive_memory(
+        derived_root_key,
+        sizeof(derived_root_key));
+
+    maintenance_clear_sensitive_memory(
+        generated_pairing_salt,
+        sizeof(generated_pairing_salt));
+
+    maintenance_clear_sensitive_memory(
+        &candidate,
+        sizeof(candidate));
+
+    return maintenance_send_text_response(
+        request,
+        "400 Bad Request",
+        "Invalid Gateway configuration values.\n");
+
+request_timeout:
+
+    maintenance_clear_sensitive_memory(
+        body,
+        content_length + 1U);
+
+    free(body);
+
+    maintenance_clear_sensitive_memory(
+        pairing_passphrase,
+        sizeof(pairing_passphrase));
+
+    maintenance_clear_sensitive_memory(
+        pairing_passphrase_confirm,
+        sizeof(pairing_passphrase_confirm));
+
+    maintenance_clear_sensitive_memory(
+        derived_root_key,
+        sizeof(derived_root_key));
+
+    maintenance_clear_sensitive_memory(
+        generated_pairing_salt,
+        sizeof(generated_pairing_salt));
+
+    return maintenance_send_text_response(
+        request,
+        "408 Request Timeout",
+        "Request timed out.\n");
+
+invalid_request:
+
+    maintenance_clear_sensitive_memory(
+        body,
+        content_length + 1U);
+
+    free(body);
+
+    maintenance_clear_sensitive_memory(
+        pairing_passphrase,
+        sizeof(pairing_passphrase));
+
+    maintenance_clear_sensitive_memory(
+        pairing_passphrase_confirm,
+        sizeof(pairing_passphrase_confirm));
+
+    maintenance_clear_sensitive_memory(
+        derived_root_key,
+        sizeof(derived_root_key));
+
+    maintenance_clear_sensitive_memory(
+        generated_pairing_salt,
+        sizeof(generated_pairing_salt));
+
+    return maintenance_send_text_response(
+        request,
+        "400 Bad Request",
+        "Could not read Gateway configuration form.\n");
+}
+
 static void maintenance_wifi_event_handler(
     void *handler_argument,
     esp_event_base_t event_base,
@@ -2067,37 +8404,146 @@ esp_err_t mathos_maintenance_softap_start(
         return ESP_ERR_INVALID_ARG;
     }
 
-    esp_err_t config_err =
-        mathos_maintenance_config_load(
-            &maintenance_active_config,
-            &maintenance_config_loaded_from_nvs);
+    esp_err_t config_err = ESP_OK;
 
-    if (config_err != ESP_OK)
+    if (role == MATHOS_MAINTENANCE_ROLE_RC)
     {
-        ESP_LOGW(
+        /*
+            The RC uses the telemetry-forwarding
+            configuration stored under config_v1.
+        */
+        config_err =
+            mathos_maintenance_config_load(
+                &maintenance_active_config,
+                &maintenance_config_loaded_from_nvs);
+
+        if (config_err != ESP_OK)
+        {
+            ESP_LOGW(
+                TAG,
+                "RC maintenance configuration load failed: %s; "
+                "safe defaults remain active",
+                esp_err_to_name(config_err));
+
+            maintenance_config_loaded_from_nvs = 0;
+        }
+
+        ESP_LOGI(
             TAG,
-            "maintenance configuration load failed: %s; "
-            "safe defaults remain active",
-            esp_err_to_name(config_err));
+            "active RC configuration source=%s "
+            "telemetry=%u ssid_set=%u host_set=%u port=%u",
+            maintenance_config_loaded_from_nvs
+                ? "NVS"
+                : "DEFAULTS",
+            maintenance_active_config.telemetry_enabled,
+            maintenance_active_config.wifi_ssid[0] != '\0'
+                ? 1U
+                : 0U,
+            maintenance_active_config.server_host[0] != '\0'
+                ? 1U
+                : 0U,
+            maintenance_active_config.server_port);
 
-        maintenance_config_loaded_from_nvs = 0;
+        /*
+            Load the RC cryptographic pairing record separately
+            from telemetry and server configuration.
+        */
+        esp_err_t pairing_err =
+            mathos_rc_pairing_config_load(
+                &maintenance_active_rc_pairing_config,
+                &maintenance_rc_pairing_config_loaded_from_nvs);
+
+        if (pairing_err != ESP_OK)
+        {
+            ESP_LOGW(
+                TAG,
+                "RC pairing configuration load failed: %s; "
+                "unpaired defaults remain active",
+                esp_err_to_name(pairing_err));
+
+            maintenance_rc_pairing_config_loaded_from_nvs = 0;
+        }
+
+        ESP_LOGI(
+            TAG,
+            "active RC pairing source=%s "
+            "rc_id=%u gateway_id=%u "
+            "key_generation=%lu key_provisioned=%u "
+            "counter=%lu",
+            maintenance_rc_pairing_config_loaded_from_nvs
+                ? "NVS"
+                : "DEFAULTS",
+            maintenance_active_rc_pairing_config.rc_id,
+            maintenance_active_rc_pairing_config
+                .authorised_gateway_id,
+            (unsigned long)
+                maintenance_active_rc_pairing_config
+                    .key_generation,
+            maintenance_active_rc_pairing_config
+                        .key_generation != 0
+                ? 1U
+                : 0U,
+            (unsigned long)
+                maintenance_active_rc_pairing_config
+                    .configuration_counter);
     }
+    else if (role == MATHOS_MAINTENANCE_ROLE_GATEWAY)
+    {
+        /*
+            The airborne Gateway uses the separate
+            configuration stored under gateway_v2.
+        */
+        config_err =
+            mathos_gateway_config_load(
+                &maintenance_active_gateway_config,
+                &maintenance_gateway_config_loaded_from_nvs);
 
-    ESP_LOGI(
-        TAG,
-        "active maintenance configuration source=%s "
-        "telemetry=%u ssid_set=%u host_set=%u port=%u",
-        maintenance_config_loaded_from_nvs
-            ? "NVS"
-            : "DEFAULTS",
-        maintenance_active_config.telemetry_enabled,
-        maintenance_active_config.wifi_ssid[0] != '\0'
-            ? 1U
-            : 0U,
-        maintenance_active_config.server_host[0] != '\0'
-            ? 1U
-            : 0U,
-        maintenance_active_config.server_port);
+        if (config_err != ESP_OK)
+        {
+            ESP_LOGW(
+                TAG,
+                "Gateway configuration load failed: %s; "
+                "safe defaults remain active",
+                esp_err_to_name(config_err));
+
+            maintenance_gateway_config_loaded_from_nvs = 0;
+        }
+
+        ESP_LOGI(
+            TAG,
+            "active Gateway configuration source=%s "
+            "gateway_id=%u rc_id=%u "
+            "key_generation=%lu key_provisioned=%u "
+            "link_baud=%lu fc_baud=%lu "
+            "rc_timeout=%u fc_timeout=%u "
+            "status_period=%u telemetry_period=%u "
+            "failsafe_policy=%u counter=%lu",
+            maintenance_gateway_config_loaded_from_nvs
+                ? "NVS"
+                : "DEFAULTS",
+            maintenance_active_gateway_config.gateway_id,
+            maintenance_active_gateway_config.authorised_rc_id,
+            (unsigned long)
+                maintenance_active_gateway_config.key_generation,
+            maintenance_active_gateway_config.key_generation != 0
+                ? 1U
+                : 0U,
+            (unsigned long)
+                maintenance_active_gateway_config.link_uart_baud,
+            (unsigned long)
+                maintenance_active_gateway_config.fc_uart_baud,
+            maintenance_active_gateway_config.rc_packet_timeout_ms,
+            maintenance_active_gateway_config.fc_heartbeat_timeout_ms,
+            maintenance_active_gateway_config.status_tx_period_ms,
+            maintenance_active_gateway_config.telemetry_tx_period_ms,
+            maintenance_active_gateway_config.failsafe_policy,
+            (unsigned long)
+                maintenance_active_gateway_config.configuration_counter);
+    }
+    else
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
 
     esp_err_t err =
         esp_netif_init();
@@ -2281,6 +8727,25 @@ esp_err_t mathos_maintenance_softap_start(
     ESP_LOGI(
         TAG,
         "maintenance control and flight tasks remain disabled");
+
+#if MATHOS_PAIRING_BENCH_SELF_TEST_ENABLED
+
+    if (role ==
+        MATHOS_MAINTENANCE_ROLE_RC)
+    {
+        esp_err_t self_test_err =
+            maintenance_run_pairing_bench_self_test();
+
+        if (self_test_err != ESP_OK)
+        {
+            ESP_LOGE(
+                TAG,
+                "pairing bench self-test returned: %s",
+                esp_err_to_name(self_test_err));
+        }
+    }
+
+#endif
 
     return ESP_OK;
 }

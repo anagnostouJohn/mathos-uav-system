@@ -3619,26 +3619,73 @@ void system_health_task(void *pvParameters)
         }
 #if FEATURE_SECURE_GATEWAY_MODE
 
-        int gateway_control_ok = gateway_control_link_is_ok();
+        int gateway_control_ok =
+            gateway_control_link_is_ok();
 
+        int fc_heartbeat_fresh =
+            gateway_fc_heartbeat_is_fresh();
+
+        /*
+            DRONE_LINK_BAD means the RC-to-gateway
+            control link itself is unavailable.
+        */
         if (!gateway_control_ok)
         {
-            fault_set(FAULT_TELEMETRY_STALE);
             fault_set(FAULT_DRONE_LINK_BAD);
         }
         else
         {
-            fault_clear(FAULT_TELEMETRY_STALE);
             fault_clear(FAULT_DRONE_LINK_BAD);
         }
 
-        if (command_state == RC_ARMED && !gateway_control_ok)
+        /*
+            TELEMETRY_STALE means either:
+
+            1. Gateway status is unavailable, or
+            2. The gateway reports that the FC heartbeat
+               is no longer fresh.
+        */
+        if (!gateway_control_ok ||
+            !fc_heartbeat_fresh)
         {
-            enter_failsafe("gateway control link bad while armed");
+            fault_set(FAULT_TELEMETRY_STALE);
+        }
+        else
+        {
+            fault_clear(FAULT_TELEMETRY_STALE);
+        }
+
+        /*
+            Runtime safety while ARMED.
+
+            Keep the two failures separate so the logs
+            identify which link disappeared.
+        */
+        if (command_state == RC_ARMED &&
+            !gateway_control_ok)
+        {
+            enter_failsafe(
+                "gateway control link bad while armed");
+
             command_state = RC_FAILSAFE;
 
-            printf("[HEALTH] FAILSAFE: gateway control link bad while ARMED\n");
+            printf(
+                "[HEALTH] FAILSAFE: "
+                "gateway control link bad while ARMED\n");
         }
+        else if (command_state == RC_ARMED &&
+                 !fc_heartbeat_fresh)
+        {
+            enter_failsafe(
+                "FC heartbeat stale while armed");
+
+            command_state = RC_FAILSAFE;
+
+            printf(
+                "[HEALTH] FAILSAFE: "
+                "FC heartbeat stale while ARMED\n");
+        }
+
 #endif
 #if FEATURE_DIRECT_MAVLINK_MODE
 
