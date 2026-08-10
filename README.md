@@ -24,3 +24,22 @@ Remote Ground Gateway ESP32
 
 
 “where are we?”, “what is next?”, or “show the backlog”,
+
+
+
+BOOT
+ │
+ ├─ Maintenance build
+ │      ↓
+ │   SoftAP only
+ │   Control tasks OFF
+ │
+ └─ Normal build
+        ↓
+     Load NVS
+        ↓
+     Paired?
+      /    \
+    NO      YES
+    ↓        ↓
+  STOP    operational startup

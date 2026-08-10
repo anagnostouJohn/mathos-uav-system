@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
 
 #include "esp_event.h"
 #include "esp_log.h"
@@ -82,7 +83,7 @@ static void maintenance_clear_sensitive_memory(
 
 static esp_err_t maintenance_run_pairing_bench_self_test(
     void);
-
+static esp_err_t mathos_pairing_package_wire_self_test(void);
 static uint32_t mathos_maintenance_config_calculate_crc32(
     const mathos_maintenance_config_t *config)
 {
@@ -378,6 +379,577 @@ static uint32_t mathos_pairing_proof_calculate_crc32(
     return ~crc;
 }
 
+esp_err_t mathos_pairing_wire_encode_header(
+    const mathos_pairing_wire_header_t *header,
+    uint8_t output[MATHOS_PAIRING_WIRE_HEADER_LEN])
+{
+    if (header == NULL ||
+        output == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Reject anything that is not a valid Mathos
+        pairing header before serializing it.
+    */
+    if (header->magic_0 !=
+            MATHOS_PAIRING_WIRE_MAGIC_0 ||
+        header->magic_1 !=
+            MATHOS_PAIRING_WIRE_MAGIC_1 ||
+        header->version !=
+            MATHOS_PAIRING_WIRE_VERSION)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (header->message_type <=
+            MATHOS_PAIRING_MSG_INVALID ||
+        header->message_type >
+            MATHOS_PAIRING_MSG_RESULT)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Pairing sequence zero is reserved as invalid.
+    */
+    if (header->sequence == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Canonical 10-byte wire representation.
+
+        Multi-byte integers are always little-endian.
+    */
+    output[0] =
+        MATHOS_PAIRING_WIRE_MAGIC_0;
+
+    output[1] =
+        MATHOS_PAIRING_WIRE_MAGIC_1;
+
+    output[2] =
+        MATHOS_PAIRING_WIRE_VERSION;
+
+    output[3] =
+        header->message_type;
+
+    output[4] =
+        (uint8_t)(header->payload_len & 0xFFU);
+
+    output[5] =
+        (uint8_t)((header->payload_len >> 8) &
+                  0xFFU);
+
+    output[6] =
+        (uint8_t)(header->sequence & 0xFFU);
+
+    output[7] =
+        (uint8_t)((header->sequence >> 8) &
+                  0xFFU);
+
+    output[8] =
+        (uint8_t)((header->sequence >> 16) &
+                  0xFFU);
+
+    output[9] =
+        (uint8_t)((header->sequence >> 24) &
+                  0xFFU);
+
+    return ESP_OK;
+}
+
+esp_err_t mathos_pairing_wire_decode_header(
+    const uint8_t input[MATHOS_PAIRING_WIRE_HEADER_LEN],
+    mathos_pairing_wire_header_t *header)
+{
+    if (input == NULL ||
+        header == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Reject frames that do not begin with the
+        Mathos Pairing magic bytes.
+    */
+    if (input[0] !=
+            MATHOS_PAIRING_WIRE_MAGIC_0 ||
+        input[1] !=
+            MATHOS_PAIRING_WIRE_MAGIC_1)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Reject unsupported protocol versions.
+    */
+    if (input[2] !=
+        MATHOS_PAIRING_WIRE_VERSION)
+    {
+        return ESP_ERR_INVALID_VERSION;
+    }
+
+    uint8_t message_type =
+        input[3];
+
+    if (message_type <=
+            MATHOS_PAIRING_MSG_INVALID ||
+        message_type >
+            MATHOS_PAIRING_MSG_RESULT)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint16_t payload_len =
+        (uint16_t)input[4] |
+        ((uint16_t)input[5] << 8);
+
+    uint32_t sequence =
+        (uint32_t)input[6] |
+        ((uint32_t)input[7] << 8) |
+        ((uint32_t)input[8] << 16) |
+        ((uint32_t)input[9] << 24);
+
+    /*
+        Pairing sequence zero is reserved.
+    */
+    if (sequence == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(
+        header,
+        0,
+        sizeof(*header));
+
+    header->magic_0 =
+        MATHOS_PAIRING_WIRE_MAGIC_0;
+
+    header->magic_1 =
+        MATHOS_PAIRING_WIRE_MAGIC_1;
+
+    header->version =
+        MATHOS_PAIRING_WIRE_VERSION;
+
+    header->message_type =
+        message_type;
+
+    header->payload_len =
+        payload_len;
+
+    header->sequence =
+        sequence;
+
+    return ESP_OK;
+}
+
+esp_err_t mathos_pairing_package_encode_payload(
+    const mathos_pairing_package_t *package,
+    uint8_t *output,
+    size_t output_size)
+{
+    if (package == NULL ||
+        output == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (output_size <
+        MATHOS_PAIRING_PACKAGE_WIRE_LEN)
+    {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    /*
+        Only serialize a pairing package that already
+        passes its structural and CRC validation.
+    */
+    if (!mathos_pairing_package_is_valid(
+            package))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t i = 0;
+
+    /*
+        magic uint32 little-endian
+    */
+    output[i++] =
+        (uint8_t)(package->magic & 0xFFU);
+
+    output[i++] =
+        (uint8_t)((package->magic >> 8) & 0xFFU);
+
+    output[i++] =
+        (uint8_t)((package->magic >> 16) & 0xFFU);
+
+    output[i++] =
+        (uint8_t)((package->magic >> 24) & 0xFFU);
+
+    /*
+        version uint16 little-endian
+    */
+    output[i++] =
+        (uint8_t)(package->version & 0xFFU);
+
+    output[i++] =
+        (uint8_t)((package->version >> 8) & 0xFFU);
+
+    /*
+        record_size uint16 little-endian
+    */
+    output[i++] =
+        (uint8_t)(package->record_size & 0xFFU);
+
+    output[i++] =
+        (uint8_t)((package->record_size >> 8) & 0xFFU);
+
+    /*
+        Device identities and KDF selector.
+    */
+    output[i++] =
+        package->rc_id;
+
+    output[i++] =
+        package->gateway_id;
+
+    output[i++] =
+        package->key_derivation_method;
+
+    output[i++] =
+        package->reserved0;
+
+    /*
+        key_generation uint32 little-endian
+    */
+    output[i++] =
+        (uint8_t)(package->key_generation & 0xFFU);
+
+    output[i++] =
+        (uint8_t)((package->key_generation >> 8) & 0xFFU);
+
+    output[i++] =
+        (uint8_t)((package->key_generation >> 16) & 0xFFU);
+
+    output[i++] =
+        (uint8_t)((package->key_generation >> 24) & 0xFFU);
+
+    /*
+        PBKDF2 iteration count uint32 little-endian.
+    */
+    output[i++] =
+        (uint8_t)(package->kdf_iteration_count & 0xFFU);
+
+    output[i++] =
+        (uint8_t)((package->kdf_iteration_count >> 8) & 0xFFU);
+
+    output[i++] =
+        (uint8_t)((package->kdf_iteration_count >> 16) & 0xFFU);
+
+    output[i++] =
+        (uint8_t)((package->kdf_iteration_count >> 24) & 0xFFU);
+
+    /*
+        Public pairing salt.
+    */
+    for (size_t salt_index = 0;
+         salt_index < MATHOS_PAIRING_SALT_LEN;
+         salt_index++)
+    {
+        output[i++] =
+            package->pairing_salt[salt_index];
+    }
+
+    /*
+        Reserved version-1 bytes.
+    */
+    for (size_t reserved_index = 0;
+         reserved_index <
+         sizeof(package->reserved1);
+         reserved_index++)
+    {
+        output[i++] =
+            package->reserved1[reserved_index];
+    }
+
+    /*
+        Package CRC uint32 little-endian.
+    */
+    output[i++] =
+        (uint8_t)(package->crc32 & 0xFFU);
+
+    output[i++] =
+        (uint8_t)((package->crc32 >> 8) & 0xFFU);
+
+    output[i++] =
+        (uint8_t)((package->crc32 >> 16) & 0xFFU);
+
+    output[i++] =
+        (uint8_t)((package->crc32 >> 24) & 0xFFU);
+
+    /*
+        Defensive programming check.
+
+        If the wire layout is edited incorrectly later,
+        fail instead of silently producing a malformed
+        package.
+    */
+    if (i !=
+        MATHOS_PAIRING_PACKAGE_WIRE_LEN)
+    {
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t mathos_pairing_package_decode_payload(
+    const uint8_t *input,
+    size_t input_size,
+    mathos_pairing_package_t *package)
+{
+    if (input == NULL ||
+        package == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (input_size !=
+        MATHOS_PAIRING_PACKAGE_WIRE_LEN)
+    {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    memset(
+        package,
+        0,
+        sizeof(*package));
+
+    size_t i = 0;
+
+    /*
+        magic uint32 little-endian
+    */
+    package->magic =
+        (uint32_t)input[i] |
+        ((uint32_t)input[i + 1] << 8) |
+        ((uint32_t)input[i + 2] << 16) |
+        ((uint32_t)input[i + 3] << 24);
+
+    i += 4;
+
+    /*
+        version uint16 little-endian
+    */
+    package->version =
+        (uint16_t)input[i] |
+        ((uint16_t)input[i + 1] << 8);
+
+    i += 2;
+
+    /*
+        record_size uint16 little-endian
+    */
+    package->record_size =
+        (uint16_t)input[i] |
+        ((uint16_t)input[i + 1] << 8);
+
+    i += 2;
+
+    package->rc_id =
+        input[i++];
+
+    package->gateway_id =
+        input[i++];
+
+    package->key_derivation_method =
+        input[i++];
+
+    package->reserved0 =
+        input[i++];
+
+    /*
+        key_generation uint32 little-endian
+    */
+    package->key_generation =
+        (uint32_t)input[i] |
+        ((uint32_t)input[i + 1] << 8) |
+        ((uint32_t)input[i + 2] << 16) |
+        ((uint32_t)input[i + 3] << 24);
+
+    i += 4;
+
+    /*
+        PBKDF2 iteration count uint32 little-endian
+    */
+    package->kdf_iteration_count =
+        (uint32_t)input[i] |
+        ((uint32_t)input[i + 1] << 8) |
+        ((uint32_t)input[i + 2] << 16) |
+        ((uint32_t)input[i + 3] << 24);
+
+    i += 4;
+
+    /*
+        Public pairing salt.
+    */
+    for (size_t salt_index = 0;
+         salt_index < MATHOS_PAIRING_SALT_LEN;
+         salt_index++)
+    {
+        package->pairing_salt[salt_index] =
+            input[i++];
+    }
+
+    /*
+        Reserved version-1 bytes.
+    */
+    for (size_t reserved_index = 0;
+         reserved_index <
+         sizeof(package->reserved1);
+         reserved_index++)
+    {
+        package->reserved1[reserved_index] =
+            input[i++];
+    }
+
+    /*
+        CRC uint32 little-endian
+    */
+    package->crc32 =
+        (uint32_t)input[i] |
+        ((uint32_t)input[i + 1] << 8) |
+        ((uint32_t)input[i + 2] << 16) |
+        ((uint32_t)input[i + 3] << 24);
+
+    i += 4;
+
+    /*
+        Defensive layout check.
+    */
+    if (i !=
+        MATHOS_PAIRING_PACKAGE_WIRE_LEN)
+    {
+        memset(
+            package,
+            0,
+            sizeof(*package));
+
+        return ESP_FAIL;
+    }
+
+    /*
+        Validate magic, version, KDF parameters,
+        generation and CRC using the existing
+        pairing package validator.
+    */
+    if (!mathos_pairing_package_is_valid(
+            package))
+    {
+        memset(
+            package,
+            0,
+            sizeof(*package));
+
+        return ESP_ERR_INVALID_CRC;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t
+mathos_pairing_wire_header_self_test(void)
+{
+    mathos_pairing_wire_header_t original = {
+        .magic_0 =
+            MATHOS_PAIRING_WIRE_MAGIC_0,
+
+        .magic_1 =
+            MATHOS_PAIRING_WIRE_MAGIC_1,
+
+        .version =
+            MATHOS_PAIRING_WIRE_VERSION,
+
+        .message_type =
+            MATHOS_PAIRING_MSG_PACKAGE,
+
+        .payload_len = 64,
+
+        .sequence = 0x12345678U};
+
+    uint8_t encoded[MATHOS_PAIRING_WIRE_HEADER_LEN];
+
+    memset(
+        encoded,
+        0,
+        sizeof(encoded));
+
+    esp_err_t err =
+        mathos_pairing_wire_encode_header(
+            &original,
+            encoded);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Pairing header self-test encode failed: %s",
+            esp_err_to_name(err));
+
+        return err;
+    }
+
+    mathos_pairing_wire_header_t decoded;
+
+    memset(
+        &decoded,
+        0,
+        sizeof(decoded));
+
+    err =
+        mathos_pairing_wire_decode_header(
+            encoded,
+            &decoded);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Pairing header self-test decode failed: %s",
+            esp_err_to_name(err));
+
+        return err;
+    }
+
+    if (decoded.magic_0 != original.magic_0 ||
+        decoded.magic_1 != original.magic_1 ||
+        decoded.version != original.version ||
+        decoded.message_type != original.message_type ||
+        decoded.payload_len != original.payload_len ||
+        decoded.sequence != original.sequence)
+    {
+        ESP_LOGE(
+            TAG,
+            "Pairing header self-test mismatch");
+
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "Pairing header self-test PASSED "
+        "type=%u payload_len=%u sequence=0x%08" PRIx32,
+        decoded.message_type,
+        decoded.payload_len,
+        decoded.sequence);
+
+    return ESP_OK;
+}
 void mathos_gateway_config_set_defaults(
     mathos_gateway_config_t *config)
 {
@@ -2045,7 +2617,207 @@ cleanup:
 
     return result;
 }
+static esp_err_t
+mathos_pairing_package_wire_self_test(void)
+{
+    mathos_pairing_package_t original;
 
+    mathos_pairing_package_set_defaults(
+        &original);
+
+    /*
+        Turn the default empty package into a valid
+        provisioned pairing offer.
+    */
+    original.rc_id = 1;
+    original.gateway_id = 2;
+
+    original.key_derivation_method =
+        MATHOS_GATEWAY_KEY_DERIVATION_PBKDF2_SHA256;
+
+    original.key_generation = 7;
+
+    original.kdf_iteration_count =
+        MATHOS_PAIRING_KDF_DEFAULT_ITERATIONS;
+
+    /*
+        Deterministic nonzero salt for this wire-format
+        self-test only.
+
+        This is NOT an operational pairing salt.
+    */
+    for (size_t i = 0;
+         i < MATHOS_PAIRING_SALT_LEN;
+         i++)
+    {
+        original.pairing_salt[i] =
+            (uint8_t)(i + 1U);
+    }
+
+    original.reserved0 = 0;
+
+    memset(
+        original.reserved1,
+        0,
+        sizeof(original.reserved1));
+
+    /*
+        Recalculate the package CRC after modifying
+        the pairing parameters.
+    */
+    original.crc32 = 0;
+
+    original.crc32 =
+        mathos_pairing_package_calculate_crc32(
+            &original);
+
+    if (!mathos_pairing_package_is_valid(
+            &original))
+    {
+        ESP_LOGE(
+            TAG,
+            "Pairing PACKAGE wire self-test "
+            "could not create valid source package");
+
+        return ESP_FAIL;
+    }
+
+    uint8_t encoded[MATHOS_PAIRING_PACKAGE_WIRE_LEN];
+
+    memset(
+        encoded,
+        0,
+        sizeof(encoded));
+
+    esp_err_t err =
+        mathos_pairing_package_encode_payload(
+            &original,
+            encoded,
+            sizeof(encoded));
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Pairing PACKAGE wire self-test "
+            "encode failed: %s",
+            esp_err_to_name(err));
+
+        return err;
+    }
+
+    mathos_pairing_package_t decoded;
+
+    memset(
+        &decoded,
+        0,
+        sizeof(decoded));
+
+    err =
+        mathos_pairing_package_decode_payload(
+            encoded,
+            sizeof(encoded),
+            &decoded);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Pairing PACKAGE wire self-test "
+            "decode failed: %s",
+            esp_err_to_name(err));
+
+        return err;
+    }
+
+    /*
+        Compare every meaningful field explicitly.
+
+        We intentionally do not compare the raw C
+        structures because compiler padding must never
+        become part of the wire protocol.
+    */
+    if (decoded.magic != original.magic ||
+        decoded.version != original.version ||
+        decoded.record_size != original.record_size ||
+        decoded.rc_id != original.rc_id ||
+        decoded.gateway_id != original.gateway_id ||
+        decoded.key_derivation_method !=
+            original.key_derivation_method ||
+        decoded.reserved0 != original.reserved0 ||
+        decoded.key_generation !=
+            original.key_generation ||
+        decoded.kdf_iteration_count !=
+            original.kdf_iteration_count ||
+        memcmp(
+            decoded.pairing_salt,
+            original.pairing_salt,
+            MATHOS_PAIRING_SALT_LEN) != 0 ||
+        memcmp(
+            decoded.reserved1,
+            original.reserved1,
+            sizeof(original.reserved1)) != 0 ||
+        decoded.crc32 != original.crc32)
+    {
+        ESP_LOGE(
+            TAG,
+            "Pairing PACKAGE wire self-test mismatch");
+
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "Pairing PACKAGE wire round-trip PASSED "
+        "len=%u generation=%lu",
+        (unsigned int)
+            MATHOS_PAIRING_PACKAGE_WIRE_LEN,
+        (unsigned long)
+            decoded.key_generation);
+
+    /*
+        ----------------------------------------------------
+        Tamper test
+        ----------------------------------------------------
+
+        Byte 20 is the first byte of the public pairing
+        salt in our canonical version-1 payload.
+
+        Modify it without changing the stored CRC.
+        The decoder must reject the package.
+    */
+    encoded[20] ^= 0x01U;
+
+    mathos_pairing_package_t tampered;
+
+    memset(
+        &tampered,
+        0,
+        sizeof(tampered));
+
+    err =
+        mathos_pairing_package_decode_payload(
+            encoded,
+            sizeof(encoded),
+            &tampered);
+
+    if (err == ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Pairing PACKAGE tamper test FAILED: "
+            "corrupted payload was accepted");
+
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "Pairing PACKAGE tamper test PASSED: "
+        "corrupted payload rejected");
+
+    return ESP_OK;
+}
 int mathos_pairing_proof_is_valid(
     const mathos_pairing_proof_t *proof)
 {
@@ -8382,6 +9154,29 @@ static const char *maintenance_role_to_text(
 esp_err_t mathos_maintenance_softap_start(
     mathos_maintenance_role_t role)
 {
+    esp_err_t pairing_header_test_err =
+        mathos_pairing_wire_header_self_test();
+
+    if (pairing_header_test_err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Pairing wire header self-test FAILED");
+
+        return pairing_header_test_err;
+    }
+
+    esp_err_t pairing_package_wire_test_err =
+        mathos_pairing_package_wire_self_test();
+
+    if (pairing_package_wire_test_err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Pairing PACKAGE wire self-test FAILED");
+
+        return pairing_package_wire_test_err;
+    }
     if (maintenance_softap_started)
     {
         ESP_LOGW(
@@ -8749,6 +9544,158 @@ esp_err_t mathos_maintenance_softap_start(
 
     return ESP_OK;
 }
+
+
+esp_err_t mathos_pairing_challenge_encode_payload(
+    const mathos_pairing_challenge_t *challenge,
+    uint8_t *output,
+    size_t output_size)
+{
+    if (challenge == NULL ||
+        output == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (output_size <
+        MATHOS_PAIRING_CHALLENGE_WIRE_LEN)
+    {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    /*
+        Only an active, completely valid challenge
+        may be placed onto the pairing transport.
+    */
+    if (!mathos_pairing_challenge_is_valid(
+            challenge) ||
+        challenge->key_generation == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t i = 0;
+
+    /*
+        magic uint32 little-endian
+    */
+    output[i++] =
+        (uint8_t)(
+            challenge->magic & 0xFFU);
+
+    output[i++] =
+        (uint8_t)(
+            (challenge->magic >> 8) & 0xFFU);
+
+    output[i++] =
+        (uint8_t)(
+            (challenge->magic >> 16) & 0xFFU);
+
+    output[i++] =
+        (uint8_t)(
+            (challenge->magic >> 24) & 0xFFU);
+
+    /*
+        version uint16 little-endian
+    */
+    output[i++] =
+        (uint8_t)(
+            challenge->version & 0xFFU);
+
+    output[i++] =
+        (uint8_t)(
+            (challenge->version >> 8) & 0xFFU);
+
+    /*
+        record_size uint16 little-endian
+    */
+    output[i++] =
+        (uint8_t)(
+            challenge->record_size & 0xFFU);
+
+    output[i++] =
+        (uint8_t)(
+            (challenge->record_size >> 8) & 0xFFU);
+
+    /*
+        Device identities.
+    */
+    output[i++] =
+        challenge->rc_id;
+
+    output[i++] =
+        challenge->gateway_id;
+
+    /*
+        Reserved version-1 bytes.
+    */
+    output[i++] =
+        challenge->reserved0[0];
+
+    output[i++] =
+        challenge->reserved0[1];
+
+    /*
+        key_generation uint32 little-endian
+    */
+    output[i++] =
+        (uint8_t)(
+            challenge->key_generation & 0xFFU);
+
+    output[i++] =
+        (uint8_t)(
+            (challenge->key_generation >> 8) & 0xFFU);
+
+    output[i++] =
+        (uint8_t)(
+            (challenge->key_generation >> 16) & 0xFFU);
+
+    output[i++] =
+        (uint8_t)(
+            (challenge->key_generation >> 24) & 0xFFU);
+
+    /*
+        Fresh Gateway nonce.
+    */
+    for (size_t nonce_index = 0;
+         nonce_index < MATHOS_PAIRING_NONCE_LEN;
+         nonce_index++)
+    {
+        output[i++] =
+            challenge->nonce[nonce_index];
+    }
+
+    /*
+        CRC uint32 little-endian
+    */
+    output[i++] =
+        (uint8_t)(
+            challenge->crc32 & 0xFFU);
+
+    output[i++] =
+        (uint8_t)(
+            (challenge->crc32 >> 8) & 0xFFU);
+
+    output[i++] =
+        (uint8_t)(
+            (challenge->crc32 >> 16) & 0xFFU);
+
+    output[i++] =
+        (uint8_t)(
+            (challenge->crc32 >> 24) & 0xFFU);
+
+    /*
+        Detect accidental future wire-layout mistakes.
+    */
+    if (i !=
+        MATHOS_PAIRING_CHALLENGE_WIRE_LEN)
+    {
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
 
 esp_err_t mathos_maintenance_get_ap_ip(
     char *buffer,

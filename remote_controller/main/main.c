@@ -239,6 +239,7 @@ typedef enum
     ARM_STATUS_ARM_LOCKED,
     ARM_STATUS_BOOT_LOCK,
     ARM_STATUS_PROTOCOL_MISMATCH,
+    ARM_STATUS_PAIRING_REQUIRED,
     ARM_STATUS_INPUT_STALE,
     ARM_STATUS_STICKS_NOT_CENTERED,
     ARM_STATUS_TELEMETRY_STALE,
@@ -425,6 +426,9 @@ static joystick_axis_calibration_t pitch_calibration = {
     .invert = PITCH_INVERT,
 };
 static uint32_t joystick_calibration_counter = 0;
+static mathos_rc_pairing_config_t rc_runtime_pairing_config;
+static int rc_runtime_pairing_loaded_from_nvs = 0;
+
 volatile uint32_t system_faults = FAULT_NONE;
 volatile TickType_t task_heartbeat[HB_COUNT];
 volatile TickType_t rc_input_last_update_tick = 0;
@@ -1784,6 +1788,9 @@ const char *arm_status_to_lcd_text(arm_status_t status)
     case ARM_STATUS_BOOT_LOCK:
         return "BOOT LOCK";
 
+    case ARM_STATUS_PAIRING_REQUIRED:
+        return "PAIR FIRST";
+
     case ARM_STATUS_PROTOCOL_MISMATCH:
         return "PROTO BAD";
 
@@ -1827,6 +1834,9 @@ const char *arm_status_to_log_text(arm_status_t status)
 
     case ARM_STATUS_BOOT_LOCK:
         return "ARM_BOOT_LOCK";
+
+    case ARM_STATUS_PAIRING_REQUIRED:
+        return "PAIRING_REQUIRED";
 
     case ARM_STATUS_PROTOCOL_MISMATCH:
         return "PROTOCOL_MISMATCH";
@@ -2672,7 +2682,7 @@ int security_wrap_rc_packet(const rc_packet_t *rc_packet,
 
     secure_packet->sequence = rc_packet->packet_id;
     secure_packet->timestamp_ms = mathos_session_id;
-    secure_packet->controller_id = SECURITY_CONTROLLER_ID;
+    secure_packet->controller_id = rc_runtime_pairing_config.rc_id;
     secure_packet->link_id = (uint8_t)link_mode;
     secure_packet->payload_type = SECURITY_PAYLOAD_TYPE_RC;
     secure_packet->payload_len = sizeof(rc_packet_t);
@@ -3511,6 +3521,15 @@ arm_status_t get_arm_status(void)
         return ARM_STATUS_BOOT_LOCK;
     }
 
+#if FEATURE_SECURE_GATEWAY_MODE
+
+    if (!rc_runtime_pairing_loaded_from_nvs ||
+        rc_runtime_pairing_config.key_generation == 0)
+    {
+        return ARM_STATUS_PAIRING_REQUIRED;
+    }
+
+#endif
     if (fault_get_snapshot() &
         FAULT_PROTOCOL_MISMATCH)
     {
@@ -4786,12 +4805,16 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
         return;
     }
 
-    if (packet.controller_id != SECURITY_GATEWAY_ID)
+    if (packet.controller_id !=
+        rc_runtime_pairing_config.authorised_gateway_id)
     {
         bad_count++;
-        printf("[GATEWAY RX] bad controller_id=%u expected=%u\n",
-               packet.controller_id,
-               SECURITY_GATEWAY_ID);
+
+        printf(
+            "[GATEWAY RX] bad controller_id=%u expected=%u\n",
+            packet.controller_id,
+            rc_runtime_pairing_config.authorised_gateway_id);
+
         return;
     }
 
@@ -5658,7 +5681,38 @@ void radio_tx_task(void *pvParameters)
         int64_t work_start_us = esp_timer_get_time();
 
         heartbeat_mark(HB_RADIO_TX);
+#if FEATURE_SECURE_GATEWAY_MODE
 
+        /*
+            An unpaired RC has no authority to transmit
+            operational control packets.
+
+            Keep the task alive and keep its supervisor
+            heartbeat running, but do not construct,
+            encrypt or transmit RC control frames.
+        */
+        if (!rc_runtime_pairing_loaded_from_nvs ||
+            rc_runtime_pairing_config.key_generation == 0)
+        {
+            static int pairing_tx_block_logged = 0;
+
+            if (!pairing_tx_block_logged)
+            {
+                printf(
+                    "[PAIRING] CONTROL TX BLOCKED: "
+                    "RC is not paired\n");
+
+                pairing_tx_block_logged = 1;
+            }
+
+            vTaskDelayUntil(
+                &last_wake,
+                period);
+
+            continue;
+        }
+
+#endif
         rc_input_t input_snapshot;
         TickType_t input_last_update;
 
@@ -7150,28 +7204,100 @@ void app_main(void)
 
         lcd_draw_maintenance_screen(
             maintenance_ip);
-
-        /*
-            Do not continue into normal-mode initialization.
-
-            Wi-Fi and HTTP run in their own ESP-IDF tasks.
-        */
         return;
     }
 
-    /*
-        Everything below this point belongs exclusively
-        to normal controller operation.
-    */
     printf(
         "[BOOT MODE] NORMAL\n");
+
+    esp_err_t pairing_load_err =
+        mathos_rc_pairing_config_load(
+            &rc_runtime_pairing_config,
+            &rc_runtime_pairing_loaded_from_nvs);
+
+    if (pairing_load_err != ESP_OK)
+    {
+        printf(
+            "[PAIRING] FATAL: RC pairing record load failed "
+            "error=%s\n",
+            esp_err_to_name(pairing_load_err));
+
+        return;
+    }
+
+    printf(
+        "[PAIRING] source=%s "
+        "rc_id=%u gateway_id=%u "
+        "key_generation=%lu "
+        "key_provisioned=%u "
+        "counter=%lu\n",
+        rc_runtime_pairing_loaded_from_nvs
+            ? "NVS"
+            : "DEFAULTS",
+        rc_runtime_pairing_config.rc_id,
+        rc_runtime_pairing_config
+            .authorised_gateway_id,
+        (unsigned long)
+            rc_runtime_pairing_config
+                .key_generation,
+        rc_runtime_pairing_config
+                    .key_generation != 0
+            ? 1U
+            : 0U,
+        (unsigned long)
+            rc_runtime_pairing_config
+                .configuration_counter);
+
+    if (!rc_runtime_pairing_loaded_from_nvs ||
+        rc_runtime_pairing_config.key_generation == 0)
+    {
+        /*
+            Explicitly guarantee that an unpaired RC has
+            no operational cryptographic key installed.
+        */
+        mathos_secure_clear_key();
+
+        printf(
+            "[PAIRING] RC is UNPAIRED. "
+            "Operational security key is not installed.\n");
+    }
+    else
+    {
+        /*
+            Install the validated pairing root key into the
+            operational ChaCha20-Poly1305 security engine.
+        */
+        mathos_secure_status_t secure_key_status =
+            mathos_secure_set_key(
+                rc_runtime_pairing_config.root_key,
+                (uint32_t)sizeof(
+                    rc_runtime_pairing_config.root_key));
+
+        if (secure_key_status !=
+                MATHOS_SECURE_STATUS_OK ||
+            !mathos_secure_key_is_set())
+        {
+            printf(
+                "[PAIRING] FATAL: failed to install "
+                "RC operational security key status=%s\n",
+                mathos_secure_status_to_string(
+                    secure_key_status));
+
+            mathos_secure_clear_key();
+
+            return;
+        }
+
+        printf(
+            "[PAIRING] RC operational security key installed "
+            "key_generation=%lu\n",
+            (unsigned long)
+                rc_runtime_pairing_config.key_generation);
+    }
 
     joystick_calibration_load_from_nvs();
     joystick_calibration_test_provision_once();
 
-    /*
-        Create button synchronization resources.
-    */
     button_semaphore_arm =
         xSemaphoreCreateBinary();
 

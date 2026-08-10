@@ -268,34 +268,160 @@ extern "C"
         uint32_t magic;
         uint16_t version;
         uint16_t record_size;
-
         uint8_t rc_id;
         uint8_t gateway_id;
-
-        /*
-            Identifies which side generated this proof.
-
-            1 = RC proof
-            2 = Gateway confirmation
-        */
         uint8_t proof_role;
         uint8_t reserved0;
-
         uint32_t key_generation;
-
-        /*
-            Must exactly match the nonce from the challenge.
-        */
         uint8_t nonce[MATHOS_PAIRING_NONCE_LEN];
-
-        /*
-            HMAC-SHA256 output calculated using the derived
-            MATHOS root key.
-        */
         uint8_t proof[MATHOS_PAIRING_PROOF_LEN];
 
         uint32_t crc32;
     } mathos_pairing_proof_t;
+
+    /*
+    ============================================================
+    Pairing transport message types
+    ============================================================
+
+    These messages travel only while both devices are in
+    maintenance/pairing mode.
+
+    They are NOT normal flight-control packets and they do
+    NOT use the operational ChaCha20-Poly1305 session.
+
+    Public package/challenge data may travel in plaintext.
+    Authentication is provided by the pairing HMAC proofs.
+*/
+    typedef enum
+    {
+        MATHOS_PAIRING_MSG_INVALID = 0,
+
+        /*
+            Gateway -> RC
+
+            Public pairing parameters:
+            identities, generation, KDF parameters and salt.
+        */
+        MATHOS_PAIRING_MSG_PACKAGE = 1,
+
+        /*
+            Gateway -> RC
+
+            Fresh random challenge nonce.
+        */
+        MATHOS_PAIRING_MSG_CHALLENGE = 2,
+
+        /*
+            RC -> Gateway
+
+            HMAC proof demonstrating possession of the
+            candidate root key.
+        */
+        MATHOS_PAIRING_MSG_RC_PROOF = 3,
+
+        /*
+            Gateway -> RC
+
+            Mutual-authentication HMAC proof demonstrating
+            possession of the same root key.
+        */
+        MATHOS_PAIRING_MSG_GATEWAY_PROOF = 4,
+
+        /*
+            Either direction.
+
+            Used later for explicit success/failure result.
+        */
+        MATHOS_PAIRING_MSG_RESULT = 5
+
+    } mathos_pairing_message_type_t;
+
+    /*
+        ============================================================
+        Pairing wire protocol
+        ============================================================
+
+        Canonical frame layout:
+
+        byte 0      magic 0
+        byte 1      magic 1
+        byte 2      protocol version
+        byte 3      message type
+        byte 4..5   payload length, little-endian
+        byte 6..9   sequence number, little-endian
+        byte 10..   payload
+
+        IMPORTANT:
+        mathos_pairing_wire_header_t is an in-memory
+        representation only.
+
+        Never send this C struct using memcpy().
+        The serializer/deserializer will write each field
+        explicitly so compiler padding cannot change the
+        wire format.
+    */
+
+#define MATHOS_PAIRING_WIRE_MAGIC_0 0x4DU
+#define MATHOS_PAIRING_WIRE_MAGIC_1 0x50U
+#define MATHOS_PAIRING_WIRE_VERSION 1U
+#define MATHOS_PAIRING_WIRE_HEADER_LEN 10U
+
+/*
+    Canonical version-1 pairing PACKAGE payload length.
+
+    This is a wire-format size, not sizeof(struct).
+*/
+#define MATHOS_PAIRING_PACKAGE_WIRE_LEN \
+    (4U + 2U + 2U +                     \
+     1U + 1U + 1U + 1U +                \
+     4U + 4U +                          \
+     MATHOS_PAIRING_SALT_LEN +          \
+     4U +                               \
+     4U)
+
+/*
+    Canonical version-1 pairing CHALLENGE payload length.
+
+    This is the wire-format size, not sizeof(struct).
+*/
+#define MATHOS_PAIRING_CHALLENGE_WIRE_LEN \
+    (4U + 2U + 2U +                       \
+     1U + 1U + 2U +                       \
+     4U +                                 \
+     MATHOS_PAIRING_NONCE_LEN +           \
+     4U)
+
+    typedef struct
+    {
+        uint8_t magic_0;
+        uint8_t magic_1;
+
+        uint8_t version;
+        uint8_t message_type;
+
+        uint16_t payload_len;
+        uint32_t sequence;
+
+    } mathos_pairing_wire_header_t;
+
+    /*
+    Encode one pairing wire header into its canonical
+    10-byte representation.
+
+    No raw struct memcpy is used.
+*/
+    esp_err_t mathos_pairing_wire_encode_header(
+        const mathos_pairing_wire_header_t *header,
+        uint8_t output[MATHOS_PAIRING_WIRE_HEADER_LEN]);
+
+    /*
+        Decode and validate one canonical 10-byte
+        Mathos pairing wire header.
+    */
+    esp_err_t mathos_pairing_wire_decode_header(
+        const uint8_t input[MATHOS_PAIRING_WIRE_HEADER_LEN],
+        mathos_pairing_wire_header_t *header);
 
     typedef enum
     {
@@ -406,6 +532,35 @@ extern "C"
 
     int mathos_rc_pairing_config_is_valid(
         const mathos_rc_pairing_config_t *config);
+
+    /*
+        Encode the public pairing package into its canonical
+        version-1 wire payload.
+
+        The root key is never part of this payload.
+    */
+    /*
+        Encode an active Gateway pairing challenge into
+        its canonical version-1 wire payload.
+    */
+    esp_err_t mathos_pairing_challenge_encode_payload(
+        const mathos_pairing_challenge_t *challenge,
+        uint8_t *output,
+        size_t output_size);
+        
+    esp_err_t mathos_pairing_package_encode_payload(
+        const mathos_pairing_package_t *package,
+        uint8_t *output,
+        size_t output_size);
+
+    /*
+        Decode and validate one canonical version-1
+        pairing PACKAGE payload.
+    */
+    esp_err_t mathos_pairing_package_decode_payload(
+        const uint8_t *input,
+        size_t input_size,
+        mathos_pairing_package_t *package);
 
     esp_err_t mathos_rc_pairing_config_save(
         const mathos_rc_pairing_config_t *config);

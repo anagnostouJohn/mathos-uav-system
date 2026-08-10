@@ -28,11 +28,7 @@
 
 static const char *TAG = "DRONE_GATEWAY";
 
-/*
-   ============================================================
-   CHANGE THESE PINS FOR YOUR ESP32-S3 DRONE GATEWAY BOARD
-   ============================================================
-*/
+
 
 // UART from RC link: fiber/RFD receiver into drone ESP32
 #define LINK_UART_NUM          UART_NUM_1
@@ -52,14 +48,7 @@ static const char *TAG = "DRONE_GATEWAY";
 #define MAVLINK_SEND_PERIOD_MS 50
 #define HEARTBEAT_PERIOD_MS    1000
 #define HEALTH_PERIOD_MS       1000
-/*
-   ============================================================
-   MAVLink telemetry stream requests
 
-   Gateway asks ArduPilot to send useful telemetry messages.
-   This does not affect ARM/DISARM/failsafe.
-   ============================================================
-*/
 #define TELEMETRY_REQUEST_REPEAT_MS          10000
 #define TELEMETRY_REQUEST_FAST_INTERVAL_US   200000    // 5 Hz
 #define TELEMETRY_REQUEST_MED_INTERVAL_US    500000    // 2 Hz
@@ -111,6 +100,13 @@ static const char *TAG = "DRONE_GATEWAY";
 
 
 #define GATEWAY_MAINTENANCE_BENCH_BOOT 1
+
+static mathos_gateway_config_t
+    gateway_runtime_config;
+
+static int
+    gateway_runtime_config_loaded_from_nvs = 0;
+
 
 static QueueHandle_t rc_packet_queue = NULL;
 static SemaphoreHandle_t mavlink_tx_mutex = NULL;
@@ -2162,18 +2158,19 @@ static void link_handle_mathos_frame(const uint8_t *frame, size_t frame_len)
         return;
     }
 
-    if (packet.controller_id != SECURITY_CONTROLLER_ID) {
-        bad_packets++;
+if (packet.controller_id !=
+    gateway_runtime_config.authorised_rc_id)
+{
+    bad_packets++;
 
-        ESP_LOGW(
-            TAG,
-            "Bad controller_id=%u expected=%u",
-            packet.controller_id,
-            SECURITY_CONTROLLER_ID
-        );
+    ESP_LOGW(
+        TAG,
+        "Bad controller_id=%u expected=%u",
+        packet.controller_id,
+        gateway_runtime_config.authorised_rc_id);
 
-        return;
-    }
+    return;
+}
 
     if (packet.payload_type != SECURITY_PAYLOAD_TYPE_RC) {
         bad_packets++;
@@ -3406,7 +3403,7 @@ static bool gateway_status_send_once(void)
     packet.sequence = seq;
     packet.timestamp_ms = gateway_status_session_id;
 
-    packet.controller_id = SECURITY_GATEWAY_ID;
+    packet.controller_id = gateway_runtime_config.gateway_id;
     packet.link_id = GATEWAY_STATUS_LINK_ID;
     packet.payload_type = SECURITY_PAYLOAD_TYPE_GATEWAY_STATUS;
     packet.payload_len = sizeof(gateway_status_packet_t);
@@ -3664,7 +3661,7 @@ if (gateway_telemetry_value_is_fresh(
 
     packet.sequence = seq;
     packet.timestamp_ms = gateway_status_session_id;
-    packet.controller_id = SECURITY_GATEWAY_ID;
+    packet.controller_id = gateway_runtime_config.gateway_id;
     packet.link_id = GATEWAY_STATUS_LINK_ID;
     packet.payload_type = SECURITY_PAYLOAD_TYPE_GATEWAY_TELEMETRY;
     packet.payload_len = sizeof(gateway_telemetry_packet_t);
@@ -3805,29 +3802,28 @@ void app_main(void)
     esp_err_t nvs_err =
         nvs_flash_init();
 
-    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES ||
-        nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND)
-    {
-        ESP_LOGW(
-            TAG,
-            "NVS partition requires reinitialization");
+/*
+    Never erase NVS automatically.
 
-        esp_err_t erase_err =
-            nvs_flash_erase();
+    This partition may contain the Gateway root key,
+    pairing generation, identities and operational
+    configuration.
 
-        if (erase_err != ESP_OK)
-        {
-            ESP_LOGE(
-                TAG,
-                "NVS erase failed: %s",
-                esp_err_to_name(erase_err));
+    Any NVS state requiring erase must be recovered only
+    through an explicit physical maintenance/factory-reset
+    procedure.
+*/
+if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES ||
+    nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND)
+{
+    ESP_LOGE(
+        TAG,
+        "NVS requires recovery error=%s. "
+        "Automatic erase is forbidden.",
+        esp_err_to_name(nvs_err));
 
-            return;
-        }
-
-        nvs_err =
-            nvs_flash_init();
-    }
+    return;
+}
 
     if (nvs_err != ESP_OK)
     {
@@ -3838,7 +3834,67 @@ void app_main(void)
 
         return;
     }
+/*
+    Load the Gateway's persistent operational
+    configuration before deciding whether this boot
+    continues into maintenance or normal operation.
 
+    The loader validates the complete stored record
+    before publishing it.
+*/
+esp_err_t gateway_config_err =
+    mathos_gateway_config_load(
+        &gateway_runtime_config,
+        &gateway_runtime_config_loaded_from_nvs);
+
+if (gateway_config_err != ESP_OK)
+{
+    ESP_LOGE(
+        TAG,
+        "Gateway runtime configuration load failed: %s",
+        esp_err_to_name(gateway_config_err));
+
+    return;
+}
+
+/*
+    Print only non-sensitive configuration metadata.
+
+    Never print the root key or pairing salt.
+*/
+ESP_LOGI(
+    TAG,
+    "Runtime config source=%s "
+    "gateway_id=%u rc_id=%u "
+    "key_generation=%" PRIu32 " "
+    "key_provisioned=%u "
+    "counter=%" PRIu32,
+    gateway_runtime_config_loaded_from_nvs
+        ? "NVS"
+        : "DEFAULTS",
+    gateway_runtime_config.gateway_id,
+    gateway_runtime_config.authorised_rc_id,
+    gateway_runtime_config.key_generation,
+    gateway_runtime_config.key_generation != 0
+        ? 1U
+        : 0U,
+    gateway_runtime_config.configuration_counter);
+
+if (!gateway_runtime_config_loaded_from_nvs ||
+    gateway_runtime_config.key_generation == 0)
+{
+    ESP_LOGW(
+        TAG,
+        "Gateway is UNPAIRED. "
+        "Operational control must remain disabled.");
+}
+else
+{
+    ESP_LOGI(
+        TAG,
+        "Valid provisioned Gateway pairing "
+        "configuration is available.");
+}
 #if GATEWAY_MAINTENANCE_BENCH_BOOT
 
     /*
@@ -3866,16 +3922,93 @@ void app_main(void)
     return;
 
 #endif
-    if (gateway_status_session_id == 0) {
+
+/*
+    Normal Gateway operation is forbidden unless a valid
+    provisioned pairing record was loaded from NVS.
+
+    Maintenance mode is handled above and returns before
+    reaching this point.
+*/
+if (!gateway_runtime_config_loaded_from_nvs ||
+    gateway_runtime_config.key_generation == 0)
+{
+    ESP_LOGE(
+        TAG,
+        "OPERATIONAL STARTUP BLOCKED: "
+        "Gateway is not paired");
+
+    return;
+}
+
+/*
+    At this point the Gateway has a valid provisioned
+    pairing record.
+
+    The next integration step will install the stored
+    root key and identities into the operational secure
+    link before RC/MAVLink tasks are started.
+*/
+ESP_LOGI(
+    TAG,
+    "Operational pairing gate PASSED "
+    "gateway_id=%u rc_id=%u "
+    "key_generation=%" PRIu32,
+    gateway_runtime_config.gateway_id,
+    gateway_runtime_config.authorised_rc_id,
+    gateway_runtime_config.key_generation);
+
+/*
+    Install the provisioned Gateway root key into the
+    operational ChaCha20-Poly1305 security engine.
+
+    From this point onward, mathos_secure uses the key
+    loaded from validated NVS configuration.
+
+    There is no development-key fallback.
+*/
+mathos_secure_status_t secure_key_status =
+    mathos_secure_set_key(
+        gateway_runtime_config.root_key,
+        (uint32_t)sizeof(
+            gateway_runtime_config.root_key));
+
+if (secure_key_status !=
+        MATHOS_SECURE_STATUS_OK ||
+    !mathos_secure_key_is_set())
+{
+    ESP_LOGE(
+        TAG,
+        "OPERATIONAL STARTUP BLOCKED: "
+        "failed to install Gateway security key "
+        "status=%s",
+        mathos_secure_status_to_string(
+            secure_key_status));
+
+    mathos_secure_clear_key();
+
+    return;
+}
+
+ESP_LOGI(
+    TAG,
+    "Operational security key installed "
+    "key_generation=%" PRIu32,
+    gateway_runtime_config.key_generation);
+
+if (gateway_status_session_id == 0)
+{
     gateway_status_session_id = 1;
 }
 
 ESP_LOGI(
     TAG,
     "Gateway status session_id=0x%08" PRIx32,
-    gateway_status_session_id
-);
-    ESP_LOGI(TAG, "Starting drone-side gateway");
+    gateway_status_session_id);
+
+ESP_LOGI(
+    TAG,
+    "Starting drone-side gateway");
 
     rc_packet_queue = xQueueCreate(RC_PACKET_QUEUE_LEN, sizeof(rc_packet_t));
 

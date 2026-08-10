@@ -3,19 +3,66 @@
 #include <string.h>
 
 #include "mbedtls/chachapoly.h"
+#include "mbedtls/platform_util.h"
 
 /*
-    DEVELOPMENT KEY ONLY.
+    Operational key installed during boot from validated
+    pairing configuration.
 
-    Later this must come from maintenance mode / NVS / secure provisioning.
-    Do not treat this hardcoded key as production security.
+    There is deliberately NO fallback development key.
+
+    No installed key means no operational encryption or
+    decryption authority.
 */
-static const uint8_t MATHOS_DEV_KEY[32] = {
-    0x31, 0x4D, 0x61, 0x74, 0x68, 0x6F, 0x73, 0x2D,
-    0x55, 0x41, 0x56, 0x2D, 0x44, 0x45, 0x56, 0x31,
-    0x90, 0xA4, 0x11, 0x29, 0x7C, 0xE2, 0x5D, 0x83,
-    0x19, 0xB6, 0xCC, 0x42, 0xD0, 0x6E, 0x51, 0xA8
-};
+static uint8_t mathos_runtime_key[MATHOS_SECURE_KEY_LEN];
+
+static int mathos_runtime_key_set = 0;
+
+mathos_secure_status_t mathos_secure_set_key(
+    const uint8_t *key,
+    uint32_t key_len)
+{
+    if (key == NULL)
+    {
+        return MATHOS_SECURE_STATUS_BAD_ARGUMENT;
+    }
+
+    if (key_len != MATHOS_SECURE_KEY_LEN)
+    {
+        return MATHOS_SECURE_STATUS_BAD_LENGTH;
+    }
+
+    /*
+        Clear any previous key before installing
+        the new validated key.
+    */
+    mbedtls_platform_zeroize(
+        mathos_runtime_key,
+        sizeof(mathos_runtime_key));
+
+    memcpy(
+        mathos_runtime_key,
+        key,
+        MATHOS_SECURE_KEY_LEN);
+
+    mathos_runtime_key_set = 1;
+
+    return MATHOS_SECURE_STATUS_OK;
+}
+
+void mathos_secure_clear_key(void)
+{
+    mbedtls_platform_zeroize(
+        mathos_runtime_key,
+        sizeof(mathos_runtime_key));
+
+    mathos_runtime_key_set = 0;
+}
+
+int mathos_secure_key_is_set(void)
+{
+    return mathos_runtime_key_set;
+}
 
 static void put_u32_le(uint8_t *buffer, int *index, uint32_t value)
 {
@@ -37,6 +84,9 @@ const char *mathos_secure_status_to_string(mathos_secure_status_t status)
 
     case MATHOS_SECURE_STATUS_BAD_LENGTH:
         return "BAD_LENGTH";
+
+    case MATHOS_SECURE_STATUS_KEY_NOT_SET:
+        return "KEY_NOT_SET";
 
     case MATHOS_SECURE_STATUS_CRYPTO_FAILED:
         return "CRYPTO_FAILED";
@@ -107,7 +157,10 @@ mathos_secure_status_t mathos_secure_encrypt_packet(mathos_secure_packet_t *pack
     {
         return MATHOS_SECURE_STATUS_BAD_LENGTH;
     }
-
+    if (!mathos_runtime_key_set)
+    {
+        return MATHOS_SECURE_STATUS_KEY_NOT_SET;
+    }
     uint8_t nonce[12];
     uint8_t aad[12];
     uint8_t encrypted[MATHOS_PAYLOAD_MAX_LEN];
@@ -118,7 +171,10 @@ mathos_secure_status_t mathos_secure_encrypt_packet(mathos_secure_packet_t *pack
     mbedtls_chachapoly_context ctx;
     mbedtls_chachapoly_init(&ctx);
 
-    int rc = mbedtls_chachapoly_setkey(&ctx, MATHOS_DEV_KEY);
+    int rc =
+        mbedtls_chachapoly_setkey(
+            &ctx,
+            mathos_runtime_key);
 
     if (rc != 0)
     {
@@ -154,6 +210,10 @@ mathos_secure_status_t mathos_secure_decrypt_packet(mathos_secure_packet_t *pack
     {
         return MATHOS_SECURE_STATUS_BAD_ARGUMENT;
     }
+    if (!mathos_runtime_key_set)
+    {
+        return MATHOS_SECURE_STATUS_KEY_NOT_SET;
+    }
 
     if (packet->payload_len > MATHOS_PAYLOAD_MAX_LEN)
     {
@@ -167,18 +227,21 @@ mathos_secure_status_t mathos_secure_decrypt_packet(mathos_secure_packet_t *pack
     build_nonce(packet, nonce);
     build_aad(packet, aad);
 
-    mbedtls_chachapoly_context ctx;
-    mbedtls_chachapoly_init(&ctx);
+mbedtls_chachapoly_context ctx;
+mbedtls_chachapoly_init(&ctx);
 
-    int rc = mbedtls_chachapoly_setkey(&ctx, MATHOS_DEV_KEY);
+int rc =
+    mbedtls_chachapoly_setkey(
+        &ctx,
+        mathos_runtime_key);
 
-    if (rc != 0)
-    {
-        mbedtls_chachapoly_free(&ctx);
-        return MATHOS_SECURE_STATUS_CRYPTO_FAILED;
-    }
+if (rc != 0)
+{
+    mbedtls_chachapoly_free(&ctx);
+    return MATHOS_SECURE_STATUS_CRYPTO_FAILED;
+}
 
-    rc = mbedtls_chachapoly_auth_decrypt(
+rc = mbedtls_chachapoly_auth_decrypt(
         &ctx,
         packet->payload_len,
         nonce,
