@@ -107,7 +107,14 @@ static mathos_gateway_config_t
 static int
     gateway_runtime_config_loaded_from_nvs = 0;
 
+/*
+    Active maintenance pairing session.
 
+    This must persist between PACKAGE/CHALLENGE transmission
+    and the later RC_PROOF verification.
+*/
+static mathos_pairing_session_t
+    gateway_pairing_session;
 static QueueHandle_t rc_packet_queue = NULL;
 static SemaphoreHandle_t mavlink_tx_mutex = NULL;
 static volatile uint32_t rx_packets = 0;
@@ -600,6 +607,839 @@ static void uart_init_port(
     ESP_ERROR_CHECK(uart_driver_install(uart_num, 4096, 4096, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(uart_num, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(uart_num, tx_pin, rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+}
+
+static esp_err_t gateway_pairing_send_package_once(void)
+{
+    /*
+        ------------------------------------------------
+        1. Build the public pairing PACKAGE from the
+           Gateway configuration already loaded from NVS.
+        ------------------------------------------------
+    */
+    mathos_pairing_package_t package;
+
+    memset(
+        &package,
+        0,
+        sizeof(package));
+
+    esp_err_t err =
+        mathos_pairing_package_from_gateway_config(
+            &gateway_runtime_config,
+            &package);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Pairing PACKAGE creation failed: %s",
+            esp_err_to_name(err));
+
+        return err;
+    }
+/*
+    Start a real distributed pairing session.
+
+    This generates and retains the fresh Gateway
+    challenge that will later authenticate RC_PROOF.
+*/
+mathos_pairing_session_set_defaults(
+    &gateway_pairing_session);
+
+err =
+    mathos_pairing_session_start(
+        &gateway_pairing_session,
+        &package);
+
+if (err != ESP_OK)
+{
+    ESP_LOGE(
+        TAG,
+        "Pairing session start failed: %s",
+        esp_err_to_name(err));
+
+    return err;
+}
+    /*
+        ------------------------------------------------
+        2. Serialize the PACKAGE payload.
+        ------------------------------------------------
+    */
+    uint8_t payload[
+        MATHOS_PAIRING_PACKAGE_WIRE_LEN];
+
+    memset(
+        payload,
+        0,
+        sizeof(payload));
+
+    err =
+        mathos_pairing_package_encode_payload(
+            &package,
+            payload,
+            sizeof(payload));
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Pairing PACKAGE payload encode failed: %s",
+            esp_err_to_name(err));
+
+        return err;
+    }
+
+    /*
+        ------------------------------------------------
+        3. Create the pairing wire header.
+        ------------------------------------------------
+    */
+    mathos_pairing_wire_header_t header = {
+        .magic_0 =
+            MATHOS_PAIRING_WIRE_MAGIC_0,
+
+        .magic_1 =
+            MATHOS_PAIRING_WIRE_MAGIC_1,
+
+        .version =
+            MATHOS_PAIRING_WIRE_VERSION,
+
+        .message_type =
+            MATHOS_PAIRING_MSG_PACKAGE,
+
+        .payload_len =
+            MATHOS_PAIRING_PACKAGE_WIRE_LEN,
+
+        .sequence = 1U
+    };
+
+    /*
+        ------------------------------------------------
+        4. Build the complete 54-byte frame.
+        ------------------------------------------------
+    */
+    uint8_t frame[
+        MATHOS_PAIRING_WIRE_MAX_FRAME_LEN];
+
+    memset(
+        frame,
+        0,
+        sizeof(frame));
+
+    size_t frame_len = 0;
+
+    err =
+        mathos_pairing_wire_encode_frame(
+            &header,
+            payload,
+            sizeof(payload),
+            frame,
+            sizeof(frame),
+            &frame_len);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Pairing PACKAGE frame encode failed: %s",
+            esp_err_to_name(err));
+
+        return err;
+    }
+
+    /*
+        ------------------------------------------------
+        5. Send the actual frame over the maintenance UART.
+        ------------------------------------------------
+    */
+    int written =
+        uart_write_bytes(
+            LINK_UART_NUM,
+            (const char *)frame,
+            frame_len);
+
+    if (written !=
+        (int)frame_len)
+    {
+        ESP_LOGE(
+            TAG,
+            "Pairing PACKAGE UART write failed "
+            "written=%d expected=%u",
+            written,
+            (unsigned int)frame_len);
+
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "Pairing PACKAGE TX "
+        "frame_len=%u rc_id=%u gateway_id=%u "
+        "generation=%lu sequence=%lu",
+        (unsigned int)frame_len,
+        package.rc_id,
+        package.gateway_id,
+        (unsigned long)
+            package.key_generation,
+        (unsigned long)
+            header.sequence);
+
+    return ESP_OK;
+}
+
+static esp_err_t
+gateway_pairing_send_challenge_once(void)
+{
+    /*
+        A challenge may only be transmitted from the
+        active pairing session that generated it.
+    */
+    if (!gateway_pairing_session.active ||
+        !mathos_pairing_challenge_is_valid(
+            &gateway_pairing_session.challenge))
+    {
+        ESP_LOGE(
+            TAG,
+            "Pairing CHALLENGE TX blocked: "
+            "no valid active session");
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+        Serialize the retained challenge.
+    */
+    uint8_t payload[
+        MATHOS_PAIRING_CHALLENGE_WIRE_LEN];
+
+    memset(
+        payload,
+        0,
+        sizeof(payload));
+
+    esp_err_t err =
+        mathos_pairing_challenge_encode_payload(
+            &gateway_pairing_session.challenge,
+            payload,
+            sizeof(payload));
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Pairing CHALLENGE payload encode failed: %s",
+            esp_err_to_name(err));
+
+        return err;
+    }
+
+    /*
+        PACKAGE used sequence 1.
+        CHALLENGE uses sequence 2.
+    */
+    mathos_pairing_wire_header_t header = {
+        .magic_0 =
+            MATHOS_PAIRING_WIRE_MAGIC_0,
+
+        .magic_1 =
+            MATHOS_PAIRING_WIRE_MAGIC_1,
+
+        .version =
+            MATHOS_PAIRING_WIRE_VERSION,
+
+        .message_type =
+            MATHOS_PAIRING_MSG_CHALLENGE,
+
+        .payload_len =
+            MATHOS_PAIRING_CHALLENGE_WIRE_LEN,
+
+        .sequence = 2U
+    };
+
+    uint8_t frame[
+        MATHOS_PAIRING_WIRE_MAX_FRAME_LEN];
+
+    memset(
+        frame,
+        0,
+        sizeof(frame));
+
+    size_t frame_len = 0;
+
+    err =
+        mathos_pairing_wire_encode_frame(
+            &header,
+            payload,
+            sizeof(payload),
+            frame,
+            sizeof(frame),
+            &frame_len);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Pairing CHALLENGE frame encode failed: %s",
+            esp_err_to_name(err));
+
+        return err;
+    }
+
+    int written =
+        uart_write_bytes(
+            LINK_UART_NUM,
+            (const char *)frame,
+            frame_len);
+
+    if (written !=
+        (int)frame_len)
+    {
+        ESP_LOGE(
+            TAG,
+            "Pairing CHALLENGE UART write failed "
+            "written=%d expected=%u",
+            written,
+            (unsigned int)frame_len);
+
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "Pairing CHALLENGE TX "
+        "frame_len=%u rc_id=%u gateway_id=%u "
+        "generation=%lu sequence=%lu",
+        (unsigned int)frame_len,
+        gateway_pairing_session.challenge.rc_id,
+        gateway_pairing_session.challenge.gateway_id,
+        (unsigned long)
+            gateway_pairing_session.challenge
+                .key_generation,
+        (unsigned long)
+            header.sequence);
+
+    return ESP_OK;
+}
+
+static esp_err_t
+gateway_pairing_send_gateway_proof_once(void)
+{
+    /*
+        The Gateway may transmit its confirmation only
+        after RC_PROOF has been authenticated successfully.
+    */
+    if (!gateway_pairing_session.active ||
+        gateway_pairing_session.state !=
+            MATHOS_PAIRING_SESSION_GATEWAY_PROOF_READY ||
+        !mathos_pairing_proof_is_valid(
+            &gateway_pairing_session.gateway_proof))
+    {
+        ESP_LOGE(
+            TAG,
+            "GATEWAY_PROOF TX blocked: "
+            "pairing session not ready state=%u",
+            (unsigned int)
+                gateway_pairing_session.state);
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint8_t payload[
+        MATHOS_PAIRING_PROOF_WIRE_LEN];
+
+    memset(
+        payload,
+        0,
+        sizeof(payload));
+
+    esp_err_t err =
+        mathos_pairing_proof_encode_payload(
+            &gateway_pairing_session.gateway_proof,
+            payload,
+            sizeof(payload));
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "GATEWAY_PROOF payload encode failed: %s",
+            esp_err_to_name(err));
+
+        return err;
+    }
+
+    /*
+        PACKAGE       sequence 1
+        CHALLENGE     sequence 2
+        RC_PROOF      sequence 3
+        GATEWAY_PROOF sequence 4
+    */
+    mathos_pairing_wire_header_t header = {
+        .magic_0 =
+            MATHOS_PAIRING_WIRE_MAGIC_0,
+
+        .magic_1 =
+            MATHOS_PAIRING_WIRE_MAGIC_1,
+
+        .version =
+            MATHOS_PAIRING_WIRE_VERSION,
+
+        .message_type =
+            MATHOS_PAIRING_MSG_GATEWAY_PROOF,
+
+        .payload_len =
+            MATHOS_PAIRING_PROOF_WIRE_LEN,
+
+        .sequence = 4U
+    };
+
+    uint8_t frame[
+        MATHOS_PAIRING_WIRE_MAX_FRAME_LEN];
+
+    memset(
+        frame,
+        0,
+        sizeof(frame));
+
+    size_t frame_len = 0;
+
+    err =
+        mathos_pairing_wire_encode_frame(
+            &header,
+            payload,
+            sizeof(payload),
+            frame,
+            sizeof(frame),
+            &frame_len);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "GATEWAY_PROOF frame encode failed: %s",
+            esp_err_to_name(err));
+
+        return err;
+    }
+
+    int written =
+        uart_write_bytes(
+            LINK_UART_NUM,
+            (const char *)frame,
+            frame_len);
+
+    if (written !=
+        (int)frame_len)
+    {
+        ESP_LOGE(
+            TAG,
+            "GATEWAY_PROOF UART write failed "
+            "written=%d expected=%u",
+            written,
+            (unsigned int)frame_len);
+
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "GATEWAY_PROOF SENT "
+        "frame_len=%u rc_id=%u gateway_id=%u "
+        "generation=%lu sequence=%lu",
+        (unsigned int)frame_len,
+        gateway_pairing_session.gateway_proof.rc_id,
+        gateway_pairing_session.gateway_proof.gateway_id,
+        (unsigned long)
+            gateway_pairing_session.gateway_proof
+                .key_generation,
+        (unsigned long)
+            header.sequence);
+
+    return ESP_OK;
+} 
+
+
+static void gateway_pairing_rx_task(
+    void *pvParameters)
+{
+    uint8_t rx_buffer[64];
+
+    uint8_t frame[
+        MATHOS_PAIRING_WIRE_MAX_FRAME_LEN];
+
+    size_t frame_index = 0;
+    size_t expected_frame_len = 0;
+
+    ESP_LOGI(
+        TAG,
+        "Pairing RX task started. "
+        "Waiting for RC_PROOF...");
+
+    while (1)
+    {
+        int len =
+            uart_read_bytes(
+                LINK_UART_NUM,
+                rx_buffer,
+                sizeof(rx_buffer),
+                pdMS_TO_TICKS(100));
+
+        if (len <= 0)
+        {
+            continue;
+        }
+
+        for (int i = 0;
+             i < len;
+             i++)
+        {
+            uint8_t byte =
+                rx_buffer[i];
+
+            /*
+                Wait for first pairing magic byte.
+            */
+            if (frame_index == 0)
+            {
+                if (byte !=
+                    MATHOS_PAIRING_WIRE_MAGIC_0)
+                {
+                    continue;
+                }
+
+                frame[frame_index++] =
+                    byte;
+
+                continue;
+            }
+
+            /*
+                Validate second magic byte.
+            */
+            if (frame_index == 1)
+            {
+                if (byte ==
+                    MATHOS_PAIRING_WIRE_MAGIC_1)
+                {
+                    frame[frame_index++] =
+                        byte;
+                }
+                else if (byte ==
+                         MATHOS_PAIRING_WIRE_MAGIC_0)
+                {
+                    frame[0] = byte;
+                    frame_index = 1;
+                }
+                else
+                {
+                    frame_index = 0;
+                }
+
+                continue;
+            }
+
+            if (frame_index >=
+                sizeof(frame))
+            {
+                ESP_LOGW(
+                    TAG,
+                    "Pairing RX frame overflow; "
+                    "parser reset");
+
+                frame_index = 0;
+                expected_frame_len = 0;
+
+                continue;
+            }
+
+            frame[frame_index++] =
+                byte;
+
+            /*
+                Decode header once all ten bytes exist.
+            */
+            if (frame_index ==
+                MATHOS_PAIRING_WIRE_HEADER_LEN)
+            {
+                mathos_pairing_wire_header_t header;
+
+                memset(
+                    &header,
+                    0,
+                    sizeof(header));
+
+                esp_err_t err =
+                    mathos_pairing_wire_decode_header(
+                        frame,
+                        &header);
+
+                if (err != ESP_OK)
+                {
+                    ESP_LOGW(
+                        TAG,
+                        "Pairing RX bad header: %s",
+                        esp_err_to_name(err));
+
+                    frame_index = 0;
+                    expected_frame_len = 0;
+
+                    continue;
+                }
+
+                if (header.payload_len == 0 ||
+                    header.payload_len >
+                        MATHOS_PAIRING_WIRE_MAX_PAYLOAD_LEN)
+                {
+                    ESP_LOGW(
+                        TAG,
+                        "Pairing RX bad payload length=%u",
+                        header.payload_len);
+
+                    frame_index = 0;
+                    expected_frame_len = 0;
+
+                    continue;
+                }
+
+                expected_frame_len =
+                    MATHOS_PAIRING_WIRE_HEADER_LEN +
+                    header.payload_len;
+
+                ESP_LOGI(
+                    TAG,
+                    "Pairing RX header "
+                    "type=%u payload_len=%u sequence=%lu",
+                    header.message_type,
+                    header.payload_len,
+                    (unsigned long)
+                        header.sequence);
+            }
+
+            if (expected_frame_len == 0 ||
+                frame_index <
+                    expected_frame_len)
+            {
+                continue;
+            }
+
+            mathos_pairing_wire_header_t
+                decoded_header;
+
+            memset(
+                &decoded_header,
+                0,
+                sizeof(decoded_header));
+
+            uint8_t payload[
+                MATHOS_PAIRING_WIRE_MAX_PAYLOAD_LEN];
+
+            memset(
+                payload,
+                0,
+                sizeof(payload));
+
+            size_t payload_len = 0;
+
+            esp_err_t err =
+                mathos_pairing_wire_decode_frame(
+                    frame,
+                    expected_frame_len,
+                    &decoded_header,
+                    payload,
+                    sizeof(payload),
+                    &payload_len);
+
+            /*
+                Parser is ready for the next frame
+                regardless of processing outcome.
+            */
+            frame_index = 0;
+            expected_frame_len = 0;
+
+            if (err != ESP_OK)
+            {
+                ESP_LOGW(
+                    TAG,
+                    "Pairing RX frame rejected: %s",
+                    esp_err_to_name(err));
+
+                continue;
+            }
+
+            /*
+                Gateway expects only RC_PROOF here.
+            */
+            if (decoded_header.message_type !=
+                    MATHOS_PAIRING_MSG_RC_PROOF ||
+                decoded_header.sequence != 3U)
+            {
+                ESP_LOGW(
+                    TAG,
+                    "Pairing RX unexpected message "
+                    "type=%u sequence=%lu",
+                    decoded_header.message_type,
+                    (unsigned long)
+                        decoded_header.sequence);
+
+                continue;
+            }
+
+            if (payload_len !=
+                MATHOS_PAIRING_PROOF_WIRE_LEN)
+            {
+                ESP_LOGW(
+                    TAG,
+                    "RC_PROOF unexpected length=%u",
+                    (unsigned int)
+                        payload_len);
+
+                continue;
+            }
+
+            mathos_pairing_proof_t
+                rc_proof;
+
+            memset(
+                &rc_proof,
+                0,
+                sizeof(rc_proof));
+
+            err =
+                mathos_pairing_proof_decode_payload(
+                    payload,
+                    payload_len,
+                    &rc_proof);
+
+            if (err != ESP_OK)
+            {
+                ESP_LOGW(
+                    TAG,
+                    "RC_PROOF decode rejected: %s",
+                    esp_err_to_name(err));
+
+                continue;
+            }
+
+            /*
+                Structural transport validation is not enough.
+
+                Confirm this proof belongs to the exact active
+                Gateway pairing challenge.
+            */
+            if (!gateway_pairing_session.active ||
+                gateway_pairing_session.state !=
+                    MATHOS_PAIRING_SESSION_CHALLENGE_READY)
+            {
+                ESP_LOGW(
+                    TAG,
+                    "RC_PROOF rejected: "
+                    "Gateway session not ready state=%u",
+                    (unsigned int)
+                        gateway_pairing_session.state);
+
+                continue;
+            }
+
+            if (rc_proof.proof_role !=
+                    MATHOS_PAIRING_PROOF_ROLE_RC ||
+                rc_proof.rc_id !=
+                    gateway_pairing_session.challenge.rc_id ||
+                rc_proof.gateway_id !=
+                    gateway_pairing_session.challenge.gateway_id ||
+                rc_proof.key_generation !=
+                    gateway_pairing_session.challenge
+                        .key_generation ||
+                memcmp(
+                    rc_proof.nonce,
+                    gateway_pairing_session.challenge.nonce,
+                    MATHOS_PAIRING_NONCE_LEN) != 0)
+            {
+                ESP_LOGW(
+                    TAG,
+                    "RC_PROOF rejected: "
+                    "challenge metadata mismatch");
+
+                continue;
+            }
+
+            /*
+                Publish the received proof into the active
+                pairing session.
+
+                prepare_gateway_response() explicitly requires
+                RC_PROOF_READY.
+            */
+            gateway_pairing_session.rc_proof =
+                rc_proof;
+
+            gateway_pairing_session.state =
+                MATHOS_PAIRING_SESSION_RC_PROOF_READY;
+
+            ESP_LOGI(
+                TAG,
+                "RC_PROOF ACCEPTED "
+                "rc_id=%u gateway_id=%u "
+                "generation=%lu sequence=%lu",
+                rc_proof.rc_id,
+                rc_proof.gateway_id,
+                (unsigned long)
+                    rc_proof.key_generation,
+                (unsigned long)
+                    decoded_header.sequence);
+
+            /*
+                This performs the actual HMAC verification.
+
+                Wrong passphrase:
+                    rejected here.
+
+                Correct passphrase:
+                    creates role-2 GATEWAY_PROOF.
+            */
+            err =
+                mathos_pairing_session_prepare_gateway_response(
+                    &gateway_pairing_session,
+                    &gateway_runtime_config);
+
+            if (err != ESP_OK)
+            {
+                ESP_LOGW(
+                    TAG,
+                    "RC_PROOF authentication FAILED: %s",
+                    esp_err_to_name(err));
+
+                /*
+                    The shared session function already
+                    handles retry/reset state.
+                */
+                continue;
+            }
+
+            ESP_LOGI(
+                TAG,
+                "RC_PROOF AUTHENTICATED "
+                "Gateway confirmation ready");
+
+            err =
+                gateway_pairing_send_gateway_proof_once();
+
+            if (err != ESP_OK)
+            {
+                ESP_LOGE(
+                    TAG,
+                    "GATEWAY_PROOF TX failed: %s",
+                    esp_err_to_name(err));
+
+                continue;
+            }
+
+            ESP_LOGI(
+                TAG,
+                "Pairing mutual-authentication "
+                "response sent to RC");
+        }
+    }
 }
 
 
@@ -3907,19 +4747,92 @@ else
         TAG,
         "GATEWAY MAINTENANCE BENCH MODE ACTIVE");
 
-    esp_err_t maintenance_err =
-        mathos_maintenance_softap_start(
-            MATHOS_MAINTENANCE_ROLE_GATEWAY);
+esp_err_t maintenance_err =
+    mathos_maintenance_softap_start(
+        MATHOS_MAINTENANCE_ROLE_GATEWAY);
 
-    if (maintenance_err != ESP_OK)
-    {
-        ESP_LOGE(
-            TAG,
-            "Gateway maintenance startup failed: %s",
-            esp_err_to_name(maintenance_err));
-    }
+if (maintenance_err != ESP_OK)
+{
+    ESP_LOGE(
+        TAG,
+        "Gateway maintenance startup failed: %s",
+        esp_err_to_name(maintenance_err));
 
     return;
+}
+
+/*
+    Maintenance mode may use the RC-link UART only
+    for the dedicated pairing protocol.
+
+    Do NOT start the normal operational link_rx_task.
+    Do NOT initialize the Flight Controller UART.
+*/
+uart_init_port(
+    LINK_UART_NUM,
+    LINK_UART_TX_PIN,
+    LINK_UART_RX_PIN,
+    gateway_runtime_config.link_uart_baud);
+
+ESP_LOGI(
+    TAG,
+    "Maintenance pairing UART ready "
+    "tx=%d rx=%d baud=%lu",
+    LINK_UART_TX_PIN,
+    LINK_UART_RX_PIN,
+    (unsigned long)
+        gateway_runtime_config.link_uart_baud);
+
+BaseType_t pairing_rx_task_result =
+    xTaskCreate(
+        gateway_pairing_rx_task,
+        "gateway_pairing_rx",
+        4096,
+        NULL,
+        8,
+        NULL);
+
+if (pairing_rx_task_result !=
+    pdPASS)
+{
+    ESP_LOGE(
+        TAG,
+        "Failed to create maintenance "
+        "pairing RX task");
+
+    return;
+}
+
+ESP_LOGI(
+    TAG,
+    "Maintenance pairing RX task created");
+esp_err_t package_tx_err =
+    gateway_pairing_send_package_once();
+
+if (package_tx_err != ESP_OK)
+{
+    ESP_LOGE(
+        TAG,
+        "Maintenance pairing PACKAGE TX failed: %s",
+        esp_err_to_name(package_tx_err));
+
+    return;
+}
+
+esp_err_t challenge_tx_err =
+    gateway_pairing_send_challenge_once();
+
+if (challenge_tx_err != ESP_OK)
+{
+    ESP_LOGE(
+        TAG,
+        "Maintenance pairing CHALLENGE TX failed: %s",
+        esp_err_to_name(challenge_tx_err));
+
+    return;
+}
+
+return;
 
 #endif
 

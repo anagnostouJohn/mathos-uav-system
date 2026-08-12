@@ -428,7 +428,9 @@ static joystick_axis_calibration_t pitch_calibration = {
 static uint32_t joystick_calibration_counter = 0;
 static mathos_rc_pairing_config_t rc_runtime_pairing_config;
 static int rc_runtime_pairing_loaded_from_nvs = 0;
-
+static mathos_pairing_session_t rc_pairing_session;
+static mathos_pairing_package_t rc_pairing_received_package;
+static int rc_pairing_have_package = 0;
 volatile uint32_t system_faults = FAULT_NONE;
 volatile TickType_t task_heartbeat[HB_COUNT];
 volatile TickType_t rc_input_last_update_tick = 0;
@@ -5330,6 +5332,974 @@ static void gateway_status_process_byte(uint8_t byte)
         expected_frame_len = 0;
     }
 }
+static esp_err_t
+rc_pairing_prepare_and_send_proof(
+    const char *passphrase)
+{
+    if (passphrase == NULL ||
+        passphrase[0] == '\0')
+    {
+        printf(
+            "[PAIRING TX] RC_PROOF blocked: "
+            "no passphrase\n");
+
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        The RC may create its proof only after it has
+        accepted the Gateway PACKAGE + CHALLENGE.
+    */
+    if (!rc_pairing_session.active ||
+        rc_pairing_session.state !=
+            MATHOS_PAIRING_SESSION_CHALLENGE_READY)
+    {
+        printf(
+            "[PAIRING TX] RC_PROOF blocked: "
+            "pairing session not ready state=%u\n",
+            (unsigned int)
+                rc_pairing_session.state);
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+        Derive the candidate root key from the passphrase
+        and received PACKAGE parameters, then create the
+        role-1 RC authentication proof.
+
+        The passphrase itself is never transmitted.
+    */
+    esp_err_t err =
+        mathos_pairing_session_prepare_rc_response(
+            &rc_pairing_session,
+            &rc_runtime_pairing_config,
+            passphrase);
+
+    if (err != ESP_OK)
+    {
+        printf(
+            "[PAIRING TX] RC_PROOF preparation failed "
+            "error=%s\n",
+            esp_err_to_name(err));
+
+        return err;
+    }
+
+    if (rc_pairing_session.state !=
+            MATHOS_PAIRING_SESSION_RC_PROOF_READY ||
+        !mathos_pairing_proof_is_valid(
+            &rc_pairing_session.rc_proof))
+    {
+        printf(
+            "[PAIRING TX] RC_PROOF preparation produced "
+            "invalid session state=%u\n",
+            (unsigned int)
+                rc_pairing_session.state);
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+        Canonical 68-byte proof payload.
+    */
+    uint8_t payload[MATHOS_PAIRING_PROOF_WIRE_LEN];
+
+    memset(
+        payload,
+        0,
+        sizeof(payload));
+
+    err =
+        mathos_pairing_proof_encode_payload(
+            &rc_pairing_session.rc_proof,
+            payload,
+            sizeof(payload));
+
+    if (err != ESP_OK)
+    {
+        printf(
+            "[PAIRING TX] RC_PROOF payload encode failed "
+            "error=%s\n",
+            esp_err_to_name(err));
+
+        return err;
+    }
+
+    /*
+        PACKAGE  = sequence 1
+        CHALLENGE = sequence 2
+        RC_PROOF = sequence 3
+    */
+    mathos_pairing_wire_header_t header = {
+        .magic_0 =
+            MATHOS_PAIRING_WIRE_MAGIC_0,
+
+        .magic_1 =
+            MATHOS_PAIRING_WIRE_MAGIC_1,
+
+        .version =
+            MATHOS_PAIRING_WIRE_VERSION,
+
+        .message_type =
+            MATHOS_PAIRING_MSG_RC_PROOF,
+
+        .payload_len =
+            MATHOS_PAIRING_PROOF_WIRE_LEN,
+
+        .sequence = 3U};
+
+    uint8_t frame[MATHOS_PAIRING_WIRE_MAX_FRAME_LEN];
+
+    memset(
+        frame,
+        0,
+        sizeof(frame));
+
+    size_t frame_len = 0;
+
+    err =
+        mathos_pairing_wire_encode_frame(
+            &header,
+            payload,
+            sizeof(payload),
+            frame,
+            sizeof(frame),
+            &frame_len);
+
+    if (err != ESP_OK)
+    {
+        printf(
+            "[PAIRING TX] RC_PROOF frame encode failed "
+            "error=%s\n",
+            esp_err_to_name(err));
+
+        return err;
+    }
+
+    int written =
+        uart_write_bytes(
+            LINK_UART_PORT,
+            (const char *)frame,
+            frame_len);
+
+    if (written !=
+        (int)frame_len)
+    {
+        printf(
+            "[PAIRING TX] RC_PROOF UART write failed "
+            "written=%d expected=%u\n",
+            written,
+            (unsigned int)frame_len);
+
+        return ESP_FAIL;
+    }
+
+    printf(
+        "[PAIRING TX] RC_PROOF SENT "
+        "frame_len=%u rc_id=%u gateway_id=%u "
+        "generation=%lu sequence=%lu\n",
+        (unsigned int)frame_len,
+        rc_pairing_session.rc_proof.rc_id,
+        rc_pairing_session.rc_proof.gateway_id,
+        (unsigned long)
+            rc_pairing_session.rc_proof
+                .key_generation,
+        (unsigned long)
+            header.sequence);
+
+    return ESP_OK;
+}
+static void rc_pairing_clear_sensitive_memory(
+    void *buffer,
+    size_t buffer_size)
+{
+    if (buffer == NULL)
+    {
+        return;
+    }
+
+    volatile uint8_t *bytes =
+        (volatile uint8_t *)buffer;
+
+    while (buffer_size > 0)
+    {
+        *bytes = 0;
+        bytes++;
+        buffer_size--;
+    }
+}
+
+static esp_err_t
+rc_pairing_commit_verified_candidate(void)
+{
+    if (!rc_pairing_session.active ||
+        rc_pairing_session.state !=
+            MATHOS_PAIRING_SESSION_COMMIT_READY)
+    {
+        printf(
+            "[PAIRING COMMIT] blocked: "
+            "session not COMMIT_READY state=%u\n",
+            (unsigned int)
+                rc_pairing_session.state);
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!mathos_rc_pairing_config_is_valid(
+            &rc_pairing_session.rc_candidate))
+    {
+        printf(
+            "[PAIRING COMMIT] rejected: "
+            "candidate configuration invalid\n");
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+        The candidate contains the locally derived key.
+
+        It reaches NVS only now, after successful
+        GATEWAY_PROOF authentication.
+    */
+    esp_err_t save_err =
+        mathos_rc_pairing_config_save(
+            &rc_pairing_session.rc_candidate);
+
+    if (save_err != ESP_OK)
+    {
+        printf(
+            "[PAIRING COMMIT] NVS save FAILED "
+            "error=%s\n",
+            esp_err_to_name(save_err));
+
+        return save_err;
+    }
+
+    /*
+        Never trust a successful write call alone.
+
+        Reload the record through the normal production
+        loader and validate what actually persisted.
+    */
+    mathos_rc_pairing_config_t
+        loaded_config;
+
+    memset(
+        &loaded_config,
+        0,
+        sizeof(loaded_config));
+
+    int loaded_from_nvs = 0;
+
+    esp_err_t load_err =
+        mathos_rc_pairing_config_load(
+            &loaded_config,
+            &loaded_from_nvs);
+
+    if (load_err != ESP_OK ||
+        !loaded_from_nvs)
+    {
+        printf(
+            "[PAIRING COMMIT] NVS reload FAILED "
+            "error=%s loaded=%d\n",
+            esp_err_to_name(load_err),
+            loaded_from_nvs);
+
+        rc_pairing_clear_sensitive_memory(
+            &loaded_config,
+            sizeof(loaded_config));
+
+        return load_err != ESP_OK
+                   ? load_err
+                   : ESP_FAIL;
+    }
+
+    /*
+        The save function increments configuration_counter
+        and regenerates CRC, so we intentionally do NOT
+        compare the complete structs byte-for-byte here.
+
+        Compare the security-critical pairing fields.
+    */
+    int persisted_matches_candidate =
+        loaded_config.rc_id ==
+            rc_pairing_session.rc_candidate.rc_id &&
+
+        loaded_config.authorised_gateway_id ==
+            rc_pairing_session.rc_candidate
+                .authorised_gateway_id &&
+
+        loaded_config.key_derivation_method ==
+            rc_pairing_session.rc_candidate
+                .key_derivation_method &&
+
+        loaded_config.key_generation ==
+            rc_pairing_session.rc_candidate
+                .key_generation &&
+
+        loaded_config.kdf_iteration_count ==
+            rc_pairing_session.rc_candidate
+                .kdf_iteration_count &&
+
+        memcmp(
+            loaded_config.root_key,
+            rc_pairing_session.rc_candidate.root_key,
+            sizeof(loaded_config.root_key)) == 0 &&
+
+        memcmp(
+            loaded_config.pairing_salt,
+            rc_pairing_session.rc_candidate.pairing_salt,
+            sizeof(loaded_config.pairing_salt)) == 0;
+
+    if (!persisted_matches_candidate)
+    {
+        printf(
+            "[PAIRING COMMIT] FATAL: "
+            "reloaded pairing record differs "
+            "from authenticated candidate\n");
+
+        rc_pairing_clear_sensitive_memory(
+            &loaded_config,
+            sizeof(loaded_config));
+
+        return ESP_FAIL;
+    }
+
+    /*
+        Install the newly verified root key into the
+        operational secure-link engine.
+
+        Flight/control tasks are still disabled because
+        we are in maintenance mode.
+    */
+    mathos_secure_status_t
+        secure_key_status =
+            mathos_secure_set_key(
+                loaded_config.root_key,
+                (uint32_t)sizeof(loaded_config.root_key));
+
+    if (secure_key_status !=
+            MATHOS_SECURE_STATUS_OK ||
+        !mathos_secure_key_is_set())
+    {
+        printf(
+            "[PAIRING COMMIT] security key install FAILED "
+            "status=%s\n",
+            mathos_secure_status_to_string(
+                secure_key_status));
+
+        mathos_secure_clear_key();
+
+        rc_pairing_clear_sensitive_memory(
+            &loaded_config,
+            sizeof(loaded_config));
+
+        return ESP_FAIL;
+    }
+
+    /*
+        Only now publish the persisted pairing record as
+        the RC runtime pairing configuration.
+    */
+    rc_runtime_pairing_config =
+        loaded_config;
+
+    rc_runtime_pairing_loaded_from_nvs =
+        1;
+
+    rc_pairing_session.state =
+        MATHOS_PAIRING_SESSION_COMPLETE;
+
+    printf(
+        "[PAIRING COMMIT] COMPLETE "
+        "rc_id=%u gateway_id=%u "
+        "generation=%lu counter=%lu state=%u\n",
+        rc_runtime_pairing_config.rc_id,
+        rc_runtime_pairing_config
+            .authorised_gateway_id,
+        (unsigned long)
+            rc_runtime_pairing_config
+                .key_generation,
+        (unsigned long)
+            rc_runtime_pairing_config
+                .configuration_counter,
+        (unsigned int)
+            rc_pairing_session.state);
+
+    /*
+        The runtime configuration now owns the required
+        persistent key copy.
+
+        Remove the temporary stack copy.
+    */
+    rc_pairing_clear_sensitive_memory(
+        &loaded_config,
+        sizeof(loaded_config));
+
+    /*
+        Remove transient challenge, candidate key and
+        proof material from the pairing session.
+    */
+    mathos_pairing_session_reset(
+        &rc_pairing_session);
+
+    rc_pairing_have_package = 0;
+
+    memset(
+        &rc_pairing_received_package,
+        0,
+        sizeof(rc_pairing_received_package));
+
+    printf(
+        "[PAIRING] SUCCESS. "
+        "RC is paired and may reboot into normal mode.\n");
+
+    return ESP_OK;
+}
+
+static void rc_pairing_rx_task(
+    void *pvParameters)
+{
+    uint8_t rx_buffer[64];
+
+    uint8_t frame[MATHOS_PAIRING_WIRE_MAX_FRAME_LEN];
+
+    size_t frame_index = 0;
+    size_t expected_frame_len = 0;
+
+    printf(
+        "[PAIRING RX] task started. "
+        "Waiting for Gateway pairing frame...\n");
+
+    while (1)
+    {
+        int len =
+            uart_read_bytes(
+                LINK_UART_PORT,
+                rx_buffer,
+                sizeof(rx_buffer),
+                pdMS_TO_TICKS(100));
+
+        if (len <= 0)
+        {
+            continue;
+        }
+
+        for (int i = 0;
+             i < len;
+             i++)
+        {
+            uint8_t byte =
+                rx_buffer[i];
+
+            /*
+                ------------------------------------------------
+                Wait for first pairing magic byte.
+                ------------------------------------------------
+            */
+            if (frame_index == 0)
+            {
+                if (byte !=
+                    MATHOS_PAIRING_WIRE_MAGIC_0)
+                {
+                    continue;
+                }
+
+                frame[frame_index++] =
+                    byte;
+
+                continue;
+            }
+
+            /*
+                ------------------------------------------------
+                Validate second pairing magic byte.
+
+                If another first magic byte arrives, keep it
+                as the possible beginning of a new frame.
+                ------------------------------------------------
+            */
+            if (frame_index == 1)
+            {
+                if (byte ==
+                    MATHOS_PAIRING_WIRE_MAGIC_1)
+                {
+                    frame[frame_index++] =
+                        byte;
+                }
+                else if (byte ==
+                         MATHOS_PAIRING_WIRE_MAGIC_0)
+                {
+                    frame[0] = byte;
+                    frame_index = 1;
+                }
+                else
+                {
+                    frame_index = 0;
+                }
+
+                continue;
+            }
+
+            /*
+                ------------------------------------------------
+                Collect remaining frame bytes.
+                ------------------------------------------------
+            */
+            if (frame_index >=
+                sizeof(frame))
+            {
+                printf(
+                    "[PAIRING RX] frame buffer overflow; "
+                    "resetting parser\n");
+
+                frame_index = 0;
+                expected_frame_len = 0;
+
+                continue;
+            }
+
+            frame[frame_index++] =
+                byte;
+
+            /*
+                ------------------------------------------------
+                Once the complete 10-byte header exists,
+                decode it and learn the expected frame length.
+                ------------------------------------------------
+            */
+            if (frame_index ==
+                MATHOS_PAIRING_WIRE_HEADER_LEN)
+            {
+                mathos_pairing_wire_header_t
+                    header;
+
+                memset(
+                    &header,
+                    0,
+                    sizeof(header));
+
+                esp_err_t err =
+                    mathos_pairing_wire_decode_header(
+                        frame,
+                        &header);
+
+                if (err != ESP_OK)
+                {
+                    printf(
+                        "[PAIRING RX] invalid header "
+                        "error=%s\n",
+                        esp_err_to_name(err));
+
+                    frame_index = 0;
+                    expected_frame_len = 0;
+
+                    continue;
+                }
+
+                if (header.payload_len == 0 ||
+                    header.payload_len >
+                        MATHOS_PAIRING_WIRE_MAX_PAYLOAD_LEN)
+                {
+                    printf(
+                        "[PAIRING RX] invalid payload length=%u\n",
+                        header.payload_len);
+
+                    frame_index = 0;
+                    expected_frame_len = 0;
+
+                    continue;
+                }
+
+                expected_frame_len =
+                    MATHOS_PAIRING_WIRE_HEADER_LEN +
+                    header.payload_len;
+
+                printf(
+                    "[PAIRING RX] header received "
+                    "type=%u payload_len=%u "
+                    "sequence=%lu\n",
+                    header.message_type,
+                    header.payload_len,
+                    (unsigned long)
+                        header.sequence);
+            }
+
+            /*
+                Header has not been completed yet.
+            */
+            if (expected_frame_len == 0)
+            {
+                continue;
+            }
+
+            /*
+                Wait until the declared complete frame
+                has arrived.
+            */
+            if (frame_index <
+                expected_frame_len)
+            {
+                continue;
+            }
+
+            /*
+                ------------------------------------------------
+                Complete pairing frame received.
+                ------------------------------------------------
+            */
+            mathos_pairing_wire_header_t
+                decoded_header;
+
+            memset(
+                &decoded_header,
+                0,
+                sizeof(decoded_header));
+
+            uint8_t payload[MATHOS_PAIRING_WIRE_MAX_PAYLOAD_LEN];
+
+            memset(
+                payload,
+                0,
+                sizeof(payload));
+
+            size_t payload_len = 0;
+
+            esp_err_t err =
+                mathos_pairing_wire_decode_frame(
+                    frame,
+                    expected_frame_len,
+                    &decoded_header,
+                    payload,
+                    sizeof(payload),
+                    &payload_len);
+
+            if (err != ESP_OK)
+            {
+                printf(
+                    "[PAIRING RX] complete frame rejected "
+                    "error=%s\n",
+                    esp_err_to_name(err));
+
+                frame_index = 0;
+                expected_frame_len = 0;
+
+                continue;
+            }
+
+            printf(
+                "[PAIRING RX] complete frame accepted "
+                "type=%u payload_len=%u sequence=%lu\n",
+                decoded_header.message_type,
+                (unsigned int)payload_len,
+                (unsigned long)
+                    decoded_header.sequence);
+
+            /*
+                ------------------------------------------------
+                For our first physical test we only accept
+                Gateway PACKAGE messages.
+                ------------------------------------------------
+            */
+            if (decoded_header.message_type ==
+                MATHOS_PAIRING_MSG_PACKAGE)
+            {
+                if (payload_len !=
+                    MATHOS_PAIRING_PACKAGE_WIRE_LEN)
+                {
+                    printf(
+                        "[PAIRING RX] PACKAGE has "
+                        "unexpected length=%u\n",
+                        (unsigned int)
+                            payload_len);
+                }
+                else
+                {
+                    mathos_pairing_package_t
+                        package;
+
+                    memset(
+                        &package,
+                        0,
+                        sizeof(package));
+
+                    err =
+                        mathos_pairing_package_decode_payload(
+                            payload,
+                            payload_len,
+                            &package);
+
+                    if (err == ESP_OK)
+                    {
+                        printf(
+                            "[PAIRING RX] PACKAGE ACCEPTED "
+                            "rc_id=%u gateway_id=%u "
+                            "generation=%lu "
+                            "kdf=%u iterations=%lu "
+                            "sequence=%lu\n",
+                            package.rc_id,
+                            package.gateway_id,
+                            (unsigned long)
+                                package.key_generation,
+                            package.key_derivation_method,
+                            (unsigned long)
+                                package.kdf_iteration_count,
+                            (unsigned long)
+                                decoded_header.sequence);
+                        /*
+        A new valid PACKAGE begins a new remote
+        pairing attempt.
+
+        Clear any previous incomplete attempt before
+        retaining this public package.
+    */
+                        mathos_pairing_session_reset(
+                            &rc_pairing_session);
+
+                        rc_pairing_received_package =
+                            package;
+
+                        rc_pairing_have_package = 1;
+
+                        printf(
+                            "[PAIRING RX] PACKAGE retained "
+                            "for pairing session generation=%lu\n",
+                            (unsigned long)
+                                rc_pairing_received_package
+                                    .key_generation);
+                    }
+                    else
+                    {
+                        printf(
+                            "[PAIRING RX] PACKAGE rejected "
+                            "error=%s\n",
+                            esp_err_to_name(err));
+                    }
+                }
+            }
+            else if (decoded_header.message_type ==
+                     MATHOS_PAIRING_MSG_CHALLENGE)
+            {
+                if (payload_len !=
+                    MATHOS_PAIRING_CHALLENGE_WIRE_LEN)
+                {
+                    printf(
+                        "[PAIRING RX] CHALLENGE has "
+                        "unexpected length=%u\n",
+                        (unsigned int)
+                            payload_len);
+                }
+                else
+                {
+                    mathos_pairing_challenge_t
+                        challenge;
+
+                    memset(
+                        &challenge,
+                        0,
+                        sizeof(challenge));
+
+                    err =
+                        mathos_pairing_challenge_decode_payload(
+                            payload,
+                            payload_len,
+                            &challenge);
+
+                    if (err == ESP_OK)
+                    {
+                        printf(
+                            "[PAIRING RX] CHALLENGE ACCEPTED "
+                            "rc_id=%u gateway_id=%u "
+                            "generation=%lu "
+                            "sequence=%lu\n",
+                            challenge.rc_id,
+                            challenge.gateway_id,
+                            (unsigned long)
+                                challenge.key_generation,
+                            (unsigned long)
+                                decoded_header.sequence);
+
+                        if (!rc_pairing_have_package)
+                        {
+                            printf(
+                                "[PAIRING RX] CHALLENGE rejected: "
+                                "no PACKAGE received first\n");
+                        }
+                        else
+                        {
+                            esp_err_t session_err =
+                                mathos_pairing_session_accept_remote_challenge(
+                                    &rc_pairing_session,
+                                    &rc_pairing_received_package,
+                                    &challenge);
+
+                            if (session_err != ESP_OK)
+                            {
+                                printf(
+                                    "[PAIRING RX] RC pairing session creation "
+                                    "failed error=%s\n",
+                                    esp_err_to_name(
+                                        session_err));
+                            }
+                            else
+                            {
+                                printf(
+                                    "[PAIRING RX] RC pairing session READY "
+                                    "rc_id=%u gateway_id=%u "
+                                    "generation=%lu state=%u\n",
+                                    rc_pairing_session.package.rc_id,
+                                    rc_pairing_session.package.gateway_id,
+                                    (unsigned long)
+                                        rc_pairing_session
+                                            .key_generation,
+                                    (unsigned int)
+                                        rc_pairing_session.state);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        printf(
+                            "[PAIRING RX] CHALLENGE rejected "
+                            "error=%s\n",
+                            esp_err_to_name(err));
+                    }
+                }
+            }
+
+            else if (decoded_header.message_type ==
+                     MATHOS_PAIRING_MSG_GATEWAY_PROOF)
+            {
+                /*
+                    Version-1 handshake ordering:
+
+                        PACKAGE        sequence 1
+                        CHALLENGE      sequence 2
+                        RC_PROOF       sequence 3
+                        GATEWAY_PROOF  sequence 4
+                */
+                if (decoded_header.sequence != 4U)
+                {
+                    printf(
+                        "[PAIRING RX] GATEWAY_PROOF rejected: "
+                        "unexpected sequence=%lu\n",
+                        (unsigned long)
+                            decoded_header.sequence);
+                }
+                else if (payload_len !=
+                         MATHOS_PAIRING_PROOF_WIRE_LEN)
+                {
+                    printf(
+                        "[PAIRING RX] GATEWAY_PROOF has "
+                        "unexpected length=%u\n",
+                        (unsigned int)
+                            payload_len);
+                }
+                else
+                {
+                    mathos_pairing_proof_t
+                        gateway_proof;
+
+                    memset(
+                        &gateway_proof,
+                        0,
+                        sizeof(gateway_proof));
+
+                    err =
+                        mathos_pairing_proof_decode_payload(
+                            payload,
+                            payload_len,
+                            &gateway_proof);
+
+                    if (err != ESP_OK)
+                    {
+                        printf(
+                            "[PAIRING RX] GATEWAY_PROOF "
+                            "decode rejected error=%s\n",
+                            esp_err_to_name(err));
+                    }
+                    else
+                    {
+                        printf(
+                            "[PAIRING RX] GATEWAY_PROOF RECEIVED "
+                            "rc_id=%u gateway_id=%u "
+                            "generation=%lu sequence=%lu\n",
+                            gateway_proof.rc_id,
+                            gateway_proof.gateway_id,
+                            (unsigned long)
+                                gateway_proof.key_generation,
+                            (unsigned long)
+                                decoded_header.sequence);
+
+                        /*
+                            This is the actual mutual-authentication
+                            decision.
+
+                            No NVS write happens unless this succeeds.
+                        */
+                        esp_err_t verify_err =
+                            mathos_pairing_session_accept_gateway_proof(
+                                &rc_pairing_session,
+                                &gateway_proof);
+
+                        if (verify_err != ESP_OK)
+                        {
+                            printf(
+                                "[PAIRING RX] GATEWAY_PROOF "
+                                "AUTHENTICATION FAILED error=%s\n",
+                                esp_err_to_name(
+                                    verify_err));
+                        }
+                        else
+                        {
+                            printf(
+                                "[PAIRING RX] GATEWAY AUTHENTICATED "
+                                "generation=%lu\n",
+                                (unsigned long)
+                                    gateway_proof
+                                        .key_generation);
+
+                            /*
+                                Mutual authentication succeeded.
+
+                                We may now persist the candidate key.
+                            */
+                            esp_err_t commit_err =
+                                rc_pairing_commit_verified_candidate();
+
+                            if (commit_err != ESP_OK)
+                            {
+                                printf(
+                                    "[PAIRING RX] pairing COMMIT FAILED "
+                                    "error=%s\n",
+                                    esp_err_to_name(
+                                        commit_err));
+                            }
+                        }
+                    }
+
+                    rc_pairing_clear_sensitive_memory(
+                        &gateway_proof,
+                        sizeof(gateway_proof));
+                }
+            }
+
+            /*
+                Ready for the next pairing frame.
+            */
+            else
+            {
+                printf(
+                    "[PAIRING RX] message type=%u "
+                    "not handled yet\n",
+                    decoded_header.message_type);
+            }
+            frame_index = 0;
+            expected_frame_len = 0;
+        }
+    }
+}
 
 void gateway_status_rx_task(void *pvParameters)
 {
@@ -7127,7 +8097,27 @@ void app_main(void)
     {
         return;
     }
+    /*
+        Load the current RC pairing record before selecting
+        maintenance or normal mode.
 
+        Maintenance pairing needs the current generation and
+        identities too, especially for safe re-pairing later.
+    */
+    esp_err_t pairing_load_err =
+        mathos_rc_pairing_config_load(
+            &rc_runtime_pairing_config,
+            &rc_runtime_pairing_loaded_from_nvs);
+
+    if (pairing_load_err != ESP_OK)
+    {
+        printf(
+            "[PAIRING] FATAL: RC pairing record load failed "
+            "error=%s\n",
+            esp_err_to_name(pairing_load_err));
+
+        return;
+    }
     /*
         Configure only the two switches required to select
         the boot mode.
@@ -7163,6 +8153,13 @@ void app_main(void)
         printf(
             "[MAINTENANCE] Control resources will not initialize\n");
 
+        /*
+Give the maintenance HTTP layer access only to the
+application's pairing action.
+
+The maintenance component never owns or stores
+the pairing passphrase.
+*/
         esp_err_t maintenance_err =
             mathos_maintenance_softap_start(
                 MATHOS_MAINTENANCE_ROLE_RC);
@@ -7179,6 +8176,55 @@ void app_main(void)
 
         printf(
             "[MAINTENANCE] SoftAP is active\n");
+
+        /*
+            Maintenance mode uses the normal physical RC-link UART
+            only for the dedicated pairing protocol.
+
+            Normal control TX/RX tasks remain disabled because
+            app_main() returns from the maintenance branch.
+        */
+        if (!link_uart_init())
+        {
+            printf(
+                "[MAINTENANCE] FATAL: pairing UART initialization failed\n");
+
+            return;
+        }
+
+        printf(
+            "[MAINTENANCE] Pairing UART ready "
+            "tx=%d rx=%d baud=%d\n",
+            LINK_UART_TX_PIN,
+            LINK_UART_RX_PIN,
+            LINK_UART_BAUD);
+        /*
+            Pairing actions may become available only after
+            the maintenance UART is ready.
+        */
+        mathos_maintenance_set_rc_pairing_callback(
+            rc_pairing_prepare_and_send_proof);
+        BaseType_t pairing_rx_task_result =
+            xTaskCreate(
+                rc_pairing_rx_task,
+                "rc_pairing_rx_task",
+                4096,
+                NULL,
+                5,
+                NULL);
+
+        if (pairing_rx_task_result !=
+            pdPASS)
+        {
+            printf(
+                "[MAINTENANCE] FATAL: failed to create "
+                "pairing RX task\n");
+
+            return;
+        }
+
+        printf(
+            "[MAINTENANCE] Pairing RX task created\n");
 
         char maintenance_ip[16] =
             "Unavailable";
@@ -7209,11 +8255,6 @@ void app_main(void)
 
     printf(
         "[BOOT MODE] NORMAL\n");
-
-    esp_err_t pairing_load_err =
-        mathos_rc_pairing_config_load(
-            &rc_runtime_pairing_config,
-            &rc_runtime_pairing_loaded_from_nvs);
 
     if (pairing_load_err != ESP_OK)
     {

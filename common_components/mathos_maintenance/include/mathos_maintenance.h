@@ -46,7 +46,7 @@ extern "C"
 
     The timeout will later be enforced using esp_timer.
 */
-#define MATHOS_PAIRING_SESSION_TIMEOUT_MS 30000U
+#define MATHOS_PAIRING_SESSION_TIMEOUT_MS 180000U
 #define MATHOS_PAIRING_SESSION_MAX_RETRIES 3U
 
 #define MATHOS_PAIRING_NONCE_LEN 16U
@@ -392,6 +392,52 @@ extern "C"
      MATHOS_PAIRING_NONCE_LEN +           \
      4U)
 
+    /*
+   Canonical version-1 pairing PROOF payload length.
+
+   Layout:
+       magic           4
+       version         2
+       record_size     2
+       rc_id           1
+       gateway_id      1
+       proof_role      1
+       reserved0       1
+       key_generation  4
+       nonce          16
+       proof          32
+       crc32           4
+
+   Total: 68 bytes.
+*/
+
+
+#define MATHOS_PAIRING_PROOF_WIRE_LEN \
+    (4U + 2U + 2U +                   \
+     1U + 1U + 1U + 1U +              \
+     4U +                             \
+     MATHOS_PAIRING_NONCE_LEN +       \
+     MATHOS_PAIRING_PROOF_LEN +       \
+     4U)
+
+    /*
+   Largest version-1 pairing payload currently defined.
+
+   PROOF is currently the largest at 68 bytes.
+*/
+#define MATHOS_PAIRING_WIRE_MAX_PAYLOAD_LEN \
+    MATHOS_PAIRING_PROOF_WIRE_LEN
+
+/*
+    Maximum complete version-1 pairing frame:
+
+        10-byte header
+        +
+        largest pairing payload
+*/
+#define MATHOS_PAIRING_WIRE_MAX_FRAME_LEN \
+    (MATHOS_PAIRING_WIRE_HEADER_LEN +     \
+     MATHOS_PAIRING_WIRE_MAX_PAYLOAD_LEN)
     typedef struct
     {
         uint8_t magic_0;
@@ -422,6 +468,54 @@ extern "C"
     esp_err_t mathos_pairing_wire_decode_header(
         const uint8_t input[MATHOS_PAIRING_WIRE_HEADER_LEN],
         mathos_pairing_wire_header_t *header);
+    /*
+        Build one complete canonical pairing frame:
+
+            header + payload
+
+        The caller supplies the already serialized payload.
+
+        output_len receives the exact number of bytes written.
+    */
+    esp_err_t mathos_pairing_wire_encode_frame(
+        const mathos_pairing_wire_header_t *header,
+        const uint8_t *payload,
+        size_t payload_len,
+        uint8_t *output,
+        size_t output_size,
+        size_t *output_len);
+    /*
+        Encode an authenticated pairing proof into the
+        canonical version-1 wire payload.
+
+        Supports both:
+            MATHOS_PAIRING_PROOF_ROLE_RC
+            MATHOS_PAIRING_PROOF_ROLE_GATEWAY
+    */
+
+    /*
+    Decode one complete canonical pairing frame:
+
+        header + payload
+
+    The payload is copied into the caller-provided buffer.
+
+    payload_len receives the exact decoded payload size.
+*/
+    esp_err_t mathos_pairing_wire_decode_frame(
+        const uint8_t *input,
+        size_t input_len,
+        mathos_pairing_wire_header_t *header,
+        uint8_t *payload,
+        size_t payload_capacity,
+        size_t *payload_len);
+
+    esp_err_t mathos_pairing_proof_encode_payload(
+        const mathos_pairing_proof_t *proof,
+        uint8_t *output,
+        size_t output_size);
+
+
 
     typedef enum
     {
@@ -547,7 +641,26 @@ extern "C"
         const mathos_pairing_challenge_t *challenge,
         uint8_t *output,
         size_t output_size);
-        
+
+    /*
+        Decode and validate one canonical version-1
+        pairing CHALLENGE payload.
+    */
+
+
+    /*
+        Decode and validate one canonical version-1
+        pairing PROOF payload.
+    */
+    esp_err_t mathos_pairing_proof_decode_payload(
+        const uint8_t *input,
+        size_t input_size,
+        mathos_pairing_proof_t *proof);
+    esp_err_t mathos_pairing_challenge_decode_payload(
+        const uint8_t *input,
+        size_t input_size,
+        mathos_pairing_challenge_t *challenge);
+
     esp_err_t mathos_pairing_package_encode_payload(
         const mathos_pairing_package_t *package,
         uint8_t *output,
@@ -561,6 +674,25 @@ extern "C"
         const uint8_t *input,
         size_t input_size,
         mathos_pairing_package_t *package);
+
+    /*
+        RC pairing-passphrase callback.
+
+        The maintenance HTTP layer supplies the passphrase
+        only for the duration of the request.
+
+        The callback must not retain the pointer.
+    */
+    typedef esp_err_t (*mathos_maintenance_rc_pairing_callback_t)(
+        const char *passphrase);
+
+    /*
+        Register the RC application's pairing handler.
+
+        Pass NULL to remove the callback.
+    */
+    void mathos_maintenance_set_rc_pairing_callback(
+        mathos_maintenance_rc_pairing_callback_t callback);
 
     esp_err_t mathos_rc_pairing_config_save(
         const mathos_rc_pairing_config_t *config);
@@ -588,6 +720,19 @@ extern "C"
     esp_err_t mathos_pairing_session_start(
         mathos_pairing_session_t *session,
         const mathos_pairing_package_t *package);
+
+    /*
+        Initialize the RC side of a distributed pairing session
+        using the PACKAGE and CHALLENGE actually received from
+        the Gateway.
+
+        Unlike mathos_pairing_session_start(), this function
+        never generates a new challenge.
+    */
+    esp_err_t mathos_pairing_session_accept_remote_challenge(
+        mathos_pairing_session_t *session,
+        const mathos_pairing_package_t *package,
+        const mathos_pairing_challenge_t *challenge);
 
     int mathos_pairing_session_register_failure(
         mathos_pairing_session_t *session);
@@ -637,6 +782,21 @@ extern "C"
     esp_err_t mathos_pairing_session_prepare_gateway_response(
         mathos_pairing_session_t *session,
         const mathos_gateway_config_t *gateway_config);
+
+/*
+    RC-side completion of mutual authentication.
+
+    Accepts the GATEWAY_PROOF received from the real
+    Gateway and verifies it using the RC candidate key
+    and the exact challenge already stored in the session.
+
+    On success the session becomes COMMIT_READY.
+
+    This function does NOT write NVS.
+*/
+esp_err_t mathos_pairing_session_accept_gateway_proof(
+    mathos_pairing_session_t *session,
+    const mathos_pairing_proof_t *gateway_proof);
 
     esp_err_t mathos_gateway_config_load(
         mathos_gateway_config_t *config,
