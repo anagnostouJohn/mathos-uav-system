@@ -22,6 +22,8 @@
 #include "mathos_messages.h"
 #include "mathos_flight_modes.h"
 #include "mathos_maintenance.h"
+#include "mathos_identity.h"
+#include "mathos_fleet.h"
 
 ////////////////////////////////////////////////////////////////////////////////////
 #define COMMAND_STATUS_MESSAGE_CLEAR_MS 3000
@@ -8097,17 +8099,109 @@ void app_main(void)
     {
         return;
     }
-    /*
-        Load the current RC pairing record before selecting
-        maintenance or normal mode.
+    mathos_device_uid_t rc_hardware_uid;
 
-        Maintenance pairing needs the current generation and
-        identities too, especially for safe re-pairing later.
-    */
+    esp_err_t uid_err =
+        mathos_device_uid_read(
+            &rc_hardware_uid);
+
+    if (uid_err != ESP_OK)
+    {
+        printf(
+            "[IDENTITY] FATAL: failed to read RC hardware UID "
+            "error=%s\n",
+            esp_err_to_name(uid_err));
+
+        return;
+    }
+
+    char rc_uid_text[MATHOS_DEVICE_UID_TEXT_LEN];
+
+    uid_err =
+        mathos_device_uid_format(
+            &rc_hardware_uid,
+            rc_uid_text,
+            sizeof(rc_uid_text));
+
+    if (uid_err != ESP_OK)
+    {
+        printf(
+            "[IDENTITY] FATAL: failed to format RC hardware UID\n");
+
+        return;
+    }
+
+    printf(
+        "[IDENTITY] RC hardware UID=%s\n",
+        rc_uid_text);
     esp_err_t pairing_load_err =
         mathos_rc_pairing_config_load(
             &rc_runtime_pairing_config,
             &rc_runtime_pairing_loaded_from_nvs);
+
+    esp_err_t fleet_err =
+        mathos_fleet_init();
+
+    if (fleet_err != ESP_OK)
+    {
+        printf(
+            "[FLEET] FATAL: Fleet Store initialization failed "
+            "error=%s\n",
+            esp_err_to_name(fleet_err));
+
+        return;
+    }
+
+    printf(
+        "[FLEET] dedicated Fleet Store initialized\n");
+    fleet_err =
+        mathos_fleet_record_delete_slot(0);
+
+    if (fleet_err != ESP_OK &&
+        fleet_err != ESP_ERR_NVS_NOT_FOUND)
+    {
+        printf(
+            "[FLEET RECOVERY] failed to remove stale "
+            "test slot 0 error=%s\n",
+            esp_err_to_name(fleet_err));
+
+        return;
+    }
+
+    printf(
+        "[FLEET RECOVERY] stale validation test slot cleared\n");
+
+    fleet_err =
+        mathos_fleet_validate_store_self_test();
+
+    if (fleet_err != ESP_OK)
+    {
+        printf(
+            "[FLEET TEST] store-validation self-test FAILED "
+            "error=%s\n",
+            esp_err_to_name(fleet_err));
+
+        return;
+    }
+
+    printf(
+        "[FLEET TEST] store-validation self-test PASSED\n");
+
+    fleet_err =
+        mathos_fleet_duplicate_uid_lookup_self_test();
+
+    if (fleet_err != ESP_OK)
+    {
+        printf(
+            "[FLEET TEST] duplicate-UID lookup self-test FAILED "
+            "error=%s\n",
+            esp_err_to_name(fleet_err));
+
+        return;
+    }
+
+    printf(
+        "[FLEET TEST] duplicate-UID lookup self-test PASSED\n");
 
     if (pairing_load_err != ESP_OK)
     {
@@ -8255,16 +8349,6 @@ the pairing passphrase.
 
     printf(
         "[BOOT MODE] NORMAL\n");
-
-    if (pairing_load_err != ESP_OK)
-    {
-        printf(
-            "[PAIRING] FATAL: RC pairing record load failed "
-            "error=%s\n",
-            esp_err_to_name(pairing_load_err));
-
-        return;
-    }
 
     printf(
         "[PAIRING] source=%s "

@@ -25,6 +25,7 @@
 #include "nvs_flash.h"
 #include "mathos_maintenance.h"
 #include "mathos_flight_modes.h"
+#include "mathos_identity.h"
 
 static const char *TAG = "DRONE_GATEWAY";
 
@@ -4682,6 +4683,46 @@ if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES ||
     The loader validates the complete stored record
     before publishing it.
 */
+
+mathos_device_uid_t gateway_hardware_uid;
+
+esp_err_t uid_err =
+    mathos_device_uid_read(
+        &gateway_hardware_uid);
+
+if (uid_err != ESP_OK)
+{
+    ESP_LOGE(
+        TAG,
+        "FATAL: failed to read Gateway hardware UID: %s",
+        esp_err_to_name(uid_err));
+
+    return;
+}
+
+char gateway_uid_text[
+    MATHOS_DEVICE_UID_TEXT_LEN];
+
+uid_err =
+    mathos_device_uid_format(
+        &gateway_hardware_uid,
+        gateway_uid_text,
+        sizeof(gateway_uid_text));
+
+if (uid_err != ESP_OK)
+{
+    ESP_LOGE(
+        TAG,
+        "FATAL: failed to format Gateway hardware UID");
+
+    return;
+}
+
+ESP_LOGI(
+    TAG,
+    "Gateway hardware UID=%s",
+    gateway_uid_text);
+    
 esp_err_t gateway_config_err =
     mathos_gateway_config_load(
         &gateway_runtime_config,

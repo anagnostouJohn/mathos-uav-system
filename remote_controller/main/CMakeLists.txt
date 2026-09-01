@@ -16,4 +16,6 @@ idf_component_register(
         mathos_flight_modes
         nvs_flash
         mathos_maintenance
+        mathos_identity
+        mathos_fleet
 )
