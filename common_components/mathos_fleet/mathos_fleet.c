@@ -8,6 +8,7 @@
 #include <stdlib.h>
 
 
+
 static const char *TAG = "MATHOS_FLEET";
 
 static esp_err_t fleet_make_slot_key(

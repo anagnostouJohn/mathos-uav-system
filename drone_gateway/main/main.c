@@ -16,6 +16,7 @@
 #include "mathos_protocol.h"
 #include "mathos_secure.h"
 #include "esp_random.h"
+#include "mathos_identity.h"
 
 
 // Use the MAVLink headers you generated before.
@@ -114,6 +115,13 @@ static int
     This must persist between PACKAGE/CHALLENGE transmission
     and the later RC_PROOF verification.
 */
+/*
+    Permanent Gateway hardware identity.
+
+    Used as the Fleet identity key.
+    UID identifies the Gateway but does NOT authenticate it.
+*/
+static mathos_device_uid_t gateway_hardware_uid;
 static mathos_pairing_session_t
     gateway_pairing_session;
 static QueueHandle_t rc_packet_queue = NULL;
@@ -625,10 +633,11 @@ static esp_err_t gateway_pairing_send_package_once(void)
         0,
         sizeof(package));
 
-    esp_err_t err =
-        mathos_pairing_package_from_gateway_config(
-            &gateway_runtime_config,
-            &package);
+esp_err_t err =
+    mathos_pairing_package_from_gateway_config(
+        &gateway_runtime_config,
+        &gateway_hardware_uid,
+        &package);
 
     if (err != ESP_OK)
     {
@@ -4683,8 +4692,6 @@ if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES ||
     The loader validates the complete stored record
     before publishing it.
 */
-
-mathos_device_uid_t gateway_hardware_uid;
 
 esp_err_t uid_err =
     mathos_device_uid_read(

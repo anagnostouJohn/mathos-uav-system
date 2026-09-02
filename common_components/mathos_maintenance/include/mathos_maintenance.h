@@ -2,7 +2,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-
+#include "mathos_identity.h"
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -31,14 +31,14 @@ extern "C"
 #define MATHOS_MAINTENANCE_WIFI_SSID_MAX_LEN 33
 #define MATHOS_MAINTENANCE_SERVER_HOST_MAX_LEN 64
 #define MATHOS_PAIRING_PACKAGE_MAGIC 0x4D504B47U
-#define MATHOS_PAIRING_PACKAGE_VERSION 1U
+#define MATHOS_PAIRING_PACKAGE_VERSION 2U
 #define MATHOS_PAIRING_SALT_LEN 16U
 #define MATHOS_PAIRING_PASSPHRASE_MIN_LEN 16U
 #define MATHOS_PAIRING_PASSPHRASE_MAX_LEN 96U
 #define MATHOS_PAIRING_CHALLENGE_MAGIC 0x4D43484CU
-#define MATHOS_PAIRING_CHALLENGE_VERSION 1U
+#define MATHOS_PAIRING_CHALLENGE_VERSION 2U
 #define MATHOS_PAIRING_PROOF_MAGIC 0x4D505246U
-#define MATHOS_PAIRING_PROOF_VERSION 1U
+#define MATHOS_PAIRING_PROOF_VERSION 2U
 #define MATHOS_PAIRING_PROOF_ROLE_RC 1U
 #define MATHOS_PAIRING_PROOF_ROLE_GATEWAY 2U
 /*
@@ -139,11 +139,21 @@ extern "C"
             authorised to use this pairing record.
         */
         uint8_t rc_id;
-        uint8_t authorised_gateway_id;
+        uint8_t gateway_id;
 
         /*
-            Uses the same derivation method values currently
-            defined for the Gateway pairing record.
+            Permanent physical Gateway identity.
+
+            This is the factory/eFuse-derived UID used as the
+            RC Fleet lookup key.
+
+            UID identifies the Gateway.
+            UID alone does NOT authenticate it.
+        */
+        mathos_device_uid_t gateway_uid;
+
+        /*
+            Derivation method used by both devices.
         */
         uint8_t key_derivation_method;
         uint8_t reserved0;
@@ -238,8 +248,15 @@ extern "C"
         uint8_t gateway_id;
 
         /*
+            Exact Gateway hardware UID from the pairing PACKAGE.
+
+            This UID will become part of the authenticated
+            pairing transcript.
+        */
+        mathos_device_uid_t gateway_uid;
+
+        /*
             Reserved for future challenge types.
-            Version 1 requires these bytes to remain zero.
         */
         uint8_t reserved0[2];
 
@@ -374,7 +391,9 @@ extern "C"
 */
 #define MATHOS_PAIRING_PACKAGE_WIRE_LEN \
     (4U + 2U + 2U +                     \
-     1U + 1U + 1U + 1U +                \
+     1U + 1U +                          \
+     MATHOS_DEVICE_UID_LEN +            \
+     1U + 1U +                          \
      4U + 4U +                          \
      MATHOS_PAIRING_SALT_LEN +          \
      4U +                               \
@@ -387,7 +406,9 @@ extern "C"
 */
 #define MATHOS_PAIRING_CHALLENGE_WIRE_LEN \
     (4U + 2U + 2U +                       \
-     1U + 1U + 2U +                       \
+     1U + 1U +                            \
+     MATHOS_DEVICE_UID_LEN +              \
+     2U +                                 \
      4U +                                 \
      MATHOS_PAIRING_NONCE_LEN +           \
      4U)
@@ -410,7 +431,6 @@ extern "C"
 
    Total: 68 bytes.
 */
-
 
 #define MATHOS_PAIRING_PROOF_WIRE_LEN \
     (4U + 2U + 2U +                   \
@@ -514,8 +534,6 @@ extern "C"
         const mathos_pairing_proof_t *proof,
         uint8_t *output,
         size_t output_size);
-
-
 
     typedef enum
     {
@@ -647,7 +665,6 @@ extern "C"
         pairing CHALLENGE payload.
     */
 
-
     /*
         Decode and validate one canonical version-1
         pairing PROOF payload.
@@ -701,9 +718,10 @@ extern "C"
         mathos_rc_pairing_config_t *config,
         int *loaded_from_nvs);
 
-    esp_err_t mathos_pairing_package_from_gateway_config(
-        const mathos_gateway_config_t *gateway_config,
-        mathos_pairing_package_t *package);
+esp_err_t mathos_pairing_package_from_gateway_config(
+    const mathos_gateway_config_t *gateway_config,
+    const mathos_device_uid_t *gateway_uid,
+    mathos_pairing_package_t *package);
 
     void mathos_pairing_proof_set_defaults(
         mathos_pairing_proof_t *proof);
@@ -783,20 +801,20 @@ extern "C"
         mathos_pairing_session_t *session,
         const mathos_gateway_config_t *gateway_config);
 
-/*
-    RC-side completion of mutual authentication.
+    /*
+        RC-side completion of mutual authentication.
 
-    Accepts the GATEWAY_PROOF received from the real
-    Gateway and verifies it using the RC candidate key
-    and the exact challenge already stored in the session.
+        Accepts the GATEWAY_PROOF received from the real
+        Gateway and verifies it using the RC candidate key
+        and the exact challenge already stored in the session.
 
-    On success the session becomes COMMIT_READY.
+        On success the session becomes COMMIT_READY.
 
-    This function does NOT write NVS.
-*/
-esp_err_t mathos_pairing_session_accept_gateway_proof(
-    mathos_pairing_session_t *session,
-    const mathos_pairing_proof_t *gateway_proof);
+        This function does NOT write NVS.
+    */
+    esp_err_t mathos_pairing_session_accept_gateway_proof(
+        mathos_pairing_session_t *session,
+        const mathos_pairing_proof_t *gateway_proof);
 
     esp_err_t mathos_gateway_config_load(
         mathos_gateway_config_t *config,

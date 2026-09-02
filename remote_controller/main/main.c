@@ -430,6 +430,17 @@ static joystick_axis_calibration_t pitch_calibration = {
 static uint32_t joystick_calibration_counter = 0;
 static mathos_rc_pairing_config_t rc_runtime_pairing_config;
 static int rc_runtime_pairing_loaded_from_nvs = 0;
+static mathos_fleet_operation_status_t
+    rc_fleet_operation_status =
+        MATHOS_FLEET_OPERATION_NO_AIRCRAFT;
+
+static uint16_t
+    rc_fleet_selected_slot =
+        0xFFFFU;
+
+static mathos_fleet_record_t
+    rc_fleet_selected_record;
+
 static mathos_pairing_session_t rc_pairing_session;
 static mathos_pairing_package_t rc_pairing_received_package;
 static int rc_pairing_have_package = 0;
@@ -8154,54 +8165,6 @@ void app_main(void)
 
     printf(
         "[FLEET] dedicated Fleet Store initialized\n");
-    fleet_err =
-        mathos_fleet_record_delete_slot(0);
-
-    if (fleet_err != ESP_OK &&
-        fleet_err != ESP_ERR_NVS_NOT_FOUND)
-    {
-        printf(
-            "[FLEET RECOVERY] failed to remove stale "
-            "test slot 0 error=%s\n",
-            esp_err_to_name(fleet_err));
-
-        return;
-    }
-
-    printf(
-        "[FLEET RECOVERY] stale validation test slot cleared\n");
-
-    fleet_err =
-        mathos_fleet_validate_store_self_test();
-
-    if (fleet_err != ESP_OK)
-    {
-        printf(
-            "[FLEET TEST] store-validation self-test FAILED "
-            "error=%s\n",
-            esp_err_to_name(fleet_err));
-
-        return;
-    }
-
-    printf(
-        "[FLEET TEST] store-validation self-test PASSED\n");
-
-    fleet_err =
-        mathos_fleet_duplicate_uid_lookup_self_test();
-
-    if (fleet_err != ESP_OK)
-    {
-        printf(
-            "[FLEET TEST] duplicate-UID lookup self-test FAILED "
-            "error=%s\n",
-            esp_err_to_name(fleet_err));
-
-        return;
-    }
-
-    printf(
-        "[FLEET TEST] duplicate-UID lookup self-test PASSED\n");
 
     if (pairing_load_err != ESP_OK)
     {
@@ -8344,7 +8307,65 @@ the pairing passphrase.
 
         lcd_draw_maintenance_screen(
             maintenance_ip);
+
         return;
+    }
+
+    /*
+        NORMAL MODE FLEET GATE
+
+        Maintenance mode bypasses this gate so Fleet
+        recovery remains possible.
+
+        Normal operation must not continue if the
+        Fleet Store is corrupted or ambiguous.
+    */
+    memset(
+        &rc_fleet_selected_record,
+        0,
+        sizeof(rc_fleet_selected_record));
+
+    rc_fleet_selected_slot =
+        0xFFFFU;
+
+    rc_fleet_operation_status =
+        MATHOS_FLEET_OPERATION_NO_AIRCRAFT;
+
+    fleet_err =
+        mathos_fleet_boot_validate(
+            &rc_fleet_operation_status,
+            &rc_fleet_selected_slot,
+            &rc_fleet_selected_record);
+
+    if (fleet_err != ESP_OK)
+    {
+        printf(
+            "[FLEET BOOT] FATAL: Fleet validation failed "
+            "error=%s\n",
+            esp_err_to_name(fleet_err));
+
+        printf(
+            "[FLEET BOOT] Normal control startup BLOCKED\n");
+
+        return;
+    }
+
+    printf(
+        "[FLEET BOOT] operation=%s\n",
+        mathos_fleet_operation_status_to_string(
+            rc_fleet_operation_status));
+
+    if (rc_fleet_operation_status ==
+        MATHOS_FLEET_OPERATION_READY)
+    {
+        printf(
+            "[FLEET BOOT] candidate slot=%u "
+            "name=%s generation=%lu\n",
+            (unsigned int)
+                rc_fleet_selected_slot,
+            rc_fleet_selected_record.friendly_name,
+            (unsigned long)
+                rc_fleet_selected_record.key_generation);
     }
 
     printf(

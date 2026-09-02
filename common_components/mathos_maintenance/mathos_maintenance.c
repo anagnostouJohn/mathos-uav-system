@@ -1156,6 +1156,20 @@ esp_err_t mathos_pairing_package_encode_payload(
     output[i++] =
         package->gateway_id;
 
+    /*
+        Permanent Gateway hardware UID.
+
+        Canonical byte order is exactly the six bytes
+        returned by mathos_identity.
+    */
+    for (size_t uid_index = 0;
+         uid_index < MATHOS_DEVICE_UID_LEN;
+         uid_index++)
+    {
+        output[i++] =
+            package->gateway_uid.bytes[uid_index];
+    }
+
     output[i++] =
         package->key_derivation_method;
 
@@ -1304,6 +1318,17 @@ esp_err_t mathos_pairing_package_decode_payload(
 
     package->gateway_id =
         input[i++];
+
+    /*
+        Decode the permanent Gateway hardware UID.
+    */
+    for (size_t uid_index = 0;
+         uid_index < MATHOS_DEVICE_UID_LEN;
+         uid_index++)
+    {
+        package->gateway_uid.bytes[uid_index] =
+            input[i++];
+    }
 
     package->key_derivation_method =
         input[i++];
@@ -3815,7 +3840,6 @@ esp_err_t mathos_pairing_session_accept_gateway_proof(
     return ESP_OK;
 }
 
-
 static esp_err_t maintenance_run_pairing_bench_self_test(
     void)
 {
@@ -4916,6 +4940,7 @@ esp_err_t mathos_pairing_proof_create(
                                1U +
                                1U +
                                1U +
+                               MATHOS_DEVICE_UID_LEN +
                                1U +
                                4U +
                                MATHOS_PAIRING_NONCE_LEN] = {0};
@@ -4923,15 +4948,18 @@ esp_err_t mathos_pairing_proof_create(
     size_t offset = 0;
 
     /*
-        Domain separator: "MPR1"
+        Domain separator: "MPR2"
 
-        This ensures the HMAC cannot be confused with
-        another MATHOS protocol message.
+        Pairing proof v2 cryptographically binds the
+        permanent Gateway hardware UID into the transcript.
+
+        Using a new domain separator prevents a v1 proof
+        from ever being interpreted as a v2 proof.
     */
     authenticated_data[offset++] = 'M';
     authenticated_data[offset++] = 'P';
     authenticated_data[offset++] = 'R';
-    authenticated_data[offset++] = '1';
+    authenticated_data[offset++] = '2';
 
     authenticated_data[offset++] =
         proof_role;
@@ -4941,6 +4969,22 @@ esp_err_t mathos_pairing_proof_create(
 
     authenticated_data[offset++] =
         challenge->gateway_id;
+
+    /*
+        Cryptographically bind this proof to the exact
+        physical Gateway identity.
+
+        The UID itself is public, but changing even one UID
+        byte now changes the HMAC and causes verification
+        to fail.
+    */
+    for (size_t uid_index = 0;
+        uid_index < MATHOS_DEVICE_UID_LEN;
+        uid_index++)
+    {
+        authenticated_data[offset++] =
+            challenge->gateway_uid.bytes[uid_index];
+    }
 
     authenticated_data[offset++] =
         MATHOS_PAIRING_PROOF_VERSION;
@@ -5370,9 +5414,39 @@ int mathos_pairing_challenge_is_valid(
     {
         return 0;
     }
-
     /*
-        Reserved version-1 bytes must remain zero.
+        Gateway UID follows the same active/inactive rule
+        as the pairing PACKAGE.
+
+        generation == 0:
+            empty challenge, UID must be all zero.
+
+        generation > 0:
+            active challenge, UID must be a valid
+            permanent hardware identity.
+    */
+    if (challenge->key_generation == 0)
+    {
+        for (size_t i = 0;
+             i < MATHOS_DEVICE_UID_LEN;
+             i++)
+        {
+            if (challenge->gateway_uid.bytes[i] != 0)
+            {
+                return 0;
+            }
+        }
+    }
+    else
+    {
+        if (!mathos_device_uid_is_valid(
+                &challenge->gateway_uid))
+        {
+            return 0;
+        }
+    }
+    /*
+        Reserved version-2 bytes must remain zero.
     */
     for (size_t i = 0;
          i < sizeof(challenge->reserved0);
@@ -5483,6 +5557,13 @@ esp_err_t mathos_pairing_challenge_from_package(
 
     challenge->gateway_id =
         package->gateway_id;
+
+    /*
+        Bind this challenge to the exact physical Gateway
+        that created the PACKAGE.
+    */
+    challenge->gateway_uid =
+        package->gateway_uid;
 
     challenge->key_generation =
         package->key_generation;
@@ -5633,9 +5714,43 @@ int mathos_pairing_package_is_valid(
     {
         return 0;
     }
-
     /*
-        Reserved version-1 fields must remain zero.
+        Gateway UID rules:
+
+        Empty package:
+            generation == 0
+            UID must remain all-zero.
+
+        Real pairing package:
+            generation > 0
+            UID must be a valid permanent hardware UID.
+
+        This preserves a clean inactive/default state while
+        preventing a real pairing offer from using an empty
+        or invalid Fleet identity.
+    */
+    if (package->key_generation == 0)
+    {
+        for (size_t i = 0;
+             i < MATHOS_DEVICE_UID_LEN;
+             i++)
+        {
+            if (package->gateway_uid.bytes[i] != 0)
+            {
+                return 0;
+            }
+        }
+    }
+    else
+    {
+        if (!mathos_device_uid_is_valid(
+                &package->gateway_uid))
+        {
+            return 0;
+        }
+    }
+    /*
+        Reserved version-2 fields must remain zero.
     */
     if (package->reserved0 != 0)
     {
@@ -5732,11 +5847,24 @@ int mathos_pairing_package_is_valid(
 
 esp_err_t mathos_pairing_package_from_gateway_config(
     const mathos_gateway_config_t *gateway_config,
+    const mathos_device_uid_t *gateway_uid,
     mathos_pairing_package_t *package)
 {
     if (gateway_config == NULL ||
+        gateway_uid == NULL ||
         package == NULL)
     {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!mathos_device_uid_is_valid(
+            gateway_uid))
+    {
+        ESP_LOGE(
+            TAG,
+            "pairing package creation rejected: "
+            "invalid Gateway hardware UID");
+
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -5805,6 +5933,9 @@ esp_err_t mathos_pairing_package_from_gateway_config(
 
     package->gateway_id =
         gateway_config->gateway_id;
+
+    package->gateway_uid =
+        *gateway_uid;
 
     package->key_derivation_method =
         gateway_config->key_derivation_method;
@@ -11588,16 +11719,26 @@ esp_err_t mathos_pairing_challenge_encode_payload(
 
     /*
         Device identities.
-    */
-    output[i++] =
-        challenge->rc_id;
+output[i++] =
+    challenge->rc_id;
 
-    output[i++] =
-        challenge->gateway_id;
+output[i++] =
+    challenge->gateway_id;
 
-    /*
-        Reserved version-1 bytes.
-    */
+/*
+    Permanent Gateway hardware UID.
+
+    The byte order is exactly the canonical UID byte
+    order used by mathos_identity.
+*/
+    for (size_t uid_index = 0;
+         uid_index < MATHOS_DEVICE_UID_LEN;
+         uid_index++)
+    {
+        output[i++] =
+            challenge->gateway_uid.bytes[uid_index];
+    }
+
     output[i++] =
         challenge->reserved0[0];
 
@@ -11715,6 +11856,17 @@ esp_err_t mathos_pairing_challenge_decode_payload(
 
     challenge->gateway_id =
         input[i++];
+
+    /*
+        Decode the permanent Gateway hardware UID.
+    */
+    for (size_t uid_index = 0;
+         uid_index < MATHOS_DEVICE_UID_LEN;
+         uid_index++)
+    {
+        challenge->gateway_uid.bytes[uid_index] =
+            input[i++];
+    }
 
     challenge->reserved0[0] =
         input[i++];
