@@ -3867,6 +3867,22 @@ static esp_err_t maintenance_run_pairing_bench_self_test(
 
     mathos_pairing_session_t session = {0};
 
+    /*
+        Deterministic synthetic Gateway UID used only by
+        this in-memory pairing self-test.
+
+        0x02 marks it as a locally administered identity,
+        keeping it distinct from a real factory MAC.
+    */
+    mathos_device_uid_t test_gateway_uid = {
+        .bytes = {
+            0x02U,
+            0x00U,
+            0x00U,
+            0x00U,
+            0x00U,
+            0x01U}};
+
     esp_err_t result = ESP_OK;
 
     ESP_LOGI(
@@ -3958,6 +3974,7 @@ static esp_err_t maintenance_run_pairing_bench_self_test(
     result =
         mathos_pairing_package_from_gateway_config(
             &gateway_config,
+            &test_gateway_uid,
             &package);
 
     if (result != ESP_OK)
@@ -11721,21 +11738,21 @@ esp_err_t mathos_pairing_challenge_encode_payload(
     output[i++] =
         (uint8_t)((challenge->record_size >> 8) & 0xFFU);
 
-/*
-    Device identities.
-*/
-output[i++] =
-    challenge->rc_id;
+    /*
+        Device identities.
+    */
+    output[i++] =
+        challenge->rc_id;
 
-output[i++] =
-    challenge->gateway_id;
+    output[i++] =
+        challenge->gateway_id;
 
-/*
-    Permanent Gateway hardware UID.
+    /*
+        Permanent Gateway hardware UID.
 
-    The byte order is exactly the canonical UID byte
-    order used by mathos_identity.
-*/
+        The byte order is exactly the canonical UID byte
+        order used by mathos_identity.
+    */
     for (size_t uid_index = 0;
          uid_index < MATHOS_DEVICE_UID_LEN;
          uid_index++)
