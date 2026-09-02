@@ -17,7 +17,7 @@
 #include "mbedtls/pkcs5.h"
 #include "esp_random.h"
 #include "esp_timer.h"
-
+#include "esp_task_wdt.h"
 #define MATHOS_MAINTENANCE_RC_SSID "MATHOS-RC-SETUP"
 #define MATHOS_MAINTENANCE_GATEWAY_SSID "MATHOS-GW-SETUP"
 
@@ -43,6 +43,15 @@
 
     Set to 0 after the runtime test passes.
 */
+/*
+    PBKDF2 currently takes approximately eight seconds
+    on the RC.
+
+    Maintenance mode is exclusive: flight and control
+    tasks are not running. Give maintenance operations
+    enough time while retaining watchdog protection.
+*/
+#define MATHOS_MAINTENANCE_TASK_WDT_TIMEOUT_MS 15000U
 #define MATHOS_PAIRING_BENCH_SELF_TEST_ENABLED 0
 
 static const char *TAG = "MATHOS_MAINT";
@@ -4698,7 +4707,7 @@ mathos_pairing_challenge_wire_self_test(void)
         test_gateway_uid;
 
     original.key_generation = 7;
-    ;
+    
 
     original.reserved0[0] = 0;
     original.reserved0[1] = 0;
@@ -11380,7 +11389,52 @@ static const char *maintenance_role_to_text(
         return "UNKNOWN";
     }
 }
+static esp_err_t
+maintenance_configure_task_watchdog(void)
+{
+#if defined(CONFIG_ESP_TASK_WDT_EN) && \
+    defined(CONFIG_ESP_TASK_WDT_INIT)
 
+    const esp_task_wdt_config_t task_wdt_config = {
+        .timeout_ms =
+            MATHOS_MAINTENANCE_TASK_WDT_TIMEOUT_MS,
+
+        .idle_core_mask =
+            (1U << CONFIG_FREERTOS_NUMBER_OF_CORES) -
+            1U,
+
+#if defined(CONFIG_ESP_TASK_WDT_PANIC)
+        .trigger_panic = true
+#else
+        .trigger_panic = false
+#endif
+    };
+
+    esp_err_t err =
+        esp_task_wdt_reconfigure(
+            &task_wdt_config);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "maintenance Task Watchdog "
+            "reconfiguration failed: %s",
+            esp_err_to_name(err));
+
+        return err;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "maintenance Task Watchdog timeout=%lu ms",
+        (unsigned long)
+            MATHOS_MAINTENANCE_TASK_WDT_TIMEOUT_MS);
+
+#endif
+
+    return ESP_OK;
+}
 esp_err_t mathos_maintenance_softap_start(
     mathos_maintenance_role_t role)
 {
@@ -11465,7 +11519,13 @@ esp_err_t mathos_maintenance_softap_start(
 
         return ESP_ERR_INVALID_ARG;
     }
+    esp_err_t watchdog_err =
+        maintenance_configure_task_watchdog();
 
+    if (watchdog_err != ESP_OK)
+    {
+        return watchdog_err;
+    }
     esp_err_t config_err = ESP_OK;
 
     if (role == MATHOS_MAINTENANCE_ROLE_RC)
