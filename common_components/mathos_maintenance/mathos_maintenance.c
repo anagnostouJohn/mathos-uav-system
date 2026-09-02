@@ -11721,8 +11721,9 @@ esp_err_t mathos_pairing_challenge_encode_payload(
     output[i++] =
         (uint8_t)((challenge->record_size >> 8) & 0xFFU);
 
-    /*
-        Device identities.
+/*
+    Device identities.
+*/
 output[i++] =
     challenge->rc_id;
 
