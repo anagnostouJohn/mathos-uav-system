@@ -2474,6 +2474,22 @@ mathos_pairing_complete_frame_self_test(void)
     original.rc_id = 1;
     original.gateway_id = 2;
 
+    /*
+        Deterministic synthetic Gateway UID used only by
+        this complete-frame self-test.
+    */
+    const mathos_device_uid_t test_gateway_uid = {
+        .bytes = {
+            0x02U,
+            0x00U,
+            0x00U,
+            0x00U,
+            0x00U,
+            0x04U}};
+
+    original.gateway_uid =
+        test_gateway_uid;
+
     original.key_derivation_method =
         MATHOS_GATEWAY_KEY_DERIVATION_PBKDF2_SHA256;
 
@@ -2713,6 +2729,10 @@ mathos_pairing_complete_frame_self_test(void)
             original.rc_id ||
         decoded_package.gateway_id !=
             original.gateway_id ||
+        memcmp(
+            decoded_package.gateway_uid.bytes,
+            original.gateway_uid.bytes,
+            MATHOS_DEVICE_UID_LEN) != 0 ||
         decoded_package.key_generation !=
             original.key_generation ||
         decoded_package.kdf_iteration_count !=
@@ -3231,12 +3251,16 @@ esp_err_t mathos_pairing_session_prepare_rc_response(
         session->package.rc_id !=
             session->challenge.rc_id ||
         session->package.gateway_id !=
-            session->challenge.gateway_id)
+            session->challenge.gateway_id ||
+        memcmp(
+            session->package.gateway_uid.bytes,
+            session->challenge.gateway_uid.bytes,
+            MATHOS_DEVICE_UID_LEN) != 0)
     {
         ESP_LOGE(
             TAG,
             "RC pairing response rejected: "
-            "session metadata mismatch");
+            "session metadata or Gateway UID mismatch");
 
         mathos_pairing_session_reset(
             session);
@@ -3552,12 +3576,16 @@ esp_err_t mathos_pairing_session_prepare_gateway_response(
         session->challenge.rc_id !=
             gateway_config->authorised_rc_id ||
         session->challenge.gateway_id !=
-            gateway_config->gateway_id)
+            gateway_config->gateway_id ||
+        memcmp(
+            session->package.gateway_uid.bytes,
+            session->challenge.gateway_uid.bytes,
+            MATHOS_DEVICE_UID_LEN) != 0)
     {
         ESP_LOGE(
             TAG,
             "Gateway pairing response rejected: "
-            "session metadata mismatch");
+            "session metadata or Gateway UID mismatch");
 
         mathos_pairing_session_reset(
             session);
@@ -4113,6 +4141,72 @@ static esp_err_t maintenance_run_pairing_bench_self_test(
         goto cleanup;
     }
     /*
+    Prove that the Gateway hardware UID is part of the
+    MPR2 authenticated transcript.
+
+    Use a valid copy of the challenge with one UID byte
+    changed and a freshly calculated CRC. Therefore,
+    rejection must come from the HMAC mismatch rather
+    than ordinary packet-corruption validation.
+*/
+    mathos_pairing_challenge_t uid_tampered_challenge =
+        session.challenge;
+
+    uid_tampered_challenge.gateway_uid.bytes[0] ^=
+        0x01U;
+
+    uid_tampered_challenge.crc32 = 0;
+
+    uid_tampered_challenge.crc32 =
+        mathos_pairing_challenge_calculate_crc32(
+            &uid_tampered_challenge);
+
+    if (!mathos_pairing_challenge_is_valid(
+            &uid_tampered_challenge))
+    {
+        ESP_LOGE(
+            TAG,
+            "PAIRING SELF-TEST FAIL: "
+            "UID-tampered challenge is not structurally valid");
+
+        result = ESP_FAIL;
+
+        maintenance_clear_sensitive_memory(
+            &uid_tampered_challenge,
+            sizeof(uid_tampered_challenge));
+
+        goto cleanup;
+    }
+
+    result =
+        mathos_pairing_proof_verify(
+            session.rc_candidate.root_key,
+            &uid_tampered_challenge,
+            &session.rc_proof,
+            MATHOS_PAIRING_PROOF_ROLE_RC);
+
+    maintenance_clear_sensitive_memory(
+        &uid_tampered_challenge,
+        sizeof(uid_tampered_challenge));
+
+    if (result == ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "PAIRING SELF-TEST FAIL: "
+            "proof accepted after Gateway UID modification");
+
+        result = ESP_FAIL;
+        goto cleanup;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "PAIRING MPR2 UID-BINDING TEST PASSED: "
+        "modified Gateway UID rejected");
+
+    result = ESP_OK;
+    /*
         Tamper with one HMAC byte after a completely valid
         RC proof has been created.
 
@@ -4365,6 +4459,22 @@ mathos_pairing_package_wire_self_test(void)
     original.rc_id = 1;
     original.gateway_id = 2;
 
+    /*
+        Deterministic synthetic Gateway UID used only by
+        this wire-format self-test.
+    */
+    const mathos_device_uid_t test_gateway_uid = {
+        .bytes = {
+            0x02U,
+            0x00U,
+            0x00U,
+            0x00U,
+            0x00U,
+            0x02U}};
+
+    original.gateway_uid =
+        test_gateway_uid;
+
     original.key_derivation_method =
         MATHOS_GATEWAY_KEY_DERIVATION_PBKDF2_SHA256;
 
@@ -4475,6 +4585,10 @@ mathos_pairing_package_wire_self_test(void)
         decoded.record_size != original.record_size ||
         decoded.rc_id != original.rc_id ||
         decoded.gateway_id != original.gateway_id ||
+        memcmp(
+            decoded.gateway_uid.bytes,
+            original.gateway_uid.bytes,
+            MATHOS_DEVICE_UID_LEN) != 0 ||
         decoded.key_derivation_method !=
             original.key_derivation_method ||
         decoded.reserved0 != original.reserved0 ||
@@ -4510,16 +4624,16 @@ mathos_pairing_package_wire_self_test(void)
 
     /*
         ----------------------------------------------------
-        Tamper test
+        Gateway UID tamper test
         ----------------------------------------------------
 
-        Byte 20 is the first byte of the public pairing
-        salt in our canonical version-1 payload.
+        Byte 10 is the first Gateway hardware UID byte
+        in the canonical version-2 PACKAGE payload.
 
         Modify it without changing the stored CRC.
         The decoder must reject the package.
     */
-    encoded[20] ^= 0x01U;
+    encoded[10] ^= 0x01U;
 
     mathos_pairing_package_t tampered;
 
@@ -4566,7 +4680,25 @@ mathos_pairing_challenge_wire_self_test(void)
     */
     original.rc_id = 1;
     original.gateway_id = 2;
+
+    /*
+        Deterministic synthetic Gateway UID used only by
+        this challenge wire-format self-test.
+    */
+    const mathos_device_uid_t test_gateway_uid = {
+        .bytes = {
+            0x02U,
+            0x00U,
+            0x00U,
+            0x00U,
+            0x00U,
+            0x03U}};
+
+    original.gateway_uid =
+        test_gateway_uid;
+
     original.key_generation = 7;
+    ;
 
     original.reserved0[0] = 0;
     original.reserved0[1] = 0;
@@ -4660,6 +4792,10 @@ mathos_pairing_challenge_wire_self_test(void)
         decoded.record_size != original.record_size ||
         decoded.rc_id != original.rc_id ||
         decoded.gateway_id != original.gateway_id ||
+        memcmp(
+            decoded.gateway_uid.bytes,
+            original.gateway_uid.bytes,
+            MATHOS_DEVICE_UID_LEN) != 0 ||
         decoded.reserved0[0] != original.reserved0[0] ||
         decoded.reserved0[1] != original.reserved0[1] ||
         decoded.key_generation !=
@@ -4687,14 +4823,15 @@ mathos_pairing_challenge_wire_self_test(void)
             decoded.key_generation);
 
     /*
-        Tamper test.
+        Gateway UID tamper test.
 
-        Byte 16 is the first byte of the nonce in the
-        version-1 canonical challenge payload.
+        Byte 10 is the first Gateway hardware UID byte
+        in the canonical version-2 CHALLENGE payload.
 
         Change it without recalculating the CRC.
+        The decoder must reject the challenge.
     */
-    encoded[16] ^= 0x01U;
+    encoded[10] ^= 0x01U;
 
     mathos_pairing_challenge_t tampered;
 

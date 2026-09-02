@@ -6010,16 +6010,26 @@ static void rc_pairing_rx_task(
                     decoded_header.sequence);
 
             /*
-                ------------------------------------------------
-                For our first physical test we only accept
-                Gateway PACKAGE messages.
-                ------------------------------------------------
+                Dispatch each validated pairing frame according
+                to its handshake message type.
             */
             if (decoded_header.message_type ==
                 MATHOS_PAIRING_MSG_PACKAGE)
             {
-                if (payload_len !=
-                    MATHOS_PAIRING_PACKAGE_WIRE_LEN)
+                /*
+                    PACKAGE must always be the first frame in the
+                    pairing exchange.
+                */
+                if (decoded_header.sequence != 1U)
+                {
+                    printf(
+                        "[PAIRING RX] PACKAGE rejected: "
+                        "unexpected sequence=%lu\n",
+                        (unsigned long)
+                            decoded_header.sequence);
+                }
+                else if (payload_len !=
+                         MATHOS_PAIRING_PACKAGE_WIRE_LEN)
                 {
                     printf(
                         "[PAIRING RX] PACKAGE has "
@@ -6094,8 +6104,20 @@ static void rc_pairing_rx_task(
             else if (decoded_header.message_type ==
                      MATHOS_PAIRING_MSG_CHALLENGE)
             {
-                if (payload_len !=
-                    MATHOS_PAIRING_CHALLENGE_WIRE_LEN)
+                /*
+                    CHALLENGE must be the second frame in the
+                    pairing exchange.
+                */
+                if (decoded_header.sequence != 2U)
+                {
+                    printf(
+                        "[PAIRING RX] CHALLENGE rejected: "
+                        "unexpected sequence=%lu\n",
+                        (unsigned long)
+                            decoded_header.sequence);
+                }
+                else if (payload_len !=
+                         MATHOS_PAIRING_CHALLENGE_WIRE_LEN)
                 {
                     printf(
                         "[PAIRING RX] CHALLENGE has "
@@ -6185,7 +6207,7 @@ static void rc_pairing_rx_task(
                      MATHOS_PAIRING_MSG_GATEWAY_PROOF)
             {
                 /*
-                    Version-1 handshake ordering:
+                    Pairing handshake ordering:
 
                         PACKAGE        sequence 1
                         CHALLENGE      sequence 2
