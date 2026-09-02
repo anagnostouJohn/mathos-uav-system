@@ -139,22 +139,8 @@ extern "C"
             authorised to use this pairing record.
         */
         uint8_t rc_id;
-        uint8_t gateway_id;
+        uint8_t authorised_gateway_id;
 
-        /*
-            Permanent physical Gateway identity.
-
-            This is the factory/eFuse-derived UID used as the
-            RC Fleet lookup key.
-
-            UID identifies the Gateway.
-            UID alone does NOT authenticate it.
-        */
-        mathos_device_uid_t gateway_uid;
-
-        /*
-            Derivation method used by both devices.
-        */
         uint8_t key_derivation_method;
         uint8_t reserved0;
 
@@ -209,32 +195,22 @@ extern "C"
         uint8_t gateway_id;
 
         /*
-            Derivation method used by both devices.
+            Permanent physical Gateway identity.
+
+            Used as the Fleet lookup identity and authenticated
+            by the Pairing-v2 challenge/proof transcript.
+
+            UID identifies the Gateway.
+            UID alone is NOT authentication.
         */
+        mathos_device_uid_t gateway_uid;
+
         uint8_t key_derivation_method;
         uint8_t reserved0;
-
-        /*
-            Both devices must use the same generation,
-            salt and iteration count.
-        */
         uint32_t key_generation;
         uint32_t kdf_iteration_count;
-
         uint8_t pairing_salt[MATHOS_PAIRING_SALT_LEN];
-
-        /*
-            Reserved for future package versions.
-            Version 1 requires these bytes to remain zero.
-        */
         uint8_t reserved1[4];
-
-        /*
-            Detects accidental corruption during transfer.
-
-            CRC is not authentication and does not make the
-            package secret.
-        */
         uint32_t crc32;
     } mathos_pairing_package_t;
 
@@ -718,10 +694,10 @@ extern "C"
         mathos_rc_pairing_config_t *config,
         int *loaded_from_nvs);
 
-esp_err_t mathos_pairing_package_from_gateway_config(
-    const mathos_gateway_config_t *gateway_config,
-    const mathos_device_uid_t *gateway_uid,
-    mathos_pairing_package_t *package);
+    esp_err_t mathos_pairing_package_from_gateway_config(
+        const mathos_gateway_config_t *gateway_config,
+        const mathos_device_uid_t *gateway_uid,
+        mathos_pairing_package_t *package);
 
     void mathos_pairing_proof_set_defaults(
         mathos_pairing_proof_t *proof);

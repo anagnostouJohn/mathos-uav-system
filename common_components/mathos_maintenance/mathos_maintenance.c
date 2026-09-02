@@ -3058,13 +3058,17 @@ esp_err_t mathos_pairing_session_accept_remote_challenge(
             challenge->rc_id ||
         package->gateway_id !=
             challenge->gateway_id ||
+        memcmp(
+            package->gateway_uid.bytes,
+            challenge->gateway_uid.bytes,
+            MATHOS_DEVICE_UID_LEN) != 0 ||
         package->key_generation !=
             challenge->key_generation)
     {
         ESP_LOGW(
             TAG,
             "remote pairing session rejected: "
-            "metadata mismatch");
+            "metadata or Gateway UID mismatch");
 
         return ESP_ERR_INVALID_STATE;
     }
@@ -4979,8 +4983,8 @@ esp_err_t mathos_pairing_proof_create(
         to fail.
     */
     for (size_t uid_index = 0;
-        uid_index < MATHOS_DEVICE_UID_LEN;
-        uid_index++)
+         uid_index < MATHOS_DEVICE_UID_LEN;
+         uid_index++)
     {
         authenticated_data[offset++] =
             challenge->gateway_uid.bytes[uid_index];
