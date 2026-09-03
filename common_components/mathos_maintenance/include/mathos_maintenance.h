@@ -676,6 +676,26 @@ extern "C"
 
         The callback must not retain the pointer.
     */
+
+    /*
+    Display-only status for the RC maintenance page.
+
+    This value reports pairing progress to the operator.
+    It must never authorize pairing, save a key or replace
+    cryptographic proof verification.
+*/
+    typedef enum
+    {
+        MATHOS_MAINTENANCE_RC_PAIRING_IDLE = 0,
+
+        MATHOS_MAINTENANCE_RC_PAIRING_IN_PROGRESS,
+
+        MATHOS_MAINTENANCE_RC_PAIRING_SUCCESS,
+
+        MATHOS_MAINTENANCE_RC_PAIRING_FAILED
+
+    } mathos_maintenance_rc_pairing_status_t;
+
     typedef esp_err_t (*mathos_maintenance_rc_pairing_callback_t)(
         const char *passphrase);
 
@@ -686,6 +706,13 @@ extern "C"
     */
     void mathos_maintenance_set_rc_pairing_callback(
         mathos_maintenance_rc_pairing_callback_t callback);
+
+    /*
+Publish a display-only pairing status to the RC
+maintenance web interface.
+*/
+    void mathos_maintenance_set_rc_pairing_status(
+        mathos_maintenance_rc_pairing_status_t status);
 
     esp_err_t mathos_rc_pairing_config_save(
         const mathos_rc_pairing_config_t *config);

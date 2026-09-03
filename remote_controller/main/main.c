@@ -35,7 +35,7 @@
 
 #define FC_ARM_PENDING_TIMEOUT_MS 3000
 
-#define ONE_JOYSTICK_TEST 1
+#define ONE_JOYSTICK_TEST 0
 
 #define TEST_FIXED_MANUAL_CONTROL 0
 #define TEST_ALLOW_MANUAL_WHILE_DISARMED 0
@@ -45,7 +45,7 @@
 #define TEST_FIXED_PITCH 300
 #define TEST_FIXED_ROLL -300
 
-#define JOYSTICK_RAW_DIAGNOSTIC 0
+#define JOYSTICK_RAW_DIAGNOSTIC 1
 #define JOYSTICK_DIAG_PRINT_EVERY 100
 
 #define BUTTON_PIN_ARM 12
@@ -112,6 +112,15 @@
 #define LINK_UART_TX_PIN 38
 #define LINK_UART_RX_PIN 39
 #define LINK_UART_BAUD 115200
+
+/*
+    Once RC_PROOF has been transmitted, the Gateway must
+    return its authenticated proof promptly.
+
+    This is separate from the longer overall pairing
+    challenge lifetime.
+*/
+#define RC_PAIRING_GATEWAY_PROOF_TIMEOUT_MS 10000U
 
 #define FEATURE_LINK_UART_TX 1
 
@@ -444,6 +453,8 @@ static mathos_fleet_record_t
 static mathos_pairing_session_t rc_pairing_session;
 static mathos_pairing_package_t rc_pairing_received_package;
 static int rc_pairing_have_package = 0;
+static portMUX_TYPE rc_pairing_proof_timer_lock = portMUX_INITIALIZER_UNLOCKED;
+static int64_t rc_pairing_proof_sent_at_us = 0;
 volatile uint32_t system_faults = FAULT_NONE;
 volatile TickType_t task_heartbeat[HB_COUNT];
 volatile TickType_t rc_input_last_update_tick = 0;
@@ -5345,6 +5356,93 @@ static void gateway_status_process_byte(uint8_t byte)
         expected_frame_len = 0;
     }
 }
+
+static esp_err_t
+rc_pairing_gateway_proof_timer_start(void)
+{
+    int64_t now_us =
+        esp_timer_get_time();
+
+    if (now_us <= 0)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    portENTER_CRITICAL(
+        &rc_pairing_proof_timer_lock);
+
+    rc_pairing_proof_sent_at_us =
+        now_us;
+
+    portEXIT_CRITICAL(
+        &rc_pairing_proof_timer_lock);
+
+    return ESP_OK;
+}
+
+static void
+rc_pairing_gateway_proof_timer_clear(void)
+{
+    portENTER_CRITICAL(
+        &rc_pairing_proof_timer_lock);
+
+    rc_pairing_proof_sent_at_us = 0;
+
+    portEXIT_CRITICAL(
+        &rc_pairing_proof_timer_lock);
+}
+
+static int
+rc_pairing_gateway_proof_timer_has_expired(void)
+{
+    int64_t proof_sent_at_us = 0;
+
+    /*
+        Copy the shared timestamp while protected, then
+        perform all calculations outside the lock.
+    */
+    portENTER_CRITICAL(
+        &rc_pairing_proof_timer_lock);
+
+    proof_sent_at_us =
+        rc_pairing_proof_sent_at_us;
+
+    portEXIT_CRITICAL(
+        &rc_pairing_proof_timer_lock);
+
+    /*
+        Zero means that no RC_PROOF response timer is
+        currently active.
+    */
+    if (proof_sent_at_us <= 0)
+    {
+        return 0;
+    }
+
+    int64_t now_us =
+        esp_timer_get_time();
+
+    /*
+        Treat an invalid or backwards timer value as
+        expired rather than trusting corrupted timing.
+    */
+    if (now_us <= 0 ||
+        now_us < proof_sent_at_us)
+    {
+        return 1;
+    }
+
+    int64_t timeout_us =
+        (int64_t)
+            RC_PAIRING_GATEWAY_PROOF_TIMEOUT_MS *
+        1000LL;
+
+    return (now_us - proof_sent_at_us) >=
+                   timeout_us
+               ? 1
+               : 0;
+}
+
 static esp_err_t
 rc_pairing_prepare_and_send_proof(
     const char *passphrase)
@@ -5490,6 +5588,25 @@ rc_pairing_prepare_and_send_proof(
         return err;
     }
 
+    /*
+        Arm the response deadline before queuing RC_PROOF.
+
+        This ordering prevents an extremely fast Gateway
+        response from arriving before the timer is active.
+    */
+    err =
+        rc_pairing_gateway_proof_timer_start();
+
+    if (err != ESP_OK)
+    {
+        printf(
+            "[PAIRING TX] Gateway-proof timer "
+            "start failed error=%s\n",
+            esp_err_to_name(err));
+
+        return err;
+    }
+
     int written =
         uart_write_bytes(
             LINK_UART_PORT,
@@ -5499,6 +5616,12 @@ rc_pairing_prepare_and_send_proof(
     if (written !=
         (int)frame_len)
     {
+        /*
+            No complete RC_PROOF was submitted, so no
+            Gateway response should be awaited.
+        */
+        rc_pairing_gateway_proof_timer_clear();
+
         printf(
             "[PAIRING TX] RC_PROOF UART write failed "
             "written=%d expected=%u\n",
@@ -5523,6 +5646,31 @@ rc_pairing_prepare_and_send_proof(
 
     return ESP_OK;
 }
+
+static int rc_pairing_secret_matches(
+    const uint8_t *left,
+    const uint8_t *right,
+    size_t length)
+{
+    if (left == NULL ||
+        right == NULL)
+    {
+        return 0;
+    }
+
+    uint8_t difference = 0U;
+
+    for (size_t index = 0;
+         index < length;
+         index++)
+    {
+        difference |=
+            left[index] ^ right[index];
+    }
+
+    return difference == 0U;
+}
+
 static void rc_pairing_clear_sensitive_memory(
     void *buffer,
     size_t buffer_size)
@@ -5680,6 +5828,99 @@ rc_pairing_commit_verified_candidate(void)
     }
 
     /*
+        Mutual authentication has completed and the RC
+        pairing record has been written and verified.
+
+        Now bind the authenticated physical Gateway UID and
+        derived Pair Key into the authoritative Fleet Store.
+    */
+    char gateway_uid_text[MATHOS_DEVICE_UID_TEXT_LEN];
+
+    esp_err_t uid_format_err =
+        mathos_device_uid_format(
+            &rc_pairing_session.challenge.gateway_uid,
+            gateway_uid_text,
+            sizeof(gateway_uid_text));
+
+    if (uid_format_err != ESP_OK)
+    {
+        printf(
+            "[PAIRING COMMIT] Fleet Gateway UID "
+            "formatting failed error=%s\n",
+            esp_err_to_name(uid_format_err));
+
+        rc_pairing_clear_sensitive_memory(
+            &loaded_config,
+            sizeof(loaded_config));
+
+        return uid_format_err;
+    }
+
+    char friendly_name[MATHOS_FLEET_FRIENDLY_NAME_LEN];
+
+    int friendly_name_length =
+        snprintf(
+            friendly_name,
+            sizeof(friendly_name),
+            "Gateway %s",
+            gateway_uid_text);
+
+    if (friendly_name_length <= 0 ||
+        (size_t)friendly_name_length >=
+            sizeof(friendly_name))
+    {
+        printf(
+            "[PAIRING COMMIT] Fleet friendly-name "
+            "construction failed\n");
+
+        rc_pairing_clear_sensitive_memory(
+            &loaded_config,
+            sizeof(loaded_config));
+
+        return ESP_FAIL;
+    }
+
+    mathos_fleet_pairing_store_result_t
+        fleet_store_result =
+            MATHOS_FLEET_PAIRING_STORE_NONE;
+
+    uint16_t fleet_slot =
+        0xFFFFU;
+
+    esp_err_t fleet_store_err =
+        mathos_fleet_store_verified_pairing(
+            &rc_pairing_session.challenge.gateway_uid,
+            friendly_name,
+            loaded_config.key_generation,
+            MATHOS_FLEET_SECRET_FORMAT_DEV_RAW_PAIR_KEY,
+            loaded_config.root_key,
+            (uint16_t)sizeof(loaded_config.root_key),
+            &fleet_store_result,
+            &fleet_slot);
+
+    if (fleet_store_err != ESP_OK)
+    {
+        printf(
+            "[PAIRING COMMIT] Fleet Store commit FAILED "
+            "error=%s\n",
+            esp_err_to_name(fleet_store_err));
+
+        rc_pairing_clear_sensitive_memory(
+            &loaded_config,
+            sizeof(loaded_config));
+
+        return fleet_store_err;
+    }
+
+    printf(
+        "[PAIRING COMMIT] Fleet Store verified "
+        "slot=%u result=%u generation=%lu uid=%s\n",
+        (unsigned int)fleet_slot,
+        (unsigned int)fleet_store_result,
+        (unsigned long)loaded_config.key_generation,
+        gateway_uid_text);
+
+    /*
         Install the newly verified root key into the
         operational secure-link engine.
 
@@ -5764,6 +6005,20 @@ rc_pairing_commit_verified_candidate(void)
         0,
         sizeof(rc_pairing_received_package));
 
+    /*
+        Publish SUCCESS only after Gateway authentication,
+        NVS verification, runtime-key installation and
+        sensitive session cleanup have all completed.
+    */
+    /*
+        The authenticated response was received and the
+        candidate was safely committed.
+    */
+    rc_pairing_gateway_proof_timer_clear();
+
+    mathos_maintenance_set_rc_pairing_status(
+        MATHOS_MAINTENANCE_RC_PAIRING_SUCCESS);
+
     printf(
         "[PAIRING] SUCCESS. "
         "RC is paired and may reboot into normal mode.\n");
@@ -5793,6 +6048,47 @@ static void rc_pairing_rx_task(
                 rx_buffer,
                 sizeof(rx_buffer),
                 pdMS_TO_TICKS(100));
+
+        /*
+            Enforce the Gateway-proof deadline on every
+            loop, even when malformed or unrelated UART
+            bytes continue arriving.
+        */
+        if (rc_pairing_gateway_proof_timer_has_expired())
+        {
+            printf(
+                "[PAIRING RX] GATEWAY_PROOF TIMEOUT "
+                "after %lu ms\n",
+                (unsigned long)
+                    RC_PAIRING_GATEWAY_PROOF_TIMEOUT_MS);
+
+            /*
+                The expired nonce, candidate key and proof
+                must never remain available for reuse.
+            */
+            rc_pairing_gateway_proof_timer_clear();
+
+            mathos_pairing_session_reset(
+                &rc_pairing_session);
+
+            rc_pairing_have_package = 0;
+
+            rc_pairing_clear_sensitive_memory(
+                &rc_pairing_received_package,
+                sizeof(rc_pairing_received_package));
+
+            /*
+                Discard any partial transport frame that
+                belonged to the expired attempt.
+            */
+            frame_index = 0;
+            expected_frame_len = 0;
+
+            mathos_maintenance_set_rc_pairing_status(
+                MATHOS_MAINTENANCE_RC_PAIRING_FAILED);
+
+            continue;
+        }
 
         if (len <= 0)
         {
@@ -6080,6 +6376,20 @@ static void rc_pairing_rx_task(
                         mathos_pairing_session_reset(
                             &rc_pairing_session);
 
+                        /*
+                            The new PACKAGE replaces every
+                            previous proof-response deadline.
+                        */
+                        rc_pairing_gateway_proof_timer_clear();
+
+                        /*
+                            A valid new PACKAGE begins a new
+                            pairing attempt. Remove any stale
+                            SUCCESS or FAILED web result.
+                        */
+                        mathos_maintenance_set_rc_pairing_status(
+                            MATHOS_MAINTENANCE_RC_PAIRING_IDLE);
+
                         rc_pairing_received_package =
                             package;
 
@@ -6225,6 +6535,7 @@ static void rc_pairing_rx_task(
                 else if (payload_len !=
                          MATHOS_PAIRING_PROOF_WIRE_LEN)
                 {
+
                     printf(
                         "[PAIRING RX] GATEWAY_PROOF has "
                         "unexpected length=%u\n",
@@ -6280,6 +6591,28 @@ static void rc_pairing_rx_task(
 
                         if (verify_err != ESP_OK)
                         {
+                            /*
+                                Invalid proofs are ignored while
+                                the legitimate session remains active.
+
+                                A session timeout is terminal because
+                                the shared logic has securely reset it.
+                            */
+                            if (verify_err == ESP_ERR_TIMEOUT)
+                            {
+                                rc_pairing_gateway_proof_timer_clear();
+
+                                rc_pairing_have_package = 0;
+
+                                rc_pairing_clear_sensitive_memory(
+                                    &rc_pairing_received_package,
+                                    sizeof(
+                                        rc_pairing_received_package));
+
+                                mathos_maintenance_set_rc_pairing_status(
+                                    MATHOS_MAINTENANCE_RC_PAIRING_FAILED);
+                            }
+
                             printf(
                                 "[PAIRING RX] GATEWAY_PROOF "
                                 "AUTHENTICATION FAILED error=%s\n",
@@ -6305,6 +6638,15 @@ static void rc_pairing_rx_task(
 
                             if (commit_err != ESP_OK)
                             {
+                                /*
+                                    The authenticated exchange
+                                    reached a final commit failure.
+                                */
+                                rc_pairing_gateway_proof_timer_clear();
+
+                                mathos_maintenance_set_rc_pairing_status(
+                                    MATHOS_MAINTENANCE_RC_PAIRING_FAILED);
+
                                 printf(
                                     "[PAIRING RX] pairing COMMIT FAILED "
                                     "error=%s\n",
@@ -8167,6 +8509,27 @@ void app_main(void)
     printf(
         "[IDENTITY] RC hardware UID=%s\n",
         rc_uid_text);
+    /*
+        Read the physical boot-mode controls before loading
+        pairing or Fleet records.
+
+        This ensures maintenance recovery can still be
+        selected when persistent storage has a problem.
+    */
+    boot_mode_switches_init();
+
+    int boot_master_raw =
+        gpio_get_level(
+            MASTER_ENABLE_PIN);
+
+    int boot_maintenance_raw =
+        gpio_get_level(
+            MAINTENANCE_SWITCH_PIN);
+
+    int maintenance_mode_requested =
+        boot_master_raw != 0 &&
+        boot_maintenance_raw == 0;
+
     esp_err_t pairing_load_err =
         mathos_rc_pairing_config_load(
             &rc_runtime_pairing_config,
@@ -8175,19 +8538,38 @@ void app_main(void)
     esp_err_t fleet_err =
         mathos_fleet_init();
 
-    if (fleet_err != ESP_OK)
+    int fleet_store_available =
+        fleet_err == ESP_OK;
+
+    if (!fleet_store_available)
     {
+        if (!maintenance_mode_requested)
+        {
+            printf(
+                "[FLEET] FATAL: Fleet Store initialization failed "
+                "error=%s\n",
+                esp_err_to_name(fleet_err));
+
+            printf(
+                "[FLEET] Normal startup BLOCKED\n");
+
+            return;
+        }
+
         printf(
-            "[FLEET] FATAL: Fleet Store initialization failed "
+            "[FLEET] WARNING: Fleet Store unavailable "
             "error=%s\n",
             esp_err_to_name(fleet_err));
 
-        return;
+        printf(
+            "[FLEET] Entering maintenance recovery mode; "
+            "pairing will remain disabled\n");
     }
-
-    printf(
-        "[FLEET] dedicated Fleet Store initialized\n");
-
+    else
+    {
+        printf(
+            "[FLEET] dedicated Fleet Store initialized\n");
+    }
     if (pairing_load_err != ESP_OK)
     {
         printf(
@@ -8219,8 +8601,7 @@ void app_main(void)
 
         Both switches use active-low pull-up logic.
     */
-    if (!master_switch_enabled() &&
-        maintenance_switch_enabled())
+    if (maintenance_mode_requested)
     {
         printf(
             "[BOOT MODE] MAINTENANCE\n");
@@ -8281,8 +8662,17 @@ the pairing passphrase.
             Pairing actions may become available only after
             the maintenance UART is ready.
         */
-        mathos_maintenance_set_rc_pairing_callback(
-            rc_pairing_prepare_and_send_proof);
+        if (fleet_store_available)
+        {
+            mathos_maintenance_set_rc_pairing_callback(
+                rc_pairing_prepare_and_send_proof);
+        }
+        else
+        {
+            printf(
+                "[MAINTENANCE] Pairing disabled: "
+                "Fleet Store is unavailable\n");
+        }
         BaseType_t pairing_rx_task_result =
             xTaskCreate(
                 rc_pairing_rx_task,
@@ -8390,8 +8780,35 @@ the pairing passphrase.
                 rc_fleet_selected_record.key_generation);
     }
 
-    printf(
-        "[BOOT MODE] NORMAL\n");
+    /*
+    Normal operation requires exactly one ACTIVE
+    Fleet aircraft.
+
+    NO_AIRCRAFT and SELECTION_REQUIRED must both
+    fail closed.
+*/
+    if (rc_fleet_operation_status !=
+        MATHOS_FLEET_OPERATION_READY)
+    {
+        mathos_secure_clear_key();
+
+        rc_fleet_selected_slot =
+            0xFFFFU;
+
+        memset(
+            &rc_fleet_selected_record,
+            0,
+            sizeof(rc_fleet_selected_record));
+
+        printf(
+            "[FLEET BOOT] NORMAL STARTUP BLOCKED: "
+            "operation=%s\n",
+            mathos_fleet_operation_status_to_string(
+                rc_fleet_operation_status));
+
+        return;
+    }
+    printf("[BOOT MODE] NORMAL\n");
 
     printf(
         "[PAIRING] source=%s "
@@ -8415,53 +8832,98 @@ the pairing passphrase.
         (unsigned long)
             rc_runtime_pairing_config
                 .configuration_counter);
+    /*
+        Transitional consistency guard.
 
-    if (!rc_runtime_pairing_loaded_from_nvs ||
-        rc_runtime_pairing_config.key_generation == 0)
+        Until Fleet Store becomes the only authoritative
+        credential source, both persistent records must
+        describe exactly the same pairing generation and key.
+    */
+    int fleet_pairing_consistent =
+        rc_runtime_pairing_loaded_from_nvs &&
+
+        rc_runtime_pairing_config.key_generation != 0U &&
+
+        rc_fleet_selected_slot != 0xFFFFU &&
+
+        rc_fleet_selected_record.state ==
+            MATHOS_FLEET_STATE_ACTIVE &&
+
+        rc_fleet_selected_record.secret_format ==
+            MATHOS_FLEET_SECRET_FORMAT_DEV_RAW_PAIR_KEY &&
+
+        rc_fleet_selected_record.secret_blob_len ==
+            sizeof(rc_runtime_pairing_config.root_key) &&
+
+        rc_fleet_selected_record.key_generation ==
+            rc_runtime_pairing_config.key_generation &&
+
+        rc_pairing_secret_matches(
+            rc_fleet_selected_record.secret_blob,
+            rc_runtime_pairing_config.root_key,
+            sizeof(rc_runtime_pairing_config.root_key));
+
+    if (!fleet_pairing_consistent)
     {
-        /*
-            Explicitly guarantee that an unpaired RC has
-            no operational cryptographic key installed.
-        */
         mathos_secure_clear_key();
 
         printf(
-            "[PAIRING] RC is UNPAIRED. "
-            "Operational security key is not installed.\n");
+            "[PAIRING] NORMAL STARTUP BLOCKED: "
+            "Fleet and RC pairing records disagree\n");
+
+        return;
     }
-    else
+
+    printf(
+        "[PAIRING] Fleet consistency PASSED "
+        "slot=%u generation=%lu\n",
+        (unsigned int)rc_fleet_selected_slot,
+        (unsigned long)
+            rc_fleet_selected_record.key_generation);
+    /*
+        The Fleet-selected aircraft is now the authoritative
+        source of the operational Pair Key.
+
+        The consistency guard above already proved that the
+        transitional RC pairing record matches it.
+    */
+    mathos_secure_status_t secure_key_status =
+        mathos_secure_set_key(
+            rc_fleet_selected_record.secret_blob,
+            (uint32_t)
+                rc_fleet_selected_record.secret_blob_len);
+
+    if (secure_key_status !=
+            MATHOS_SECURE_STATUS_OK ||
+        !mathos_secure_key_is_set())
     {
-        /*
-            Install the validated pairing root key into the
-            operational ChaCha20-Poly1305 security engine.
-        */
-        mathos_secure_status_t secure_key_status =
-            mathos_secure_set_key(
-                rc_runtime_pairing_config.root_key,
-                (uint32_t)sizeof(
-                    rc_runtime_pairing_config.root_key));
-
-        if (secure_key_status !=
-                MATHOS_SECURE_STATUS_OK ||
-            !mathos_secure_key_is_set())
-        {
-            printf(
-                "[PAIRING] FATAL: failed to install "
-                "RC operational security key status=%s\n",
-                mathos_secure_status_to_string(
-                    secure_key_status));
-
-            mathos_secure_clear_key();
-
-            return;
-        }
-
         printf(
-            "[PAIRING] RC operational security key installed "
-            "key_generation=%lu\n",
-            (unsigned long)
-                rc_runtime_pairing_config.key_generation);
+            "[PAIRING] FATAL: failed to install "
+            "Fleet operational security key "
+            "status=%s\n",
+            mathos_secure_status_to_string(
+                secure_key_status));
+
+        mathos_secure_clear_key();
+
+        return;
     }
+
+    /*
+        The legacy record is no longer the active key source.
+        Remove its duplicate plaintext key from runtime RAM.
+    */
+    rc_pairing_clear_sensitive_memory(
+        rc_runtime_pairing_config.root_key,
+        sizeof(rc_runtime_pairing_config.root_key));
+
+    printf(
+        "[PAIRING] Fleet operational security key installed "
+        "slot=%u name=%s generation=%lu\n",
+        (unsigned int)rc_fleet_selected_slot,
+        rc_fleet_selected_record.friendly_name,
+        (unsigned long)
+            rc_fleet_selected_record.key_generation);
 
     joystick_calibration_load_from_nvs();
     joystick_calibration_test_provision_once();

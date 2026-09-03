@@ -7,9 +7,35 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-
-
 static const char *TAG = "MATHOS_FLEET";
+
+/*
+    Compare credential bytes without returning early
+    when a mismatch is found.
+*/
+static int fleet_secret_matches(
+    const uint8_t *left,
+    const uint8_t *right,
+    size_t length)
+{
+    if (left == NULL ||
+        right == NULL)
+    {
+        return 0;
+    }
+
+    uint8_t difference = 0U;
+
+    for (size_t index = 0;
+         index < length;
+         index++)
+    {
+        difference |=
+            left[index] ^ right[index];
+    }
+
+    return difference == 0U;
+}
 
 static esp_err_t fleet_make_slot_key(
     uint16_t slot,
@@ -55,7 +81,6 @@ static void fleet_put_u16_le(
         (uint8_t)((value >> 8) & 0xFFU);
 }
 
-
 static void fleet_put_u32_le(
     uint8_t *buffer,
     size_t *index,
@@ -74,7 +99,6 @@ static void fleet_put_u32_le(
         (uint8_t)((value >> 24) & 0xFFU);
 }
 
-
 static uint16_t fleet_get_u16_le(
     const uint8_t *buffer,
     size_t *index)
@@ -87,7 +111,6 @@ static uint16_t fleet_get_u16_le(
 
     return value;
 }
-
 
 static uint32_t fleet_get_u32_le(
     const uint8_t *buffer,
@@ -103,7 +126,6 @@ static uint32_t fleet_get_u32_le(
 
     return value;
 }
-
 
 static uint32_t fleet_crc32_bytes(
     const uint8_t *data,
@@ -143,7 +165,6 @@ static uint32_t fleet_crc32_bytes(
     return ~crc;
 }
 
-
 void mathos_fleet_record_set_defaults(
     mathos_fleet_record_t *record)
 {
@@ -163,8 +184,8 @@ void mathos_fleet_record_set_defaults(
     record->version =
         MATHOS_FLEET_RECORD_VERSION;
 
-record->record_size =
-    MATHOS_FLEET_RECORD_WIRE_LEN;
+    record->record_size =
+        MATHOS_FLEET_RECORD_WIRE_LEN;
 
     record->state =
         MATHOS_FLEET_STATE_EMPTY;
@@ -172,7 +193,6 @@ record->record_size =
     record->secret_format =
         MATHOS_FLEET_SECRET_FORMAT_NONE;
 }
-
 
 uint32_t mathos_fleet_record_calculate_crc32(
     const mathos_fleet_record_t *record)
@@ -186,8 +206,7 @@ uint32_t mathos_fleet_record_calculate_crc32(
         Canonical Fleet Record excluding the final
         4-byte CRC field.
     */
-    uint8_t buffer[
-        MATHOS_FLEET_RECORD_WIRE_LEN - 4U];
+    uint8_t buffer[MATHOS_FLEET_RECORD_WIRE_LEN - 4U];
 
     memset(
         buffer,
@@ -280,7 +299,6 @@ uint32_t mathos_fleet_record_calculate_crc32(
         sizeof(buffer));
 }
 
-
 int mathos_fleet_record_is_valid(
     const mathos_fleet_record_t *record)
 {
@@ -301,11 +319,11 @@ int mathos_fleet_record_is_valid(
         return 0;
     }
 
-if (record->record_size !=
-    MATHOS_FLEET_RECORD_WIRE_LEN)
-{
-    return 0;
-}
+    if (record->record_size !=
+        MATHOS_FLEET_RECORD_WIRE_LEN)
+    {
+        return 0;
+    }
 
     if (record->state !=
             MATHOS_FLEET_STATE_ACTIVE &&
@@ -360,38 +378,36 @@ if (record->record_size !=
         return 0;
     }
 
-/*
-    Development raw Pair Key must always be
-    exactly 32 bytes.
-*/
-if (record->secret_format ==
-        MATHOS_FLEET_SECRET_FORMAT_DEV_RAW_PAIR_KEY &&
-    record->secret_blob_len !=
-        MATHOS_FLEET_PAIR_KEY_LEN)
-{
-    return 0;
-}
+    /*
+        Development raw Pair Key must always be
+        exactly 32 bytes.
+    */
+    if (record->secret_format ==
+            MATHOS_FLEET_SECRET_FORMAT_DEV_RAW_PAIR_KEY &&
+        record->secret_blob_len !=
+            MATHOS_FLEET_PAIR_KEY_LEN)
+    {
+        return 0;
+    }
 
+    /*
+        Only known secret formats are accepted.
+    */
+    if (record->secret_format !=
+            MATHOS_FLEET_SECRET_FORMAT_DEV_RAW_PAIR_KEY &&
+        record->secret_format !=
+            MATHOS_FLEET_SECRET_FORMAT_WRAPPED_PAIR_KEY_V1)
+    {
+        return 0;
+    }
 
-/*
-    Only known secret formats are accepted.
-*/
-if (record->secret_format !=
-        MATHOS_FLEET_SECRET_FORMAT_DEV_RAW_PAIR_KEY &&
-    record->secret_format !=
-        MATHOS_FLEET_SECRET_FORMAT_WRAPPED_PAIR_KEY_V1)
-{
-    return 0;
-}
-
-
-/*
-    Version 1 requires reserved fields to remain zero.
-*/
-if (record->reserved0 != 0)
-{
-    return 0;
-}
+    /*
+        Version 1 requires reserved fields to remain zero.
+    */
+    if (record->reserved0 != 0)
+    {
+        return 0;
+    }
 
     uint32_t expected_crc =
         mathos_fleet_record_calculate_crc32(
@@ -518,7 +534,6 @@ esp_err_t mathos_fleet_record_encode(
 
     return ESP_OK;
 }
-
 
 esp_err_t mathos_fleet_record_decode(
     const uint8_t *input,
@@ -651,16 +666,14 @@ esp_err_t mathos_fleet_record_self_test(void)
     /*
         Synthetic test Gateway UID.
     */
-    const uint8_t test_uid[
-        MATHOS_DEVICE_UID_LEN] =
-    {
-        0x10,
-        0x20,
-        0x30,
-        0x40,
-        0x50,
-        0x60
-    };
+    const uint8_t test_uid[MATHOS_DEVICE_UID_LEN] =
+        {
+            0x10,
+            0x20,
+            0x30,
+            0x40,
+            0x50,
+            0x60};
 
     memcpy(
         source.gateway_uid.bytes,
@@ -710,8 +723,7 @@ esp_err_t mathos_fleet_record_self_test(void)
         return ESP_FAIL;
     }
 
-    uint8_t encoded[
-        MATHOS_FLEET_RECORD_WIRE_LEN];
+    uint8_t encoded[MATHOS_FLEET_RECORD_WIRE_LEN];
 
     memset(
         encoded,
@@ -764,8 +776,7 @@ esp_err_t mathos_fleet_record_self_test(void)
         canonical representation, rather than comparing
         raw C structures.
     */
-    uint8_t reencoded[
-        MATHOS_FLEET_RECORD_WIRE_LEN];
+    uint8_t reencoded[MATHOS_FLEET_RECORD_WIRE_LEN];
 
     memset(
         reencoded,
@@ -895,8 +906,7 @@ esp_err_t mathos_fleet_record_save_slot(
         return ESP_ERR_INVALID_STATE;
     }
 
-    uint8_t encoded[
-        MATHOS_FLEET_RECORD_WIRE_LEN];
+    uint8_t encoded[MATHOS_FLEET_RECORD_WIRE_LEN];
 
     memset(
         encoded,
@@ -953,8 +963,7 @@ esp_err_t mathos_fleet_record_save_slot(
     /*
         Read committed bytes back before trusting them.
     */
-    uint8_t verified[
-        MATHOS_FLEET_RECORD_WIRE_LEN];
+    uint8_t verified[MATHOS_FLEET_RECORD_WIRE_LEN];
 
     memset(
         verified,
@@ -1119,8 +1128,7 @@ esp_err_t mathos_fleet_record_load_slot(
         return ESP_ERR_INVALID_SIZE;
     }
 
-    uint8_t encoded[
-        MATHOS_FLEET_RECORD_WIRE_LEN];
+    uint8_t encoded[MATHOS_FLEET_RECORD_WIRE_LEN];
 
     memset(
         encoded,
@@ -1324,13 +1332,11 @@ esp_err_t mathos_fleet_find_by_uid(
 esp_err_t mathos_fleet_duplicate_uid_lookup_self_test(void)
 {
     mathos_device_uid_t test_uid =
-    {
-        .bytes =
         {
-            0xE1, 0xE2, 0xE3,
-            0xE4, 0xE5, 0xE6
-        }
-    };
+            .bytes =
+                {
+                    0xE1, 0xE2, 0xE3,
+                    0xE4, 0xE5, 0xE6}};
 
     /*
         Make sure the synthetic UID does not already exist.
@@ -1367,8 +1373,7 @@ esp_err_t mathos_fleet_duplicate_uid_lookup_self_test(void)
         return err;
     }
 
-    uint8_t test_key[
-        MATHOS_FLEET_PAIR_KEY_LEN];
+    uint8_t test_key[MATHOS_FLEET_PAIR_KEY_LEN];
 
     for (size_t i = 0;
          i < sizeof(test_key);
@@ -1712,7 +1717,6 @@ esp_err_t mathos_fleet_find_free_slot(
     return ESP_ERR_NO_MEM;
 }
 
-
 esp_err_t mathos_fleet_get_counts(
     mathos_fleet_counts_t *counts)
 {
@@ -1810,9 +1814,8 @@ esp_err_t mathos_fleet_get_counts(
         Internal consistency check.
     */
     if (counts->total !=
-            (uint16_t)(
-                counts->active +
-                counts->revoked))
+        (uint16_t)(counts->active +
+                   counts->revoked))
     {
         memset(
             counts,
@@ -1822,9 +1825,8 @@ esp_err_t mathos_fleet_get_counts(
         return ESP_FAIL;
     }
 
-    if ((uint16_t)(
-            counts->total +
-            counts->free_slots) !=
+    if ((uint16_t)(counts->total +
+                   counts->free_slots) !=
         MATHOS_FLEET_MAX_AIRCRAFT)
     {
         memset(
@@ -2067,7 +2069,6 @@ esp_err_t mathos_fleet_get_operation_status(
     }
 }
 
-
 esp_err_t mathos_fleet_boot_validate(
     mathos_fleet_operation_status_t *status_out,
     uint16_t *slot_out,
@@ -2166,7 +2167,7 @@ esp_err_t mathos_fleet_boot_validate(
             *status_out));
 
     if (*status_out ==
-            MATHOS_FLEET_OPERATION_READY)
+        MATHOS_FLEET_OPERATION_READY)
     {
         ESP_LOGI(
             TAG,
@@ -2180,7 +2181,6 @@ esp_err_t mathos_fleet_boot_validate(
 
     return ESP_OK;
 }
-
 
 const char *mathos_fleet_operation_status_to_string(
     mathos_fleet_operation_status_t status)
@@ -2249,8 +2249,7 @@ esp_err_t mathos_fleet_operation_status_self_test(void)
         return ESP_FAIL;
     }
 
-    uint8_t test_key[
-        MATHOS_FLEET_PAIR_KEY_LEN];
+    uint8_t test_key[MATHOS_FLEET_PAIR_KEY_LEN];
 
     for (size_t i = 0;
          i < sizeof(test_key);
@@ -2261,22 +2260,18 @@ esp_err_t mathos_fleet_operation_status_self_test(void)
     }
 
     mathos_device_uid_t uid_one =
-    {
-        .bytes =
         {
-            0xB1, 0xB2, 0xB3,
-            0xB4, 0xB5, 0xB6
-        }
-    };
+            .bytes =
+                {
+                    0xB1, 0xB2, 0xB3,
+                    0xB4, 0xB5, 0xB6}};
 
     mathos_device_uid_t uid_two =
-    {
-        .bytes =
         {
-            0xC1, 0xC2, 0xC3,
-            0xC4, 0xC5, 0xC6
-        }
-    };
+            .bytes =
+                {
+                    0xC1, 0xC2, 0xC3,
+                    0xC4, 0xC5, 0xC6}};
 
     uint16_t slot_one =
         0xFFFFU;
@@ -2633,13 +2628,11 @@ esp_err_t mathos_fleet_validate_store_self_test(void)
         duplicate-record injection.
     */
     mathos_device_uid_t test_uid =
-    {
-        .bytes =
         {
-            0xD1, 0xD2, 0xD3,
-            0xD4, 0xD5, 0xD6
-        }
-    };
+            .bytes =
+                {
+                    0xD1, 0xD2, 0xD3,
+                    0xD4, 0xD5, 0xD6}};
 
     /*
         Make sure the synthetic UID is not already
@@ -2694,8 +2687,7 @@ esp_err_t mathos_fleet_validate_store_self_test(void)
     /*
         Construct first valid record directly.
     */
-    uint8_t test_key[
-        MATHOS_FLEET_PAIR_KEY_LEN];
+    uint8_t test_key[MATHOS_FLEET_PAIR_KEY_LEN];
 
     for (size_t i = 0;
          i < sizeof(test_key);
@@ -2965,8 +2957,7 @@ esp_err_t mathos_fleet_active_status_self_test(void)
     /*
         Synthetic Pair Key.
     */
-    uint8_t test_key[
-        MATHOS_FLEET_PAIR_KEY_LEN];
+    uint8_t test_key[MATHOS_FLEET_PAIR_KEY_LEN];
 
     for (size_t i = 0;
          i < sizeof(test_key);
@@ -2977,22 +2968,18 @@ esp_err_t mathos_fleet_active_status_self_test(void)
     }
 
     mathos_device_uid_t uid_one =
-    {
-        .bytes =
         {
-            0x81, 0x82, 0x83,
-            0x84, 0x85, 0x86
-        }
-    };
+            .bytes =
+                {
+                    0x81, 0x82, 0x83,
+                    0x84, 0x85, 0x86}};
 
     mathos_device_uid_t uid_two =
-    {
-        .bytes =
         {
-            0x91, 0x92, 0x93,
-            0x94, 0x95, 0x96
-        }
-    };
+            .bytes =
+                {
+                    0x91, 0x92, 0x93,
+                    0x94, 0x95, 0x96}};
 
     uint16_t slot_one =
         0xFFFFU;
@@ -3236,17 +3223,15 @@ esp_err_t mathos_fleet_add_aircraft_self_test(void)
         Synthetic Gateway UID used only by this test.
     */
     mathos_device_uid_t test_uid =
-    {
-        .bytes =
         {
-            0x41,
-            0x42,
-            0x43,
-            0x44,
-            0x45,
-            0x46
-        }
-    };
+            .bytes =
+                {
+                    0x41,
+                    0x42,
+                    0x43,
+                    0x44,
+                    0x45,
+                    0x46}};
 
     /*
         Make sure this synthetic UID is not already
@@ -3292,8 +3277,7 @@ esp_err_t mathos_fleet_add_aircraft_self_test(void)
     /*
         Synthetic development Pair Key.
     */
-    uint8_t test_pair_key[
-        MATHOS_FLEET_PAIR_KEY_LEN];
+    uint8_t test_pair_key[MATHOS_FLEET_PAIR_KEY_LEN];
 
     for (size_t i = 0;
          i < sizeof(test_pair_key);
@@ -3491,6 +3475,318 @@ esp_err_t mathos_fleet_add_aircraft_self_test(void)
 
     return ESP_OK;
 }
+
+esp_err_t mathos_fleet_store_verified_pairing(
+    const mathos_device_uid_t *gateway_uid,
+    const char *friendly_name,
+    uint32_t key_generation,
+    mathos_fleet_secret_format_t secret_format,
+    const uint8_t *secret_blob,
+    uint16_t secret_blob_len,
+    mathos_fleet_pairing_store_result_t *result_out,
+    uint16_t *slot_out)
+{
+    if (gateway_uid == NULL ||
+        friendly_name == NULL ||
+        secret_blob == NULL ||
+        result_out == NULL ||
+        slot_out == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *result_out =
+        MATHOS_FLEET_PAIRING_STORE_NONE;
+
+    *slot_out =
+        0xFFFFU;
+
+    if (!mathos_device_uid_is_valid(
+            gateway_uid))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t name_len =
+        strnlen(
+            friendly_name,
+            MATHOS_FLEET_FRIENDLY_NAME_LEN);
+
+    if (name_len == 0U ||
+        name_len >= MATHOS_FLEET_FRIENDLY_NAME_LEN ||
+        key_generation == 0U ||
+        secret_blob_len == 0U ||
+        secret_blob_len >
+            MATHOS_FLEET_SECRET_BLOB_MAX_LEN)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (secret_format ==
+            MATHOS_FLEET_SECRET_FORMAT_DEV_RAW_PAIR_KEY &&
+        secret_blob_len !=
+            MATHOS_FLEET_PAIR_KEY_LEN)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (secret_format !=
+            MATHOS_FLEET_SECRET_FORMAT_DEV_RAW_PAIR_KEY &&
+        secret_format !=
+            MATHOS_FLEET_SECRET_FORMAT_WRAPPED_PAIR_KEY_V1)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint16_t existing_slot =
+        0xFFFFU;
+
+    mathos_fleet_record_t existing_record;
+
+    memset(
+        &existing_record,
+        0,
+        sizeof(existing_record));
+
+    esp_err_t err =
+        mathos_fleet_find_by_uid(
+            gateway_uid,
+            &existing_slot,
+            &existing_record);
+
+    /*
+        Unknown UID: create a new ACTIVE aircraft.
+    */
+    if (err == ESP_ERR_NOT_FOUND)
+    {
+        err =
+            mathos_fleet_add_aircraft(
+                gateway_uid,
+                friendly_name,
+                key_generation,
+                secret_format,
+                secret_blob,
+                secret_blob_len,
+                slot_out);
+
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+
+        *result_out =
+            MATHOS_FLEET_PAIRING_STORE_ENROLLED;
+
+        return ESP_OK;
+    }
+
+    /*
+        Corruption or storage errors must propagate.
+    */
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    /*
+        Pairing must never silently restore an aircraft
+        that the owner explicitly revoked.
+    */
+    if (existing_record.state ==
+        MATHOS_FLEET_STATE_REVOKED)
+    {
+        ESP_LOGW(
+            TAG,
+            "Fleet pairing commit rejected: "
+            "Gateway UID is revoked slot=%u",
+            (unsigned int)existing_slot);
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (existing_record.state !=
+        MATHOS_FLEET_STATE_ACTIVE)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+        Never replace a newer stored relationship with
+        an older pairing generation.
+    */
+    if (key_generation <
+        existing_record.key_generation)
+    {
+        ESP_LOGW(
+            TAG,
+            "Fleet pairing rollback rejected "
+            "slot=%u stored=%lu received=%lu",
+            (unsigned int)existing_slot,
+            (unsigned long)
+                existing_record.key_generation,
+            (unsigned long)
+                key_generation);
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+        Same generation is accepted only when the stored
+        credential matches exactly. This makes retries
+        idempotent without permitting key replacement.
+    */
+    if (key_generation ==
+        existing_record.key_generation)
+    {
+        int same_credential =
+            existing_record.secret_format ==
+                (uint8_t)secret_format &&
+
+            existing_record.secret_blob_len ==
+                secret_blob_len &&
+
+            fleet_secret_matches(
+                existing_record.secret_blob,
+                secret_blob,
+                secret_blob_len);
+
+        if (!same_credential)
+        {
+            ESP_LOGW(
+                TAG,
+                "Fleet pairing conflict rejected "
+                "slot=%u generation=%lu",
+                (unsigned int)existing_slot,
+                (unsigned long)key_generation);
+
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        *slot_out =
+            existing_slot;
+
+        *result_out =
+            MATHOS_FLEET_PAIRING_STORE_UNCHANGED;
+
+        ESP_LOGI(
+            TAG,
+            "Fleet pairing already current "
+            "slot=%u generation=%lu",
+            (unsigned int)existing_slot,
+            (unsigned long)key_generation);
+
+        return ESP_OK;
+    }
+
+    /*
+        A higher authenticated generation rotates the
+        credential in the existing Fleet slot.
+
+        Preserve the owner's friendly name and state.
+    */
+    uint32_t previous_generation =
+        existing_record.key_generation;
+
+    existing_record.key_generation =
+        key_generation;
+
+    existing_record.secret_format =
+        (uint8_t)secret_format;
+
+    memset(
+        existing_record.secret_blob,
+        0,
+        sizeof(existing_record.secret_blob));
+
+    memcpy(
+        existing_record.secret_blob,
+        secret_blob,
+        secret_blob_len);
+
+    existing_record.secret_blob_len =
+        secret_blob_len;
+
+    err =
+        mathos_fleet_record_save_slot(
+            existing_slot,
+            &existing_record);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Fleet pairing rotation failed "
+            "slot=%u error=%s",
+            (unsigned int)existing_slot,
+            esp_err_to_name(err));
+
+        return err;
+    }
+
+    /*
+        Verify the authoritative UID lookup after writing.
+    */
+    uint16_t verified_slot =
+        0xFFFFU;
+
+    mathos_fleet_record_t verified_record;
+
+    memset(
+        &verified_record,
+        0,
+        sizeof(verified_record));
+
+    err =
+        mathos_fleet_find_by_uid(
+            gateway_uid,
+            &verified_slot,
+            &verified_record);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    if (verified_slot != existing_slot ||
+        verified_record.state !=
+            MATHOS_FLEET_STATE_ACTIVE ||
+        verified_record.key_generation !=
+            key_generation ||
+        verified_record.secret_format !=
+            (uint8_t)secret_format ||
+        verified_record.secret_blob_len !=
+            secret_blob_len ||
+        !fleet_secret_matches(
+            verified_record.secret_blob,
+            secret_blob,
+            secret_blob_len))
+    {
+        ESP_LOGE(
+            TAG,
+            "Fleet pairing rotation verification failed "
+            "slot=%u",
+            (unsigned int)existing_slot);
+
+        return ESP_FAIL;
+    }
+
+    *slot_out =
+        existing_slot;
+
+    *result_out =
+        MATHOS_FLEET_PAIRING_STORE_ROTATED;
+
+    ESP_LOGI(
+        TAG,
+        "Fleet pairing credential rotated "
+        "slot=%u generation=%lu->%lu",
+        (unsigned int)existing_slot,
+        (unsigned long)previous_generation,
+        (unsigned long)key_generation);
+
+    return ESP_OK;
+}
+
 esp_err_t mathos_fleet_get_authorization(
     const mathos_device_uid_t *gateway_uid,
     mathos_fleet_auth_status_t *status_out,
@@ -3602,13 +3898,11 @@ const char *mathos_fleet_auth_status_to_string(
 esp_err_t mathos_fleet_authorization_self_test(void)
 {
     mathos_device_uid_t test_uid =
-    {
-        .bytes =
         {
-            0xA1, 0xA2, 0xA3,
-            0xA4, 0xA5, 0xA6
-        }
-    };
+            .bytes =
+                {
+                    0xA1, 0xA2, 0xA3,
+                    0xA4, 0xA5, 0xA6}};
 
     mathos_fleet_auth_status_t status =
         MATHOS_FLEET_AUTH_UNKNOWN;
@@ -3658,8 +3952,7 @@ esp_err_t mathos_fleet_authorization_self_test(void)
         return ESP_FAIL;
     }
 
-    uint8_t test_key[
-        MATHOS_FLEET_PAIR_KEY_LEN];
+    uint8_t test_key[MATHOS_FLEET_PAIR_KEY_LEN];
 
     for (size_t i = 0;
          i < sizeof(test_key);
@@ -3791,22 +4084,18 @@ esp_err_t mathos_fleet_counts_self_test(void)
         enrolled.
     */
     mathos_device_uid_t uid_active =
-    {
-        .bytes =
         {
-            0x61, 0x62, 0x63,
-            0x64, 0x65, 0x66
-        }
-    };
+            .bytes =
+                {
+                    0x61, 0x62, 0x63,
+                    0x64, 0x65, 0x66}};
 
     mathos_device_uid_t uid_revoked =
-    {
-        .bytes =
         {
-            0x71, 0x72, 0x73,
-            0x74, 0x75, 0x76
-        }
-    };
+            .bytes =
+                {
+                    0x71, 0x72, 0x73,
+                    0x74, 0x75, 0x76}};
 
     mathos_fleet_counts_t before;
 
@@ -3819,8 +4108,7 @@ esp_err_t mathos_fleet_counts_self_test(void)
         return err;
     }
 
-    uint8_t test_key[
-        MATHOS_FLEET_PAIR_KEY_LEN];
+    uint8_t test_key[MATHOS_FLEET_PAIR_KEY_LEN];
 
     for (size_t i = 0;
          i < sizeof(test_key);
@@ -4203,7 +4491,6 @@ esp_err_t mathos_fleet_add_aircraft(
     return ESP_OK;
 }
 
-
 esp_err_t mathos_fleet_revoke_aircraft(
     const mathos_device_uid_t *gateway_uid)
 {
@@ -4349,17 +4636,15 @@ esp_err_t mathos_fleet_revoke_restore_self_test(void)
         Synthetic Gateway used only by this test.
     */
     mathos_device_uid_t test_uid =
-    {
-        .bytes =
         {
-            0x51,
-            0x52,
-            0x53,
-            0x54,
-            0x55,
-            0x56
-        }
-    };
+            .bytes =
+                {
+                    0x51,
+                    0x52,
+                    0x53,
+                    0x54,
+                    0x55,
+                    0x56}};
 
     /*
         Ensure this test UID is not already enrolled.
@@ -4398,8 +4683,7 @@ esp_err_t mathos_fleet_revoke_restore_self_test(void)
     /*
         Synthetic development Pair Key.
     */
-    uint8_t test_pair_key[
-        MATHOS_FLEET_PAIR_KEY_LEN];
+    uint8_t test_pair_key[MATHOS_FLEET_PAIR_KEY_LEN];
 
     for (size_t i = 0;
          i < sizeof(test_pair_key);
@@ -4751,16 +5035,14 @@ esp_err_t mathos_fleet_uid_lookup_self_test(void)
     mathos_fleet_record_set_defaults(
         &source);
 
-    const uint8_t known_uid[
-        MATHOS_DEVICE_UID_LEN] =
-    {
-        0x21,
-        0x22,
-        0x23,
-        0x24,
-        0x25,
-        0x26
-    };
+    const uint8_t known_uid[MATHOS_DEVICE_UID_LEN] =
+        {
+            0x21,
+            0x22,
+            0x23,
+            0x24,
+            0x25,
+            0x26};
 
     memcpy(
         source.gateway_uid.bytes,
@@ -4862,11 +5144,9 @@ esp_err_t mathos_fleet_uid_lookup_self_test(void)
     /*
         Verify returned record matches what was stored.
     */
-    uint8_t source_wire[
-        MATHOS_FLEET_RECORD_WIRE_LEN];
+    uint8_t source_wire[MATHOS_FLEET_RECORD_WIRE_LEN];
 
-    uint8_t found_wire[
-        MATHOS_FLEET_RECORD_WIRE_LEN];
+    uint8_t found_wire[MATHOS_FLEET_RECORD_WIRE_LEN];
 
     err =
         mathos_fleet_record_encode(
@@ -4916,17 +5196,15 @@ esp_err_t mathos_fleet_uid_lookup_self_test(void)
         Now search for a UID that is NOT enrolled.
     */
     mathos_device_uid_t unknown_uid =
-    {
-        .bytes =
         {
-            0x31,
-            0x32,
-            0x33,
-            0x34,
-            0x35,
-            0x36
-        }
-    };
+            .bytes =
+                {
+                    0x31,
+                    0x32,
+                    0x33,
+                    0x34,
+                    0x35,
+                    0x36}};
 
     memset(
         &found,
@@ -4979,7 +5257,6 @@ esp_err_t mathos_fleet_uid_lookup_self_test(void)
 
     return ESP_OK;
 }
-
 
 esp_err_t mathos_fleet_record_delete_slot(
     uint16_t slot)
@@ -5087,16 +5364,14 @@ esp_err_t mathos_fleet_persistence_self_test(void)
     mathos_fleet_record_set_defaults(
         &source);
 
-    const uint8_t uid[
-        MATHOS_DEVICE_UID_LEN] =
-    {
-        0x91,
-        0x92,
-        0x93,
-        0x94,
-        0x95,
-        0x96
-    };
+    const uint8_t uid[MATHOS_DEVICE_UID_LEN] =
+        {
+            0x91,
+            0x92,
+            0x93,
+            0x94,
+            0x95,
+            0x96};
 
     memcpy(
         source.gateway_uid.bytes,
@@ -5173,11 +5448,9 @@ esp_err_t mathos_fleet_persistence_self_test(void)
     /*
         Compare canonical bytes, never raw C structs.
     */
-    uint8_t source_wire[
-        MATHOS_FLEET_RECORD_WIRE_LEN];
+    uint8_t source_wire[MATHOS_FLEET_RECORD_WIRE_LEN];
 
-    uint8_t loaded_wire[
-        MATHOS_FLEET_RECORD_WIRE_LEN];
+    uint8_t loaded_wire[MATHOS_FLEET_RECORD_WIRE_LEN];
 
     err =
         mathos_fleet_record_encode(
@@ -5290,30 +5563,23 @@ esp_err_t mathos_fleet_init(void)
         nvs_flash_init_partition(
             MATHOS_FLEET_PARTITION_NAME);
 
+    /*
+        Never erase the Fleet partition automatically.
+
+        It contains aircraft identities, Pair Keys and
+        revocation state. Recovery must require an explicit
+        physical maintenance action.
+    */
     if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
         err == ESP_ERR_NVS_NEW_VERSION_FOUND)
     {
-        ESP_LOGW(
+        ESP_LOGE(
             TAG,
-            "Fleet partition requires erase/reinitialization");
+            "Fleet partition requires explicit recovery "
+            "error=%s. Automatic erase is forbidden.",
+            esp_err_to_name(err));
 
-        err =
-            nvs_flash_erase_partition(
-                MATHOS_FLEET_PARTITION_NAME);
-
-        if (err != ESP_OK)
-        {
-            ESP_LOGE(
-                TAG,
-                "Fleet partition erase failed: %s",
-                esp_err_to_name(err));
-
-            return err;
-        }
-
-        err =
-            nvs_flash_init_partition(
-                MATHOS_FLEET_PARTITION_NAME);
+        return err;
     }
 
     if (err != ESP_OK)
@@ -5350,18 +5616,18 @@ esp_err_t mathos_fleet_init(void)
     }
 
     nvs_close(handle);
-err =
-    mathos_fleet_record_self_test();
+    err =
+        mathos_fleet_record_self_test();
 
-if (err != ESP_OK)
-{
-    ESP_LOGE(
-        TAG,
-        "Fleet record format self-test FAILED: %s",
-        esp_err_to_name(err));
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Fleet record format self-test FAILED: %s",
+            esp_err_to_name(err));
 
-    return err;
-}
+        return err;
+    }
     ESP_LOGI(
         TAG,
         "Fleet Store ready partition=%s namespace=%s",

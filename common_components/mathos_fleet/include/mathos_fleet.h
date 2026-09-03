@@ -326,6 +326,41 @@ esp_err_t mathos_fleet_get_counts(
 */
 esp_err_t mathos_fleet_add_aircraft_self_test(void);
 
+
+/*
+    Result of committing an already authenticated
+    pairing relationship into the Fleet Store.
+*/
+typedef enum
+{
+    MATHOS_FLEET_PAIRING_STORE_NONE = 0,
+    MATHOS_FLEET_PAIRING_STORE_ENROLLED,
+    MATHOS_FLEET_PAIRING_STORE_UNCHANGED,
+    MATHOS_FLEET_PAIRING_STORE_ROTATED
+
+} mathos_fleet_pairing_store_result_t;
+
+
+/*
+    Persist a pairing only after the caller has completed
+    mutual pairing-proof verification.
+
+    Security policy:
+        unknown UID       -> enroll
+        same generation   -> key must match exactly
+        higher generation -> rotate stored key
+        lower generation  -> reject rollback
+        revoked UID       -> reject
+*/
+esp_err_t mathos_fleet_store_verified_pairing(
+    const mathos_device_uid_t *gateway_uid,
+    const char *friendly_name,
+    uint32_t key_generation,
+    mathos_fleet_secret_format_t secret_format,
+    const uint8_t *secret_blob,
+    uint16_t secret_blob_len,
+    mathos_fleet_pairing_store_result_t *result_out,
+    uint16_t *slot_out);
 /*
     Initialize one blank Fleet record.
 */

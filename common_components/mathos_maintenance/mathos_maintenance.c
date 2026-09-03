@@ -18,6 +18,8 @@
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_task_wdt.h"
+#include "freertos/FreeRTOS.h"
+
 #define MATHOS_MAINTENANCE_RC_SSID "MATHOS-RC-SETUP"
 #define MATHOS_MAINTENANCE_GATEWAY_SSID "MATHOS-GW-SETUP"
 
@@ -62,6 +64,19 @@ static httpd_handle_t maintenance_http_server = NULL;
 static esp_netif_t *maintenance_ap_netif = NULL;
 static mathos_maintenance_rc_pairing_callback_t
     maintenance_rc_pairing_callback = NULL;
+/*
+    Protect the display-only pairing status because it
+    is written by both HTTP and pairing transport tasks.
+*/
+static portMUX_TYPE
+    maintenance_rc_pairing_status_lock =
+        portMUX_INITIALIZER_UNLOCKED;
+
+static mathos_maintenance_rc_pairing_status_t
+    maintenance_rc_pairing_status =
+        MATHOS_MAINTENANCE_RC_PAIRING_IDLE;
+static mathos_maintenance_rc_pairing_status_t
+maintenance_get_rc_pairing_status(void);
 
 static mathos_maintenance_role_t maintenance_active_role =
     MATHOS_MAINTENANCE_ROLE_RC;
@@ -92,6 +107,10 @@ static esp_err_t maintenance_send_text_response(
     httpd_req_t *request,
     const char *status,
     const char *text);
+
+static esp_err_t
+maintenance_send_rc_pairing_progress_page(
+    httpd_req_t *request);
 
 static void maintenance_clear_sensitive_memory(
     void *buffer,
@@ -292,6 +311,15 @@ static esp_err_t maintenance_rc_pairing_post_handler(
 
         It must not retain this passphrase pointer.
     */
+    /*
+        Publish IN_PROGRESS before invoking the transport.
+
+        The Gateway response may arrive on another task
+        immediately after RC_PROOF is transmitted.
+    */
+    mathos_maintenance_set_rc_pairing_status(
+        MATHOS_MAINTENANCE_RC_PAIRING_IN_PROGRESS);
+
     esp_err_t pairing_err =
         maintenance_rc_pairing_callback(
             pairing_passphrase);
@@ -306,6 +334,9 @@ static esp_err_t maintenance_rc_pairing_post_handler(
 
     if (pairing_err != ESP_OK)
     {
+        mathos_maintenance_set_rc_pairing_status(
+            MATHOS_MAINTENANCE_RC_PAIRING_FAILED);
+
         ESP_LOGW(
             TAG,
             "RC pairing proof request failed: %s",
@@ -324,10 +355,8 @@ static esp_err_t maintenance_rc_pairing_post_handler(
         TAG,
         "RC pairing proof submitted to pairing transport");
 
-    return maintenance_send_text_response(
-        request,
-        "200 OK",
-        "RC_PROOF sent. Waiting for Gateway authentication.\n");
+    return maintenance_send_rc_pairing_progress_page(
+        request);
 
 invalid_form:
 
@@ -397,6 +426,282 @@ invalid_request:
         request,
         "400 Bad Request",
         "Could not read RC pairing form.\n");
+}
+
+static esp_err_t
+maintenance_rc_pairing_status_get_handler(
+    httpd_req_t *request)
+{
+    if (request == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        This status exists only on the RC maintenance
+        interface.
+    */
+    if (maintenance_active_role !=
+        MATHOS_MAINTENANCE_ROLE_RC)
+    {
+        return maintenance_send_text_response(
+            request,
+            "403 Forbidden",
+            "RC pairing status is unavailable "
+            "on this device.\n");
+    }
+
+    const char *response = NULL;
+
+    switch (maintenance_get_rc_pairing_status())
+    {
+    case MATHOS_MAINTENANCE_RC_PAIRING_IDLE:
+        response =
+            "{\"status\":\"idle\"}\n";
+        break;
+
+    case MATHOS_MAINTENANCE_RC_PAIRING_IN_PROGRESS:
+        response =
+            "{\"status\":\"in_progress\"}\n";
+        break;
+
+    case MATHOS_MAINTENANCE_RC_PAIRING_SUCCESS:
+        response =
+            "{\"status\":\"success\"}\n";
+        break;
+
+    case MATHOS_MAINTENANCE_RC_PAIRING_FAILED:
+    default:
+        response =
+            "{\"status\":\"failed\"}\n";
+        break;
+    }
+
+    esp_err_t err =
+        httpd_resp_set_status(
+            request,
+            "200 OK");
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err =
+        httpd_resp_set_type(
+            request,
+            "application/json; charset=utf-8");
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    /*
+        Pairing status is live RAM state and must never
+        be served from a browser or intermediary cache.
+    */
+    err =
+        httpd_resp_set_hdr(
+            request,
+            "Cache-Control",
+            "no-store");
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    return httpd_resp_send(
+        request,
+        response,
+        HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t
+maintenance_send_rc_pairing_progress_page(
+    httpd_req_t *request)
+{
+    if (request == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    static const char page[] =
+        "<!doctype html>"
+        "<html lang=\"en\">"
+        "<head>"
+        "<meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" "
+        "content=\"width=device-width,initial-scale=1\">"
+        "<title>MATHOS Pairing</title>"
+
+        "<style>"
+        "body{margin:0;background:#0f172a;color:#e2e8f0;"
+        "font-family:Arial,sans-serif;display:flex;"
+        "min-height:100vh;align-items:center;"
+        "justify-content:center;}"
+
+        ".card{width:min(88%,480px);background:#1e293b;"
+        "padding:28px;border-radius:16px;"
+        "box-shadow:0 12px 35px #0008;}"
+
+        "h1{margin-top:0;font-size:24px;}"
+
+        "#status{font-size:20px;font-weight:bold;"
+        "color:#fbbf24;margin:22px 0 12px;}"
+
+        ".success{color:#4ade80!important;}"
+        ".failed{color:#f87171!important;}"
+
+        "p{line-height:1.5;color:#cbd5e1;}"
+
+        "a{display:inline-block;margin-top:18px;"
+        "padding:12px 16px;background:#2563eb;"
+        "color:white;text-decoration:none;"
+        "border-radius:9px;}"
+
+        "</style>"
+        "</head>"
+
+        "<body>"
+        "<main class=\"card\">"
+        "<h1>Secure Gateway Pairing</h1>"
+
+        "<div id=\"status\">"
+        "Authenticating Gateway..."
+        "</div>"
+
+        "<p id=\"detail\">"
+        "RC_PROOF was sent. Waiting for the authenticated "
+        "Gateway response."
+        "</p>"
+
+        "<a id=\"back\" href=\"/\" hidden>"
+        "Return to maintenance page"
+        "</a>"
+
+        "</main>"
+
+        "<script>"
+        "const statusElement="
+        "document.getElementById('status');"
+
+        "const detailElement="
+        "document.getElementById('detail');"
+
+        "const backElement="
+        "document.getElementById('back');"
+
+        "let checks=0;"
+
+        "async function checkPairingStatus(){"
+        "try{"
+        "const response=await fetch("
+        "'/pair/rc/status',{cache:'no-store'});"
+
+        "if(!response.ok){"
+        "throw new Error('status request failed');"
+        "}"
+
+        "const result=await response.json();"
+
+        "if(result.status==='success'){"
+        "statusElement.textContent='Pairing successful';"
+        "statusElement.className='success';"
+
+        "detailElement.textContent="
+        "'Gateway authenticated and the pairing key was "
+        "saved. Reboot both devices into normal mode.';"
+
+        "backElement.hidden=false;"
+        "return;"
+        "}"
+
+        "if(result.status==='failed'){"
+        "statusElement.textContent='Pairing failed';"
+        "statusElement.className='failed';"
+
+        "detailElement.textContent="
+        "'Gateway authentication or secure pairing commit "
+        "failed. Check the device connection before retrying.';"
+
+        "backElement.hidden=false;"
+        "return;"
+        "}"
+
+        "if(result.status==='idle'){"
+        "statusElement.textContent='Pairing session is idle';"
+        "statusElement.className='failed';"
+
+        "detailElement.textContent="
+        "'No active pairing result is available.';"
+
+        "backElement.hidden=false;"
+        "return;"
+        "}"
+        "}catch(error){"
+        "/* Temporary Wi-Fi or HTTP errors are retried. */"
+        "}"
+
+        "checks++;"
+
+        "if(checks>=60){"
+        "statusElement.textContent="
+        "'Still waiting for final status';"
+
+        "detailElement.textContent="
+        "'No final result was received within 30 seconds. "
+        "Pairing may still finish; check the device "
+        "connection before retrying.';"
+
+        "backElement.hidden=false;"
+        "return;"
+        "}"
+
+        "setTimeout(checkPairingStatus,500);"
+        "}"
+
+        "checkPairingStatus();"
+        "</script>"
+        "</body>"
+        "</html>";
+
+    esp_err_t err =
+        httpd_resp_set_status(
+            request,
+            "200 OK");
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err =
+        httpd_resp_set_type(
+            request,
+            "text/html; charset=utf-8");
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err =
+        httpd_resp_set_hdr(
+            request,
+            "Cache-Control",
+            "no-store");
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    return httpd_resp_send(
+        request,
+        page,
+        HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t maintenance_rc_config_post_handler(
@@ -1831,6 +2136,59 @@ void mathos_maintenance_set_rc_pairing_callback(
     maintenance_rc_pairing_callback =
         callback;
 }
+
+void mathos_maintenance_set_rc_pairing_status(
+    mathos_maintenance_rc_pairing_status_t status)
+{
+    switch (status)
+    {
+    case MATHOS_MAINTENANCE_RC_PAIRING_IDLE:
+    case MATHOS_MAINTENANCE_RC_PAIRING_IN_PROGRESS:
+    case MATHOS_MAINTENANCE_RC_PAIRING_SUCCESS:
+    case MATHOS_MAINTENANCE_RC_PAIRING_FAILED:
+        break;
+
+    default:
+        ESP_LOGW(
+            TAG,
+            "invalid RC pairing web status=%u",
+            (unsigned int)status);
+
+        return;
+    }
+
+    portENTER_CRITICAL(
+        &maintenance_rc_pairing_status_lock);
+
+    maintenance_rc_pairing_status =
+        status;
+
+    portEXIT_CRITICAL(
+        &maintenance_rc_pairing_status_lock);
+
+    ESP_LOGI(
+        TAG,
+        "RC pairing web status=%u",
+        (unsigned int)status);
+}
+
+static mathos_maintenance_rc_pairing_status_t
+maintenance_get_rc_pairing_status(void)
+{
+    mathos_maintenance_rc_pairing_status_t status;
+
+    portENTER_CRITICAL(
+        &maintenance_rc_pairing_status_lock);
+
+    status =
+        maintenance_rc_pairing_status;
+
+    portEXIT_CRITICAL(
+        &maintenance_rc_pairing_status_lock);
+
+    return status;
+}
+
 void mathos_gateway_config_set_defaults(
     mathos_gateway_config_t *config)
 {
@@ -4707,7 +5065,6 @@ mathos_pairing_challenge_wire_self_test(void)
         test_gateway_uid;
 
     original.key_generation = 7;
-    
 
     original.reserved0[0] = 0;
     original.reserved0[1] = 0;
@@ -9137,6 +9494,42 @@ static esp_err_t maintenance_http_server_start(
         ESP_LOGI(
             TAG,
             "RC pairing endpoint registered");
+        /*
+Read-only endpoint polled by the phone after
+RC_PROOF transmission.
+*/
+        httpd_uri_t rc_pairing_status_uri = {
+            .uri = "/pair/rc/status",
+            .method = HTTP_GET,
+            .handler =
+                maintenance_rc_pairing_status_get_handler,
+            .user_ctx = NULL,
+        };
+
+        err =
+            httpd_register_uri_handler(
+                maintenance_http_server,
+                &rc_pairing_status_uri);
+
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(
+                TAG,
+                "RC pairing status URI "
+                "registration failed: %s",
+                esp_err_to_name(err));
+
+            httpd_stop(
+                maintenance_http_server);
+
+            maintenance_http_server = NULL;
+
+            return err;
+        }
+
+        ESP_LOGI(
+            TAG,
+            "RC pairing status endpoint registered");
     }
     else if (role ==
              MATHOS_MAINTENANCE_ROLE_GATEWAY)

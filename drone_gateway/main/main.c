@@ -10,12 +10,13 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 
-#include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "mathos_protocol.h"
 #include "mathos_secure.h"
 #include "esp_random.h"
+#include "driver/uart.h"
+#include "driver/gpio.h"
 #include "mathos_identity.h"
 
 
@@ -101,7 +102,14 @@ static const char *TAG = "DRONE_GATEWAY";
 #define FC_COMMAND_TARGET_COMP_ID_FALLBACK  1
 
 
-#define GATEWAY_MAINTENANCE_BENCH_BOOT 1
+/*
+    Gateway maintenance switch.
+
+    Active-low with internal pull-up:
+    switch OFF = GPIO reads 1 = normal boot
+    switch ON  = GPIO reads 0 = maintenance boot
+*/
+#define GATEWAY_MAINTENANCE_SWITCH_PIN 1
 
 static mathos_gateway_config_t
     gateway_runtime_config;
@@ -4642,6 +4650,27 @@ static void health_task(void *arg)
     }
 }
 
+static esp_err_t gateway_maintenance_switch_init(void)
+{
+    gpio_config_t switch_config = {
+        .pin_bit_mask =
+            (1ULL << GATEWAY_MAINTENANCE_SWITCH_PIN),
+
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    return gpio_config(&switch_config);
+}
+
+static bool gateway_maintenance_switch_enabled(void)
+{
+    return gpio_get_level(
+               GATEWAY_MAINTENANCE_SWITCH_PIN) == 0;
+}
+
 void app_main(void)
 {
     gateway_status_session_id = esp_random();
@@ -4783,7 +4812,34 @@ else
         "Valid provisioned Gateway pairing "
         "configuration is available.");
 }
-#if GATEWAY_MAINTENANCE_BENCH_BOOT
+esp_err_t maintenance_switch_err =
+    gateway_maintenance_switch_init();
+
+if (maintenance_switch_err != ESP_OK)
+{
+    ESP_LOGE(
+        TAG,
+        "Gateway maintenance switch initialization failed: %s",
+        esp_err_to_name(maintenance_switch_err));
+
+    /*
+        Do not enter operational mode when the boot-mode
+        input cannot be trusted.
+    */
+    return;
+}
+
+int maintenance_switch_raw =
+    gpio_get_level(
+        GATEWAY_MAINTENANCE_SWITCH_PIN);
+
+ESP_LOGI(
+    TAG,
+    "Gateway boot input maintenance_raw=%d",
+    maintenance_switch_raw);
+
+if (gateway_maintenance_switch_enabled())
+{
 
     /*
         Maintenance mode is exclusive.
@@ -4793,7 +4849,7 @@ else
     */
     ESP_LOGW(
         TAG,
-        "GATEWAY MAINTENANCE BENCH MODE ACTIVE");
+        "GATEWAY MAINTENANCE MODE ACTIVE");
 
 esp_err_t maintenance_err =
     mathos_maintenance_softap_start(
@@ -4882,7 +4938,7 @@ if (challenge_tx_err != ESP_OK)
 
 return;
 
-#endif
+}
 
 /*
     Normal Gateway operation is forbidden unless a valid
