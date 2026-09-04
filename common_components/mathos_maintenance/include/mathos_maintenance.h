@@ -271,7 +271,77 @@ extern "C"
 
         uint32_t crc32;
     } mathos_pairing_proof_t;
+/*
+    Authenticated pairing completion record.
 
+    This contains no passphrase or root key.
+    Receivers must verify its HMAC and session metadata
+    before acting on result_code.
+*/
+#define MATHOS_PAIRING_RESULT_MAGIC 0x4D505253U
+#define MATHOS_PAIRING_RESULT_VERSION 1U
+#define MATHOS_PAIRING_RESULT_HMAC_LEN 32U
+
+#define MATHOS_PAIRING_RESULT_ROLE_RC 1U
+#define MATHOS_PAIRING_RESULT_ROLE_GATEWAY 2U
+
+    typedef enum
+    {
+        MATHOS_PAIRING_RESULT_INVALID = 0,
+
+        /* RC reports that its pairing data is persisted. */
+        MATHOS_PAIRING_RESULT_RC_COMMITTED = 1,
+
+        /* Gateway reports that its pairing data is persisted. */
+        MATHOS_PAIRING_RESULT_GATEWAY_COMMITTED = 2
+
+    } mathos_pairing_result_code_t;
+
+    typedef struct
+    {
+        uint32_t magic;
+        uint16_t version;
+        uint16_t record_size;
+
+        uint8_t rc_id;
+        uint8_t gateway_id;
+        uint8_t sender_role;
+        uint8_t result_code;
+
+        mathos_device_uid_t gateway_uid;
+
+        uint8_t reserved0[2];
+
+        uint32_t key_generation;
+
+        /*
+            Bind the result to the exact pairing challenge.
+        */
+        uint8_t nonce[MATHOS_PAIRING_NONCE_LEN];
+
+        /*
+            Authentication; generated and checked separately
+            from the ordinary RC/Gateway pairing proofs.
+        */
+        uint8_t hmac[MATHOS_PAIRING_RESULT_HMAC_LEN];
+
+        /* Accidental-corruption check, not authentication. */
+        uint32_t crc32;
+
+    } mathos_pairing_result_t;
+
+/*
+    Canonical serialized size: 76 bytes.
+    Never use sizeof(struct) as the wire length.
+*/
+#define MATHOS_PAIRING_RESULT_WIRE_LEN \
+    (4U + 2U + 2U +                    \
+     1U + 1U + 1U + 1U +               \
+     MATHOS_DEVICE_UID_LEN + 2U +      \
+     4U +                              \
+     MATHOS_PAIRING_NONCE_LEN +        \
+     MATHOS_PAIRING_RESULT_HMAC_LEN +  \
+     4U)
     /*
     ============================================================
     Pairing transport message types
@@ -417,12 +487,11 @@ extern "C"
      4U)
 
     /*
-   Largest version-1 pairing payload currently defined.
-
-   PROOF is currently the largest at 68 bytes.
-*/
+      RESULT is currently the largest pairing payload:
+      76 bytes.
+  */
 #define MATHOS_PAIRING_WIRE_MAX_PAYLOAD_LEN \
-    MATHOS_PAIRING_PROOF_WIRE_LEN
+    MATHOS_PAIRING_RESULT_WIRE_LEN
 
 /*
     Maximum complete version-1 pairing frame:
@@ -523,7 +592,26 @@ extern "C"
         MATHOS_PAIRING_SESSION_GATEWAY_PROOF_VERIFIED,
         MATHOS_PAIRING_SESSION_COMMIT_READY,
         MATHOS_PAIRING_SESSION_COMPLETE,
-        MATHOS_PAIRING_SESSION_FAILED
+        MATHOS_PAIRING_SESSION_FAILED,
+
+        /*
+            Gateway has queued GATEWAY_PROOF successfully
+            and is waiting for an authenticated
+            RC_COMMITTED result.
+        */
+        MATHOS_PAIRING_SESSION_WAIT_RC_RESULT,
+
+        /*
+            Gateway authenticated the RC_COMMITTED result.
+            Its final acknowledgement has not been sent yet.
+        */
+        MATHOS_PAIRING_SESSION_RC_RESULT_VERIFIED,
+
+        /*
+            RC verified its local pairing/Fleet persistence
+            and is awaiting the authenticated Gateway result.
+        */
+        MATHOS_PAIRING_SESSION_WAIT_GATEWAY_RESULT
     } mathos_pairing_session_state_t;
 
     typedef struct
@@ -728,7 +816,47 @@ maintenance web interface.
 
     void mathos_pairing_proof_set_defaults(
         mathos_pairing_proof_t *proof);
+    void mathos_pairing_result_set_defaults(
+        mathos_pairing_result_t *result);
+    /*
+Structural and CRC validation only.
+Does not authenticate the result.
+*/
+    int mathos_pairing_result_is_valid(
+        const mathos_pairing_result_t *result);
 
+    /*
+        Create an authenticated result bound to the
+        supplied pairing challenge.
+    */
+    esp_err_t mathos_pairing_result_create(
+        const uint8_t root_key[MATHOS_GATEWAY_ROOT_KEY_LEN],
+        const mathos_pairing_challenge_t *challenge,
+        uint8_t result_code,
+        mathos_pairing_result_t *result);
+    /*
+Verify authentication and challenge binding.
+
+expected_result_code must come from local protocol
+logic, never from the received message.
+
+This does not check session timeout or commit state.
+*/
+    esp_err_t mathos_pairing_result_verify(
+        const uint8_t root_key[MATHOS_GATEWAY_ROOT_KEY_LEN],
+        const mathos_pairing_challenge_t *challenge,
+        const mathos_pairing_result_t *result,
+        uint8_t expected_result_code);
+
+    esp_err_t mathos_pairing_result_encode_payload(
+        const mathos_pairing_result_t *result,
+        uint8_t *output,
+        size_t output_size);
+
+    esp_err_t mathos_pairing_result_decode_payload(
+        const uint8_t *input,
+        size_t input_size,
+        mathos_pairing_result_t *result);
     void mathos_pairing_session_set_defaults(
         mathos_pairing_session_t *session);
 

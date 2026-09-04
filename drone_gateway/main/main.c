@@ -1077,6 +1077,192 @@ gateway_pairing_send_gateway_proof_once(void)
     return ESP_OK;
 } 
 
+static esp_err_t gateway_pairing_send_commit_result_once(void)
+{
+    if (!gateway_pairing_session.active ||
+        gateway_pairing_session.state !=
+            MATHOS_PAIRING_SESSION_RC_RESULT_VERIFIED)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (mathos_pairing_session_has_timed_out(
+            &gateway_pairing_session))
+    {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    mathos_gateway_config_t saved_config = {0};
+    mathos_pairing_result_t result = {0};
+
+    uint8_t payload[MATHOS_PAIRING_RESULT_WIRE_LEN] = {0};
+    uint8_t frame[MATHOS_PAIRING_WIRE_MAX_FRAME_LEN] = {0};
+
+    int loaded_from_nvs = 0;
+    size_t frame_len = 0;
+    uint8_t key_difference = 0;
+
+    /*
+        Read back the saved configuration.
+
+        A valid runtime key alone is not evidence that
+        the matching key is currently stored in NVS.
+    */
+    esp_err_t err = mathos_gateway_config_load(
+        &saved_config,
+        &loaded_from_nvs);
+
+    if (err != ESP_OK)
+    {
+        goto cleanup;
+    }
+
+    if (!loaded_from_nvs ||
+        !mathos_gateway_config_is_valid(&saved_config) ||
+        saved_config.key_generation == 0U ||
+        saved_config.key_generation !=
+            gateway_pairing_session.key_generation ||
+        saved_config.key_generation !=
+            gateway_pairing_session.challenge.key_generation ||
+        saved_config.key_generation !=
+            gateway_runtime_config.key_generation ||
+        saved_config.gateway_id !=
+            gateway_pairing_session.challenge.gateway_id ||
+        saved_config.authorised_rc_id !=
+            gateway_pairing_session.challenge.rc_id ||
+        saved_config.key_derivation_method !=
+            gateway_pairing_session.package.key_derivation_method ||
+        saved_config.kdf_iteration_count !=
+            gateway_pairing_session.package.kdf_iteration_count ||
+        memcmp(
+            saved_config.pairing_salt,
+            gateway_pairing_session.package.pairing_salt,
+            sizeof(saved_config.pairing_salt)) != 0 ||
+        memcmp(
+            gateway_pairing_session.challenge.gateway_uid.bytes,
+            gateway_hardware_uid.bytes,
+            MATHOS_DEVICE_UID_LEN) != 0)
+    {
+        err = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+
+    /*
+        Compare every key byte without an early exit.
+        Never print either key.
+    */
+    for (size_t i = 0;
+         i < sizeof(saved_config.root_key);
+         ++i)
+    {
+        key_difference |=
+            saved_config.root_key[i] ^
+            gateway_runtime_config.root_key[i];
+    }
+
+    if (key_difference != 0U)
+    {
+        err = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+
+    err = mathos_pairing_result_create(
+        saved_config.root_key,
+        &gateway_pairing_session.challenge,
+        MATHOS_PAIRING_RESULT_GATEWAY_COMMITTED,
+        &result);
+
+    if (err != ESP_OK)
+    {
+        goto cleanup;
+    }
+
+    err = mathos_pairing_result_encode_payload(
+        &result,
+        payload,
+        sizeof(payload));
+
+    if (err != ESP_OK)
+    {
+        goto cleanup;
+    }
+
+    mathos_pairing_wire_header_t header = {
+        .magic_0 = MATHOS_PAIRING_WIRE_MAGIC_0,
+        .magic_1 = MATHOS_PAIRING_WIRE_MAGIC_1,
+        .version = MATHOS_PAIRING_WIRE_VERSION,
+        .message_type = MATHOS_PAIRING_MSG_RESULT,
+        .payload_len = (uint16_t)sizeof(payload),
+        .sequence = 6U,
+    };
+
+    err = mathos_pairing_wire_encode_frame(
+        &header,
+        payload,
+        sizeof(payload),
+        frame,
+        sizeof(frame),
+        &frame_len);
+
+    if (err != ESP_OK)
+    {
+        goto cleanup;
+    }
+
+    /*
+        NVS access and authentication took time.
+        Recheck the deadline before transmitting.
+    */
+    if (mathos_pairing_session_has_timed_out(
+            &gateway_pairing_session))
+    {
+        err = ESP_ERR_TIMEOUT;
+        goto cleanup;
+    }
+
+    int written = uart_write_bytes(
+        LINK_UART_NUM,
+        (const char *)frame,
+        frame_len);
+
+    if (written != (int)frame_len)
+    {
+        err = ESP_FAIL;
+        goto cleanup;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "GATEWAY_COMMITTED RESULT QUEUED "
+        "frame_len=%u generation=%lu sequence=6",
+        (unsigned int)frame_len,
+        (unsigned long)result.key_generation);
+
+    /*
+        Keep the verified session available for an
+        authenticated retry within its existing lifetime.
+
+        UART acceptance does not prove RC reception.
+    */
+    err = ESP_OK;
+
+cleanup:
+    mathos_pairing_result_set_defaults(&result);
+
+    /*
+        Explicitly wipe this temporary configuration copy,
+        including the plaintext key read from NVS.
+    */
+    volatile uint8_t *wipe =
+        (volatile uint8_t *)&saved_config;
+
+    for (size_t i = 0; i < sizeof(saved_config); ++i)
+    {
+        wipe[i] = 0;
+    }
+
+    return err;
+}
 
 static void gateway_pairing_rx_task(
     void *pvParameters)
@@ -1102,6 +1288,35 @@ static void gateway_pairing_rx_task(
                 rx_buffer,
                 sizeof(rx_buffer),
                 pdMS_TO_TICKS(100));
+
+        /*
+            Enforce the session deadline on every loop,
+            including when UART is silent or carries junk.
+
+            Retain acknowledgement-retry context only
+            within the original session lifetime.
+        */
+        if (gateway_pairing_session.active &&
+            mathos_pairing_session_has_timed_out(
+                &gateway_pairing_session))
+        {
+            ESP_LOGW(
+                TAG,
+                "Pairing session expired; "
+                "clearing transient session");
+
+            mathos_pairing_session_reset(
+                &gateway_pairing_session);
+
+            /*
+                Discard partial data belonging to
+                the expired attempt.
+            */
+            frame_index = 0;
+            expected_frame_len = 0;
+
+            continue;
+        }
 
         if (len <= 0)
         {
@@ -1284,9 +1499,182 @@ static void gateway_pairing_rx_task(
 
                 continue;
             }
+                        /*
+                RC -> Gateway commit receipt.
+
+                Sequence 5 is a transport convention.
+                Authentication comes from the RESULT HMAC
+                and its binding to the active challenge.
+            */
+            if (decoded_header.message_type ==
+                    MATHOS_PAIRING_MSG_RESULT)
+            {
+                if (decoded_header.sequence != 5U ||
+                    payload_len != MATHOS_PAIRING_RESULT_WIRE_LEN)
+                {
+                    ESP_LOGW(
+                        TAG,
+                        "RC RESULT rejected: unexpected "
+                        "sequence=%lu length=%u",
+                        (unsigned long)decoded_header.sequence,
+                        (unsigned int)payload_len);
+
+                    continue;
+                }
+
+                /*
+                    Never accept a receipt before our
+                    Gateway proof has been queued.
+                */
+                if (!gateway_pairing_session.active ||
+                    (gateway_pairing_session.state !=
+                         MATHOS_PAIRING_SESSION_WAIT_RC_RESULT &&
+                     gateway_pairing_session.state !=
+                         MATHOS_PAIRING_SESSION_RC_RESULT_VERIFIED))
+                {
+                    ESP_LOGW(
+                        TAG,
+                        "RC RESULT rejected: "
+                        "not waiting for receipt state=%u",
+                        (unsigned int)
+                            gateway_pairing_session.state);
+
+                    continue;
+                }
+
+                if (mathos_pairing_session_has_timed_out(
+                        &gateway_pairing_session))
+                {
+                    ESP_LOGW(
+                        TAG,
+                        "RC RESULT rejected: session expired");
+
+                    mathos_pairing_session_reset(
+                        &gateway_pairing_session);
+
+                    continue;
+                }
+
+                /*
+                    Use the Gateway's validated runtime key,
+                    never a key supplied by the received packet.
+                */
+                if (!gateway_runtime_config_loaded_from_nvs ||
+                    !mathos_gateway_config_is_valid(
+                        &gateway_runtime_config) ||
+                    gateway_runtime_config.key_generation !=
+                        gateway_pairing_session.key_generation ||
+                    gateway_runtime_config.key_generation !=
+                        gateway_pairing_session.challenge.key_generation ||
+                    gateway_runtime_config.gateway_id !=
+                        gateway_pairing_session.challenge.gateway_id ||
+                    gateway_runtime_config.authorised_rc_id !=
+                        gateway_pairing_session.challenge.rc_id)
+                {
+                    ESP_LOGW(
+                        TAG,
+                        "RC RESULT rejected: "
+                        "Gateway configuration/session mismatch");
+
+                    continue;
+                }
+
+                mathos_pairing_result_t rc_result = {0};
+
+                err = mathos_pairing_result_decode_payload(
+                    payload,
+                    payload_len,
+                    &rc_result);
+
+                if (err == ESP_OK)
+                {
+                    /*
+                        Expected result is chosen locally.
+
+                        The verifier checks the sender role,
+                        IDs, Gateway UID, generation, nonce
+                        and HMAC against our challenge.
+                    */
+                    err = mathos_pairing_result_verify(
+                        gateway_runtime_config.root_key,
+                        &gateway_pairing_session.challenge,
+                        &rc_result,
+                        MATHOS_PAIRING_RESULT_RC_COMMITTED);
+                }
+
+                /*
+                    No received record needs to remain on
+                    the stack after verification.
+                */
+                mathos_pairing_result_set_defaults(
+                    &rc_result);
+
+                if (err != ESP_OK)
+                {
+                    ESP_LOGW(
+                        TAG,
+                        "RC_COMMITTED RESULT rejected: %s",
+                        esp_err_to_name(err));
+
+                    continue;
+                }
+
+                /*
+                    Verification may take time. Check the
+                    deadline again before accepting the result.
+                */
+                if (mathos_pairing_session_has_timed_out(
+                        &gateway_pairing_session))
+                {
+                    ESP_LOGW(
+                        TAG,
+                        "RC RESULT rejected: "
+                        "session expired during verification");
+
+                    mathos_pairing_session_reset(
+                        &gateway_pairing_session);
+
+                    continue;
+                }
+
+                gateway_pairing_session.state =
+                    MATHOS_PAIRING_SESSION_RC_RESULT_VERIFIED;
+
+                ESP_LOGI(
+                    TAG,
+                    "RC_COMMITTED RESULT AUTHENTICATED "
+                    "generation=%lu state=%u; "
+                    "Gateway acknowledgement pending",
+                    (unsigned long)
+                        gateway_pairing_session.key_generation,
+                    (unsigned int)
+                        gateway_pairing_session.state);
+                err = gateway_pairing_send_commit_result_once();
+
+                if (err != ESP_OK)
+                {
+                    ESP_LOGW(
+                        TAG,
+                        "Gateway commit acknowledgement "
+                        "not queued: %s",
+                        esp_err_to_name(err));
+
+                    if (err == ESP_ERR_TIMEOUT)
+                    {
+                        mathos_pairing_session_reset(
+                            &gateway_pairing_session);
+                    }
+                }
+                /*
+                    RESULT processing is finished.
+                    Do not fall through into RC_PROOF handling.
+                */
+                continue;
+            }
 
             /*
-                Gateway expects only RC_PROOF here.
+                Other messages must be RC_PROOF.
+                RESULT was handled above.
             */
             if (decoded_header.message_type !=
                     MATHOS_PAIRING_MSG_RC_PROOF ||
@@ -1446,16 +1834,44 @@ static void gateway_pairing_rx_task(
             {
                 ESP_LOGE(
                     TAG,
-                    "GATEWAY_PROOF TX failed: %s",
+                    "GATEWAY_PROOF TX failed: %s; "
+                    "pairing attempt aborted. "
+                    "Restart Gateway to begin a fresh attempt",
                     esp_err_to_name(err));
+
+                /*
+                    A failed transmission must not leave
+                    an active session in GATEWAY_PROOF_READY.
+
+                    Clear temporary state only.
+                    Saved pairing credentials are retained.
+                */
+                mathos_pairing_session_reset(
+                    &gateway_pairing_session);
+
+                frame_index = 0;
+                expected_frame_len = 0;
 
                 continue;
             }
 
+            /*
+                The transmit helper returned ESP_OK.
+
+                This means the proof was accepted by the
+                UART transmit path, not that the RC has
+                received it or committed its pairing data.
+            */
+            gateway_pairing_session.state =
+                MATHOS_PAIRING_SESSION_WAIT_RC_RESULT;
+
             ESP_LOGI(
                 TAG,
-                "Pairing mutual-authentication "
-                "response sent to RC");
+                "Gateway proof queued; waiting for "
+                "authenticated RC_COMMITTED RESULT "
+                "state=%u",
+                (unsigned int)
+                    gateway_pairing_session.state);
         }
     }
 }

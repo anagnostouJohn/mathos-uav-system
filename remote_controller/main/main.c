@@ -121,6 +121,7 @@
     challenge lifetime.
 */
 #define RC_PAIRING_GATEWAY_PROOF_TIMEOUT_MS 10000U
+#define RC_PAIRING_REQUEST_MAX_AGE_MS 5000U
 
 #define FEATURE_LINK_UART_TX 1
 
@@ -453,8 +454,56 @@ static mathos_fleet_record_t
 static mathos_pairing_session_t rc_pairing_session;
 static mathos_pairing_package_t rc_pairing_received_package;
 static int rc_pairing_have_package = 0;
+/*
+    An application-owned copy of one pairing request.
+    Never retain the HTTP handler's passphrase pointer.
+*/
+typedef struct
+{
+    char passphrase[MATHOS_PAIRING_PASSPHRASE_MAX_LEN + 1U];
+    int64_t submitted_at_us;
+} rc_pairing_request_t;
+
+/*
+    The queue will carry pointers to allocated requests.
+
+    Ownership transfers to the pairing task only when
+    enqueueing succeeds. The owner must securely erase
+    and free the request after use or rejection.
+
+    Keeping only pointers in the queue avoids leaving
+    another plaintext passphrase copy in queue storage.
+*/
+static QueueHandle_t rc_pairing_request_queue = NULL;
+typedef enum
+{
+    RC_PAIRING_ADMISSION_CLOSED = 0,
+    RC_PAIRING_ADMISSION_READY,
+    RC_PAIRING_ADMISSION_QUEUED
+} rc_pairing_admission_t;
+
+static portMUX_TYPE rc_pairing_admission_lock =
+    portMUX_INITIALIZER_UNLOCKED;
+
+static rc_pairing_admission_t rc_pairing_admission =
+    RC_PAIRING_ADMISSION_CLOSED;
 static portMUX_TYPE rc_pairing_proof_timer_lock = portMUX_INITIALIZER_UNLOCKED;
 static int64_t rc_pairing_proof_sent_at_us = 0;
+#define RC_PAIRING_RESULT_TIMEOUT_MS 10000U
+#define RC_PAIRING_RESULT_RETRY_INTERVAL_MS 1000U
+#define RC_PAIRING_RESULT_MAX_TX_ATTEMPTS 3U
+
+/*
+    Owned exclusively by rc_pairing_rx_task.
+
+    Do not modify this context from the HTTP task.
+*/
+static struct
+{
+    int64_t started_at_us;
+    int64_t last_tx_at_us;
+    unsigned int tx_attempts;
+} rc_pairing_result_wait;
 volatile uint32_t system_faults = FAULT_NONE;
 volatile TickType_t task_heartbeat[HB_COUNT];
 volatile TickType_t rc_input_last_update_tick = 0;
@@ -5691,6 +5740,533 @@ static void rc_pairing_clear_sensitive_memory(
     }
 }
 
+/*
+    HTTP-facing callback.
+
+    ESP_OK means the request was queued, NOT that
+    a proof was transmitted or pairing succeeded.
+*/
+static esp_err_t rc_pairing_enqueue_request(
+    const char *passphrase)
+{
+    if (passphrase == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (rc_pairing_request_queue == NULL)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    size_t length = strnlen(
+        passphrase,
+        MATHOS_PAIRING_PASSPHRASE_MAX_LEN + 1U);
+
+    if (length < MATHOS_PAIRING_PASSPHRASE_MIN_LEN ||
+        length > MATHOS_PAIRING_PASSPHRASE_MAX_LEN)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    for (size_t i = 0; i < length; ++i)
+    {
+        unsigned char c = (unsigned char)passphrase[i];
+
+        if (c < 0x20U || c > 0x7EU)
+        {
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+
+    int64_t submitted_at_us = esp_timer_get_time();
+
+    if (submitted_at_us <= 0)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    rc_pairing_request_t *request =
+        calloc(1, sizeof(*request));
+
+    if (request == NULL)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+
+    memcpy(
+        request->passphrase,
+        passphrase,
+        length);
+
+    request->passphrase[length] = '\0';
+    request->submitted_at_us = submitted_at_us;
+    /*
+        Reserve admission before publishing the request.
+        A busy or unavailable session cannot accept another.
+    */
+    portENTER_CRITICAL(&rc_pairing_admission_lock);
+
+    int admitted =
+        rc_pairing_admission == RC_PAIRING_ADMISSION_READY;
+
+    if (admitted)
+    {
+        rc_pairing_admission = RC_PAIRING_ADMISSION_QUEUED;
+    }
+
+    portEXIT_CRITICAL(&rc_pairing_admission_lock);
+
+    if (!admitted)
+    {
+        /*
+            This request never owned admission.
+            Leave the existing exchange untouched.
+        */
+        rc_pairing_clear_sensitive_memory(
+            request,
+            sizeof(*request));
+
+        free(request);
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+        Admission belongs to this request.
+        Publish progress before transferring ownership.
+    */
+    mathos_maintenance_set_rc_pairing_status(
+        MATHOS_MAINTENANCE_RC_PAIRING_IN_PROGRESS);
+
+    if (xQueueSend(
+            rc_pairing_request_queue,
+            &request,
+            0) != pdPASS)
+    {
+        rc_pairing_clear_sensitive_memory(
+            request,
+            sizeof(*request));
+
+        free(request);
+
+        mathos_maintenance_set_rc_pairing_status(
+            MATHOS_MAINTENANCE_RC_PAIRING_FAILED);
+
+        portENTER_CRITICAL(&rc_pairing_admission_lock);
+        rc_pairing_admission = RC_PAIRING_ADMISSION_CLOSED;
+        portEXIT_CRITICAL(&rc_pairing_admission_lock);
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+        Ownership has transferred to the pairing task.
+        It may already have consumed and freed the request.
+
+        Do not access request again here.
+    */
+    return ESP_OK;
+}
+
+static esp_err_t rc_pairing_send_commit_result_once(void)
+{
+    /*
+        The caller must first verify local persistence,
+        enter the waiting state and arm the RESULT deadline.
+
+        This helper never writes NVS or reports SUCCESS.
+    */
+    if (!rc_pairing_session.active ||
+        rc_pairing_session.state !=
+            MATHOS_PAIRING_SESSION_WAIT_GATEWAY_RESULT)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (mathos_pairing_session_has_timed_out(
+            &rc_pairing_session))
+    {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    /*
+        The runtime key must still match the authenticated
+        candidate and the current pairing attempt.
+    */
+    if (!rc_runtime_pairing_loaded_from_nvs ||
+        !mathos_rc_pairing_config_is_valid(
+            &rc_runtime_pairing_config) ||
+        rc_runtime_pairing_config.key_generation == 0U ||
+        rc_runtime_pairing_config.key_generation !=
+            rc_pairing_session.key_generation ||
+        rc_runtime_pairing_config.key_generation !=
+            rc_pairing_session.challenge.key_generation ||
+        rc_runtime_pairing_config.rc_id !=
+            rc_pairing_session.challenge.rc_id ||
+        rc_runtime_pairing_config.authorised_gateway_id !=
+            rc_pairing_session.challenge.gateway_id ||
+        !rc_pairing_secret_matches(
+            rc_runtime_pairing_config.root_key,
+            rc_pairing_session.rc_candidate.root_key,
+            sizeof(rc_runtime_pairing_config.root_key)))
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    mathos_pairing_result_t result = {0};
+
+    uint8_t payload[MATHOS_PAIRING_RESULT_WIRE_LEN] = {0};
+    uint8_t frame[MATHOS_PAIRING_WIRE_MAX_FRAME_LEN] = {0};
+
+    size_t frame_len = 0;
+
+    esp_err_t err = mathos_pairing_result_create(
+        rc_runtime_pairing_config.root_key,
+        &rc_pairing_session.challenge,
+        MATHOS_PAIRING_RESULT_RC_COMMITTED,
+        &result);
+
+    if (err != ESP_OK)
+    {
+        goto cleanup;
+    }
+
+    err = mathos_pairing_result_encode_payload(
+        &result,
+        payload,
+        sizeof(payload));
+
+    if (err != ESP_OK)
+    {
+        goto cleanup;
+    }
+
+    mathos_pairing_wire_header_t header = {
+        .magic_0 = MATHOS_PAIRING_WIRE_MAGIC_0,
+        .magic_1 = MATHOS_PAIRING_WIRE_MAGIC_1,
+        .version = MATHOS_PAIRING_WIRE_VERSION,
+        .message_type = MATHOS_PAIRING_MSG_RESULT,
+        .payload_len = (uint16_t)sizeof(payload),
+        .sequence = 5U,
+    };
+
+    err = mathos_pairing_wire_encode_frame(
+        &header,
+        payload,
+        sizeof(payload),
+        frame,
+        sizeof(frame),
+        &frame_len);
+
+    if (err != ESP_OK)
+    {
+        goto cleanup;
+    }
+
+    if (mathos_pairing_session_has_timed_out(
+            &rc_pairing_session))
+    {
+        err = ESP_ERR_TIMEOUT;
+        goto cleanup;
+    }
+
+    int written = uart_write_bytes(
+        LINK_UART_PORT,
+        (const char *)frame,
+        frame_len);
+
+    if (written != (int)frame_len)
+    {
+        printf(
+            "[PAIRING TX] RC_COMMITTED RESULT "
+            "UART write failed written=%d expected=%u\n",
+            written,
+            (unsigned int)frame_len);
+
+        err = ESP_FAIL;
+        goto cleanup;
+    }
+
+    printf(
+        "[PAIRING TX] RC_COMMITTED RESULT QUEUED "
+        "frame_len=%u generation=%lu sequence=5\n",
+        (unsigned int)frame_len,
+        (unsigned long)result.key_generation);
+
+    /*
+        Keep the challenge and candidate available for
+        acknowledgement verification and bounded retries.
+
+        Do not restart the overall deadline on a retry.
+    */
+    err = ESP_OK;
+
+cleanup:
+    rc_pairing_clear_sensitive_memory(
+        &result,
+        sizeof(result));
+
+    rc_pairing_clear_sensitive_memory(
+        payload,
+        sizeof(payload));
+
+    rc_pairing_clear_sensitive_memory(
+        frame,
+        sizeof(frame));
+
+    return err;
+}
+
+static void rc_pairing_result_wait_clear(void)
+{
+    memset(
+        &rc_pairing_result_wait,
+        0,
+        sizeof(rc_pairing_result_wait));
+}
+
+static int rc_pairing_result_wait_has_expired(void)
+{
+    int64_t now_us = esp_timer_get_time();
+
+    /*
+        A waiting session without a valid clock fails closed.
+    */
+    if (rc_pairing_result_wait.started_at_us <= 0 ||
+        now_us <= 0 ||
+        now_us < rc_pairing_result_wait.started_at_us ||
+        now_us < rc_pairing_result_wait.last_tx_at_us)
+    {
+        return 1;
+    }
+
+    /*
+        The overall pairing-session deadline still applies.
+    */
+    if (mathos_pairing_session_has_timed_out(
+            &rc_pairing_session))
+    {
+        return 1;
+    }
+
+    return (now_us - rc_pairing_result_wait.started_at_us) >=
+           ((int64_t)RC_PAIRING_RESULT_TIMEOUT_MS * 1000LL);
+}
+
+static esp_err_t rc_pairing_result_wait_start(void)
+{
+    if (!rc_pairing_session.active ||
+        rc_pairing_session.state !=
+            MATHOS_PAIRING_SESSION_WAIT_GATEWAY_RESULT ||
+        rc_pairing_result_wait.started_at_us != 0)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (mathos_pairing_session_has_timed_out(
+            &rc_pairing_session))
+    {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    int64_t now_us = esp_timer_get_time();
+
+    if (now_us <= 0)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    rc_pairing_result_wait.started_at_us = now_us;
+    rc_pairing_result_wait.last_tx_at_us = 0;
+    rc_pairing_result_wait.tx_attempts = 0;
+
+    return ESP_OK;
+}
+
+static esp_err_t rc_pairing_result_wait_poll(void)
+{
+    if (!rc_pairing_session.active ||
+        rc_pairing_session.state !=
+            MATHOS_PAIRING_SESSION_WAIT_GATEWAY_RESULT)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (rc_pairing_result_wait_has_expired())
+    {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    /*
+        After the final transmission, keep listening until
+        the deadline. Do not send indefinitely.
+    */
+    if (rc_pairing_result_wait.tx_attempts >=
+        RC_PAIRING_RESULT_MAX_TX_ATTEMPTS)
+    {
+        return ESP_OK;
+    }
+
+    int64_t now_us = esp_timer_get_time();
+
+    if (rc_pairing_result_wait.tx_attempts != 0U &&
+        (now_us - rc_pairing_result_wait.last_tx_at_us) <
+            ((int64_t)RC_PAIRING_RESULT_RETRY_INTERVAL_MS * 1000LL))
+    {
+        return ESP_OK;
+    }
+
+    /*
+        Count attempts, including unsuccessful UART writes.
+
+        Never change started_at_us here: retries must not
+        extend the original acknowledgement deadline.
+    */
+    rc_pairing_result_wait.last_tx_at_us = now_us;
+    rc_pairing_result_wait.tx_attempts++;
+
+    esp_err_t err =
+        rc_pairing_send_commit_result_once();
+
+    if (err == ESP_ERR_TIMEOUT)
+    {
+        return err;
+    }
+
+    if (err != ESP_OK)
+    {
+        printf(
+            "[PAIRING TX] RC RESULT attempt=%u/%u "
+            "not queued error=%s\n",
+            rc_pairing_result_wait.tx_attempts,
+            (unsigned int)RC_PAIRING_RESULT_MAX_TX_ATTEMPTS,
+            esp_err_to_name(err));
+    }
+
+    /*
+        ESP_OK here means waiting may continue.
+        It does NOT mean pairing succeeded.
+    */
+    return ESP_OK;
+}
+
+static esp_err_t rc_pairing_verify_gateway_commit_result(
+    const mathos_pairing_wire_header_t *header,
+    const uint8_t *payload,
+    size_t payload_len)
+{
+    if (header == NULL || payload == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (header->message_type != MATHOS_PAIRING_MSG_RESULT ||
+        header->sequence != 6U)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (header->payload_len != MATHOS_PAIRING_RESULT_WIRE_LEN ||
+        payload_len != MATHOS_PAIRING_RESULT_WIRE_LEN)
+    {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    if (!rc_pairing_session.active ||
+        rc_pairing_session.state !=
+            MATHOS_PAIRING_SESSION_WAIT_GATEWAY_RESULT)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (rc_pairing_result_wait_has_expired())
+    {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    /*
+        Authenticate against the locally committed key and
+        the original challenge, not received metadata alone.
+    */
+    if (!rc_runtime_pairing_loaded_from_nvs ||
+        !mathos_rc_pairing_config_is_valid(
+            &rc_runtime_pairing_config) ||
+        rc_runtime_pairing_config.key_generation == 0U ||
+        rc_runtime_pairing_config.key_generation !=
+            rc_pairing_session.key_generation ||
+        rc_runtime_pairing_config.key_generation !=
+            rc_pairing_session.challenge.key_generation ||
+        rc_runtime_pairing_config.rc_id !=
+            rc_pairing_session.challenge.rc_id ||
+        rc_runtime_pairing_config.authorised_gateway_id !=
+            rc_pairing_session.challenge.gateway_id ||
+        !rc_pairing_secret_matches(
+            rc_runtime_pairing_config.root_key,
+            rc_pairing_session.rc_candidate.root_key,
+            sizeof(rc_runtime_pairing_config.root_key)))
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    mathos_pairing_result_t gateway_result = {0};
+
+    esp_err_t err = mathos_pairing_result_decode_payload(
+        payload,
+        payload_len,
+        &gateway_result);
+
+    if (err == ESP_OK)
+    {
+        err = mathos_pairing_result_verify(
+            rc_runtime_pairing_config.root_key,
+            &rc_pairing_session.challenge,
+            &gateway_result,
+            MATHOS_PAIRING_RESULT_GATEWAY_COMMITTED);
+    }
+
+    rc_pairing_clear_sensitive_memory(
+        &gateway_result,
+        sizeof(gateway_result));
+
+    /*
+        Do not accept an acknowledgement if its deadline
+        passed while verification was running.
+    */
+    if (err == ESP_OK &&
+        rc_pairing_result_wait_has_expired())
+    {
+        err = ESP_ERR_TIMEOUT;
+    }
+
+    /*
+        No session reset or web-status update here.
+
+        Invalid packets must not cancel a legitimate wait.
+        The RX task will handle success or timeout.
+    */
+    return err;
+}
+static void rc_pairing_result_wait_cleanup(void)
+{
+    rc_pairing_gateway_proof_timer_clear();
+    rc_pairing_result_wait_clear();
+
+    mathos_pairing_session_reset(
+        &rc_pairing_session);
+
+    rc_pairing_have_package = 0;
+
+    rc_pairing_clear_sensitive_memory(
+        &rc_pairing_received_package,
+        sizeof(rc_pairing_received_package));
+
+    /*
+        Persistent records and the runtime key are untouched.
+        Cleanup is not a rollback of completed NVS writes.
+    */
+}
+
 static esp_err_t
 rc_pairing_commit_verified_candidate(void)
 {
@@ -5706,7 +6282,11 @@ rc_pairing_commit_verified_candidate(void)
 
         return ESP_ERR_INVALID_STATE;
     }
-
+    if (mathos_pairing_session_has_timed_out(
+            &rc_pairing_session))
+    {
+        return ESP_ERR_TIMEOUT;
+    }
     if (!mathos_rc_pairing_config_is_valid(
             &rc_pairing_session.rc_candidate))
     {
@@ -5962,68 +6542,254 @@ rc_pairing_commit_verified_candidate(void)
     rc_runtime_pairing_loaded_from_nvs =
         1;
 
-    rc_pairing_session.state =
-        MATHOS_PAIRING_SESSION_COMPLETE;
-
     printf(
-        "[PAIRING COMMIT] COMPLETE "
-        "rc_id=%u gateway_id=%u "
-        "generation=%lu counter=%lu state=%u\n",
-        rc_runtime_pairing_config.rc_id,
-        rc_runtime_pairing_config
-            .authorised_gateway_id,
+        "[PAIRING COMMIT] LOCAL RECORDS VERIFIED "
+        "generation=%lu counter=%lu\n",
         (unsigned long)
-            rc_runtime_pairing_config
-                .key_generation,
+            rc_runtime_pairing_config.key_generation,
         (unsigned long)
-            rc_runtime_pairing_config
-                .configuration_counter,
-        (unsigned int)
-            rc_pairing_session.state);
+            rc_runtime_pairing_config.configuration_counter);
 
     /*
-        The runtime configuration now owns the required
-        persistent key copy.
+        The persisted configuration has been published to
+        runtime RAM. Remove only the temporary stack copy.
 
-        Remove the temporary stack copy.
+        Keep the session challenge and candidate until
+        acknowledgement verification has finished.
     */
     rc_pairing_clear_sensitive_memory(
         &loaded_config,
         sizeof(loaded_config));
 
-    /*
-        Remove transient challenge, candidate key and
-        proof material from the pairing session.
-    */
-    mathos_pairing_session_reset(
-        &rc_pairing_session);
-
-    rc_pairing_have_package = 0;
-
-    memset(
-        &rc_pairing_received_package,
-        0,
-        sizeof(rc_pairing_received_package));
-
-    /*
-        Publish SUCCESS only after Gateway authentication,
-        NVS verification, runtime-key installation and
-        sensitive session cleanup have all completed.
-    */
-    /*
-        The authenticated response was received and the
-        candidate was safely committed.
-    */
     rc_pairing_gateway_proof_timer_clear();
+    rc_pairing_result_wait_clear();
+
+    rc_pairing_session.state =
+        MATHOS_PAIRING_SESSION_WAIT_GATEWAY_RESULT;
+
+    esp_err_t wait_err =
+        rc_pairing_result_wait_start();
+
+    if (wait_err != ESP_OK)
+    {
+        return wait_err;
+    }
 
     mathos_maintenance_set_rc_pairing_status(
-        MATHOS_MAINTENANCE_RC_PAIRING_SUCCESS);
+        MATHOS_MAINTENANCE_RC_PAIRING_IN_PROGRESS);
 
     printf(
-        "[PAIRING] SUCCESS. "
-        "RC is paired and may reboot into normal mode.\n");
+        "[PAIRING] Local commit verified; "
+        "waiting for authenticated Gateway acknowledgement\n");
 
-    return ESP_OK;
+    /*
+        Send the first receipt now.
+        Later RX-loop polls perform bounded retries.
+    */
+    return rc_pairing_result_wait_poll();
+}
+
+/*
+    Called only by the pairing RX task once the
+    ownership handoff is connected.
+
+    Consumes at most one request per call.
+*/
+/*
+    RX-task-only consumer.
+
+    Returns 1 when the caller must discard its partial
+    UART frame because this request started or reset
+    a pairing attempt.
+*/
+static int rc_pairing_process_pending_request(void)
+{
+    if (rc_pairing_request_queue == NULL)
+    {
+        return 0;
+    }
+
+    /*
+        Publish readiness without exposing the session
+        itself to HTTP.
+
+        Preserve an admission already reserved by HTTP,
+        even if enqueueing has not completed yet.
+    */
+    int ready =
+        rc_pairing_session.active &&
+        rc_pairing_session.state ==
+            MATHOS_PAIRING_SESSION_CHALLENGE_READY &&
+        !mathos_pairing_session_has_timed_out(
+            &rc_pairing_session);
+
+    portENTER_CRITICAL(&rc_pairing_admission_lock);
+
+    if (rc_pairing_admission != RC_PAIRING_ADMISSION_QUEUED)
+    {
+        rc_pairing_admission =
+            ready
+                ? RC_PAIRING_ADMISSION_READY
+                : RC_PAIRING_ADMISSION_CLOSED;
+    }
+
+    portEXIT_CRITICAL(&rc_pairing_admission_lock);
+
+    rc_pairing_request_t *request = NULL;
+    int reset_parser = 0;
+
+    if (xQueueReceive(
+            rc_pairing_request_queue,
+            &request,
+            0) != pdPASS)
+    {
+        return 0;
+    }
+
+    /*
+        Keep admission closed throughout processing.
+        Only a later RX-loop iteration may reopen it.
+    */
+    portENTER_CRITICAL(&rc_pairing_admission_lock);
+    rc_pairing_admission = RC_PAIRING_ADMISSION_CLOSED;
+    portEXIT_CRITICAL(&rc_pairing_admission_lock);
+
+    if (request == NULL)
+    {
+        return 0;
+    }
+
+    if (!rc_pairing_session.active ||
+        rc_pairing_session.state !=
+            MATHOS_PAIRING_SESSION_CHALLENGE_READY)
+    {
+        printf(
+            "[PAIRING REQUEST] discarded: "
+            "session is not ready\n");
+
+        /*
+            Do not replace the status of a busy exchange.
+        */
+        if (!rc_pairing_session.active)
+        {
+            mathos_maintenance_set_rc_pairing_status(
+                MATHOS_MAINTENANCE_RC_PAIRING_FAILED);
+        }
+
+        goto cleanup;
+    }
+
+    int64_t now_us = esp_timer_get_time();
+
+    if (request->submitted_at_us <= 0 ||
+        now_us <= 0 ||
+        now_us < request->submitted_at_us ||
+        request->submitted_at_us <=
+            rc_pairing_session.started_at_us ||
+        (now_us - request->submitted_at_us) >=
+            ((int64_t)RC_PAIRING_REQUEST_MAX_AGE_MS * 1000LL))
+    {
+        printf(
+            "[PAIRING REQUEST] discarded: "
+            "stale request or invalid timestamp\n");
+
+        mathos_maintenance_set_rc_pairing_status(
+            MATHOS_MAINTENANCE_RC_PAIRING_FAILED);
+
+        goto cleanup;
+    }
+
+    if (mathos_pairing_session_has_timed_out(
+            &rc_pairing_session))
+    {
+        printf(
+            "[PAIRING REQUEST] rejected: "
+            "pairing session expired\n");
+
+        reset_parser = 1;
+        rc_pairing_result_wait_cleanup();
+
+        mathos_maintenance_set_rc_pairing_status(
+            MATHOS_MAINTENANCE_RC_PAIRING_FAILED);
+
+        goto cleanup;
+    }
+
+    reset_parser = 1;
+
+    mathos_maintenance_set_rc_pairing_status(
+        MATHOS_MAINTENANCE_RC_PAIRING_IN_PROGRESS);
+
+    esp_err_t err =
+        rc_pairing_prepare_and_send_proof(
+            request->passphrase);
+
+    if (err != ESP_OK)
+    {
+        printf(
+            "[PAIRING REQUEST] proof preparation "
+            "or transmission failed: %s\n",
+            esp_err_to_name(err));
+
+        /*
+            Preserve only an explicit, unexpired retry
+            returned by the shared pairing logic.
+        */
+        if (rc_pairing_session.active &&
+            rc_pairing_session.state ==
+                MATHOS_PAIRING_SESSION_CHALLENGE_READY &&
+            !mathos_pairing_session_has_timed_out(
+                &rc_pairing_session))
+        {
+            rc_pairing_gateway_proof_timer_clear();
+        }
+        else
+        {
+            rc_pairing_result_wait_cleanup();
+        }
+
+        mathos_maintenance_set_rc_pairing_status(
+            MATHOS_MAINTENANCE_RC_PAIRING_FAILED);
+    }
+
+cleanup:
+    rc_pairing_clear_sensitive_memory(
+        request,
+        sizeof(*request));
+
+    free(request);
+
+    return reset_parser;
+}
+
+/*
+    RX-task-only reservation for replacing a PACKAGE.
+
+    Closing admission and checking for a queued request
+    must happen together.
+*/
+static int rc_pairing_begin_package_update(void)
+{
+    if (rc_pairing_session.active &&
+        rc_pairing_session.state !=
+            MATHOS_PAIRING_SESSION_CHALLENGE_READY)
+    {
+        return 0;
+    }
+
+    portENTER_CRITICAL(&rc_pairing_admission_lock);
+
+    int allowed =
+        rc_pairing_admission != RC_PAIRING_ADMISSION_QUEUED;
+
+    if (allowed)
+    {
+        rc_pairing_admission = RC_PAIRING_ADMISSION_CLOSED;
+    }
+
+    portEXIT_CRITICAL(&rc_pairing_admission_lock);
+
+    return allowed;
 }
 
 static void rc_pairing_rx_task(
@@ -6042,6 +6808,11 @@ static void rc_pairing_rx_task(
 
     while (1)
     {
+        if (rc_pairing_process_pending_request())
+        {
+            frame_index = 0;
+            expected_frame_len = 0;
+        }
         int len =
             uart_read_bytes(
                 LINK_UART_PORT,
@@ -6089,7 +6860,37 @@ static void rc_pairing_rx_task(
 
             continue;
         }
+        /*
+            Service the RESULT deadline and retries on every
+            loop, including when UART is silent or carries junk.
+        */
+        if (rc_pairing_session.active &&
+            rc_pairing_session.state ==
+                MATHOS_PAIRING_SESSION_WAIT_GATEWAY_RESULT)
+        {
+            esp_err_t wait_err =
+                rc_pairing_result_wait_poll();
 
+            if (wait_err != ESP_OK)
+            {
+                printf(
+                    "[PAIRING] Gateway acknowledgement "
+                    "not confirmed error=%s attempts=%u; "
+                    "local records retained, no rollback performed\n",
+                    esp_err_to_name(wait_err),
+                    rc_pairing_result_wait.tx_attempts);
+
+                rc_pairing_result_wait_cleanup();
+
+                mathos_maintenance_set_rc_pairing_status(
+                    MATHOS_MAINTENANCE_RC_PAIRING_FAILED);
+
+                frame_index = 0;
+                expected_frame_len = 0;
+
+                continue;
+            }
+        }
         if (len <= 0)
         {
             continue;
@@ -6310,13 +7111,70 @@ static void rc_pairing_rx_task(
                 to its handshake message type.
             */
             if (decoded_header.message_type ==
-                MATHOS_PAIRING_MSG_PACKAGE)
+                MATHOS_PAIRING_MSG_RESULT)
+            {
+                esp_err_t result_err =
+                    rc_pairing_verify_gateway_commit_result(
+                        &decoded_header,
+                        payload,
+                        payload_len);
+
+                if (result_err == ESP_OK)
+                {
+                    printf(
+                        "[PAIRING RX] GATEWAY_COMMITTED RESULT "
+                        "AUTHENTICATED generation=%lu\n",
+                        (unsigned long)
+                            rc_pairing_session.key_generation);
+
+                    rc_pairing_session.state =
+                        MATHOS_PAIRING_SESSION_COMPLETE;
+
+                    rc_pairing_result_wait_cleanup();
+
+                    mathos_maintenance_set_rc_pairing_status(
+                        MATHOS_MAINTENANCE_RC_PAIRING_SUCCESS);
+
+                    printf(
+                        "[PAIRING] SUCCESS. "
+                        "Gateway acknowledgement verified. "
+                        "RC may reboot into normal mode.\n");
+                }
+                else
+                {
+                    printf(
+                        "[PAIRING RX] Gateway RESULT ignored "
+                        "error=%s\n",
+                        esp_err_to_name(result_err));
+                }
+            }
+            else if (rc_pairing_session.active &&
+                     rc_pairing_session.state ==
+                         MATHOS_PAIRING_SESSION_WAIT_GATEWAY_RESULT)
+            {
+                /*
+                    Do not let another pairing frame replace
+                    the session awaiting its acknowledgement.
+                */
+                printf(
+                    "[PAIRING RX] message type=%u ignored "
+                    "while awaiting Gateway RESULT\n",
+                    decoded_header.message_type);
+            }
+            else if (decoded_header.message_type ==
+                     MATHOS_PAIRING_MSG_PACKAGE)
             {
                 /*
                     PACKAGE must always be the first frame in the
                     pairing exchange.
                 */
-                if (decoded_header.sequence != 1U)
+                if (!rc_pairing_begin_package_update())
+                {
+                    printf(
+                        "[PAIRING RX] PACKAGE ignored: "
+                        "pairing request or exchange is busy\n");
+                }
+                else if (decoded_header.sequence != 1U)
                 {
                     printf(
                         "[PAIRING RX] PACKAGE rejected: "
@@ -6642,7 +7500,7 @@ static void rc_pairing_rx_task(
                                     The authenticated exchange
                                     reached a final commit failure.
                                 */
-                                rc_pairing_gateway_proof_timer_clear();
+                                rc_pairing_result_wait_cleanup();
 
                                 mathos_maintenance_set_rc_pairing_status(
                                     MATHOS_MAINTENANCE_RC_PAIRING_FAILED);
@@ -6686,6 +7544,7 @@ void gateway_status_rx_task(void *pvParameters)
 
     while (1)
     {
+
         int len = uart_read_bytes(
             LINK_UART_PORT,
             rx_buffer,
@@ -8658,26 +9517,34 @@ the pairing passphrase.
             LINK_UART_TX_PIN,
             LINK_UART_RX_PIN,
             LINK_UART_BAUD);
+
+        /*
+Prepare the request handoff before exposing
+the queued pairing callback in a later step.
+*/
+        rc_pairing_request_queue =
+            xQueueCreate(
+                1,
+                sizeof(rc_pairing_request_t *));
+
+        if (rc_pairing_request_queue == NULL)
+        {
+            printf(
+                "[MAINTENANCE] FATAL: failed to create "
+                "pairing request queue\n");
+
+            return;
+        }
         /*
             Pairing actions may become available only after
             the maintenance UART is ready.
         */
-        if (fleet_store_available)
-        {
-            mathos_maintenance_set_rc_pairing_callback(
-                rc_pairing_prepare_and_send_proof);
-        }
-        else
-        {
-            printf(
-                "[MAINTENANCE] Pairing disabled: "
-                "Fleet Store is unavailable\n");
-        }
+
         BaseType_t pairing_rx_task_result =
             xTaskCreate(
                 rc_pairing_rx_task,
                 "rc_pairing_rx_task",
-                4096,
+                8192,
                 NULL,
                 5,
                 NULL);
@@ -8694,7 +9561,17 @@ the pairing passphrase.
 
         printf(
             "[MAINTENANCE] Pairing RX task created\n");
-
+        if (fleet_store_available)
+        {
+            mathos_maintenance_set_rc_pairing_callback(
+                rc_pairing_enqueue_request);
+        }
+        else
+        {
+            printf(
+                "[MAINTENANCE] Pairing disabled: "
+                "Fleet Store is unavailable\n");
+        }
         char maintenance_ip[16] =
             "Unavailable";
 
