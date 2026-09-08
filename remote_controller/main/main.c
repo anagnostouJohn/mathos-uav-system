@@ -461,9 +461,12 @@ static int rc_pairing_have_package = 0;
 typedef struct
 {
     char passphrase[MATHOS_PAIRING_PASSPHRASE_MAX_LEN + 1U];
-    int64_t submitted_at_us;
-} rc_pairing_request_t;
 
+    mathos_device_uid_t expected_gateway_uid;
+
+    int64_t submitted_at_us;
+
+} rc_pairing_request_t;
 /*
     The queue will carry pointers to allocated requests.
 
@@ -5747,16 +5750,14 @@ static void rc_pairing_clear_sensitive_memory(
     a proof was transmitted or pairing succeeded.
 */
 static esp_err_t rc_pairing_enqueue_request(
-    const char *passphrase)
+    const char *passphrase,
+    const mathos_device_uid_t *expected_gateway_uid)
 {
-    if (passphrase == NULL)
+    if (passphrase == NULL ||
+        expected_gateway_uid == NULL ||
+        !mathos_device_uid_is_valid(expected_gateway_uid))
     {
         return ESP_ERR_INVALID_ARG;
-    }
-
-    if (rc_pairing_request_queue == NULL)
-    {
-        return ESP_ERR_INVALID_STATE;
     }
 
     size_t length = strnlen(
@@ -5801,6 +5802,7 @@ static esp_err_t rc_pairing_enqueue_request(
 
     request->passphrase[length] = '\0';
     request->submitted_at_us = submitted_at_us;
+    request->expected_gateway_uid = *expected_gateway_uid;
     /*
         Reserve admission before publishing the request.
         A busy or unavailable session cannot accept another.
@@ -5924,6 +5926,7 @@ static esp_err_t rc_pairing_send_commit_result_once(void)
     esp_err_t err = mathos_pairing_result_create(
         rc_runtime_pairing_config.root_key,
         &rc_pairing_session.challenge,
+        rc_pairing_session.rc_nonce,
         MATHOS_PAIRING_RESULT_RC_COMMITTED,
         &result);
 
@@ -6221,6 +6224,7 @@ static esp_err_t rc_pairing_verify_gateway_commit_result(
         err = mathos_pairing_result_verify(
             rc_runtime_pairing_config.root_key,
             &rc_pairing_session.challenge,
+            rc_pairing_session.rc_nonce,
             &gateway_result,
             MATHOS_PAIRING_RESULT_GATEWAY_COMMITTED);
     }
@@ -6623,6 +6627,16 @@ static int rc_pairing_process_pending_request(void)
         !mathos_pairing_session_has_timed_out(
             &rc_pairing_session);
 
+    /*
+        Publish the announced Gateway while its challenge
+        is ready for operator input.
+
+        The HTTP task reads this copy, never the session.
+    */
+    mathos_maintenance_set_rc_pairing_target(
+        ready
+            ? &rc_pairing_session.challenge.gateway_uid
+            : NULL);
     portENTER_CRITICAL(&rc_pairing_admission_lock);
 
     if (rc_pairing_admission != RC_PAIRING_ADMISSION_QUEUED)
@@ -6678,7 +6692,30 @@ static int rc_pairing_process_pending_request(void)
 
         goto cleanup;
     }
+    /*
+        The submitted selection must match the live session.
+        A stale form must never select a different Gateway.
+    */
+    if (!mathos_device_uid_is_valid(
+            &request->expected_gateway_uid) ||
+        memcmp(
+            request->expected_gateway_uid.bytes,
+            rc_pairing_session.challenge.gateway_uid.bytes,
+            MATHOS_DEVICE_UID_LEN) != 0 ||
+        memcmp(
+            request->expected_gateway_uid.bytes,
+            rc_pairing_session.package.gateway_uid.bytes,
+            MATHOS_DEVICE_UID_LEN) != 0)
+    {
+        printf(
+            "[PAIRING REQUEST] rejected: "
+            "selected Gateway UID does not match the session\n");
 
+        mathos_maintenance_set_rc_pairing_status(
+            MATHOS_MAINTENANCE_RC_PAIRING_FAILED);
+
+        goto cleanup;
+    }
     int64_t now_us = esp_timer_get_time();
 
     if (request->submitted_at_us <= 0 ||

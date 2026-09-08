@@ -11,6 +11,9 @@ idf_component_register(
         esp_netif
         esp_http_server
         nvs_flash
+         nvs_sec_provider
+         efuse
+         esp_partition
         mbedtls
         esp_timer
         esp_system

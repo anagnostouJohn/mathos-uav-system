@@ -1169,6 +1169,7 @@ static esp_err_t gateway_pairing_send_commit_result_once(void)
     err = mathos_pairing_result_create(
         saved_config.root_key,
         &gateway_pairing_session.challenge,
+        gateway_pairing_session.rc_nonce,
         MATHOS_PAIRING_RESULT_GATEWAY_COMMITTED,
         &result);
 
@@ -1598,6 +1599,7 @@ static void gateway_pairing_rx_task(
                     err = mathos_pairing_result_verify(
                         gateway_runtime_config.root_key,
                         &gateway_pairing_session.challenge,
+                        gateway_pairing_session.rc_nonce,
                         &rc_result,
                         MATHOS_PAIRING_RESULT_RC_COMMITTED);
                 }

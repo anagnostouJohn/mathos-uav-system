@@ -113,3 +113,85 @@ esp_err_t mathos_device_uid_format(
 
     return ESP_OK;
 }
+
+static int mathos_device_uid_hex_value(char character)
+{
+    if (character >= '0' && character <= '9')
+    {
+        return character - '0';
+    }
+
+    if (character >= 'A' && character <= 'F')
+    {
+        return character - 'A' + 10;
+    }
+
+    if (character >= 'a' && character <= 'f')
+    {
+        return character - 'a' + 10;
+    }
+
+    return -1;
+}
+
+esp_err_t mathos_device_uid_parse(
+    const char *text,
+    mathos_device_uid_t *uid)
+{
+    _Static_assert(
+        MATHOS_DEVICE_UID_TEXT_LEN ==
+            (3U * MATHOS_DEVICE_UID_LEN),
+        "UID text length must include separators and terminator");
+
+    if (text == NULL || uid == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Require the complete colon-separated representation.
+        Reject truncated input, trailing text and whitespace.
+    */
+    if (strnlen(text, MATHOS_DEVICE_UID_TEXT_LEN) !=
+        (MATHOS_DEVICE_UID_TEXT_LEN - 1U))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    mathos_device_uid_t candidate = {0};
+
+    for (size_t i = 0; i < MATHOS_DEVICE_UID_LEN; ++i)
+    {
+        size_t offset = i * 3U;
+
+        int high = mathos_device_uid_hex_value(text[offset]);
+        int low = mathos_device_uid_hex_value(text[offset + 1U]);
+
+        if (high < 0 || low < 0)
+        {
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        if ((i + 1U) < MATHOS_DEVICE_UID_LEN &&
+            text[offset + 2U] != ':')
+        {
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        candidate.bytes[i] =
+            (uint8_t)((high << 4) | low);
+    }
+
+    if (!mathos_device_uid_is_valid(&candidate))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Publish only the fully validated UID.
+        On failure, the caller's output remains unchanged.
+    */
+    *uid = candidate;
+
+    return ESP_OK;
+}
