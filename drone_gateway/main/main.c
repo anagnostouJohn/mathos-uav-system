@@ -82,13 +82,17 @@ static const char *TAG = "DRONE_GATEWAY";
 #define FEATURE_DRY_RUN_ARMING          1
 #define FEATURE_REAL_MAVLINK_ARMING     1
 #define GATEWAY_RC_SESSION_HISTORY_LEN 16
-#define GATEWAY_FAILSAFE_ACTION_BENCH_DISARM    1
-#define GATEWAY_FAILSAFE_ACTION_FLIGHT_RTL      2
+/*
+    Development override:
+    1 = use bench DISARM regardless of the saved policy.
+    0 = use gateway_runtime_config.failsafe_policy.
+*/
+#define FEATURE_BENCH_FAILSAFE_REAL_DISARM 1
 
-#define GATEWAY_FAILSAFE_ACTION_MODE            GATEWAY_FAILSAFE_ACTION_BENCH_DISARM
-
-#define FEATURE_BENCH_FAILSAFE_REAL_DISARM \
-    (GATEWAY_FAILSAFE_ACTION_MODE == GATEWAY_FAILSAFE_ACTION_BENCH_DISARM)
+#if FEATURE_BENCH_FAILSAFE_REAL_DISARM != 0 && \
+    FEATURE_BENCH_FAILSAFE_REAL_DISARM != 1
+#error "FEATURE_BENCH_FAILSAFE_REAL_DISARM must be 0 or 1"
+#endif
 
 #define GATEWAY_RC_FAILSAFE_DISARM_TIMEOUT_MS   1000
 #define GATEWAY_FC_FAILSAFE_DISARM_TIMEOUT_MS   3000
@@ -2722,7 +2726,55 @@ static bool gateway_start_rtl_for_safety(
 
 #endif
 }
+/*
+    Select an action using the explicit bench override or
+    the validated configuration loaded at boot.
 
+    A true return means an action was requested.
+    It does not confirm that the FC executed it.
+*/
+static bool gateway_apply_failsafe_action(const char *reason)
+{
+    if (reason == NULL) {
+        reason = "unknown";
+    }
+
+#if !FEATURE_REAL_MAVLINK_ARMING
+    ESP_LOGW(TAG, "SAFETY action dry/disabled reason=%s", reason);
+    gateway_action_publish(GATEWAY_ACTION_FAILSAFE_DRY_RUN);
+    return false;
+#elif FEATURE_BENCH_FAILSAFE_REAL_DISARM
+    return gateway_start_real_disarm_for_safety(reason);
+#else
+    /*
+        Remove our stick overrides before handing control
+        back to the FC or requesting a flight-mode change.
+    */
+    send_rc_release();
+
+    switch (gateway_runtime_config.failsafe_policy) {
+    case MATHOS_GATEWAY_FAILSAFE_FC_NATIVE:
+        ESP_LOGW(
+            TAG,
+            "SAFETY FC_NATIVE: RC override release requested "
+            "reason=%s",
+            reason);
+        return true;
+
+    case MATHOS_GATEWAY_FAILSAFE_RTL:
+        return gateway_start_rtl_for_safety(reason);
+
+    default:
+        ESP_LOGE(
+            TAG,
+            "SAFETY invalid saved policy=%u; "
+            "RC override release requested reason=%s",
+            (unsigned int)gateway_runtime_config.failsafe_policy,
+            reason);
+        return false;
+    }
+#endif
+}
 static void gateway_failsafe_safety_check(void)
 {
 #if FEATURE_REAL_MAVLINK_ARMING
@@ -2764,15 +2816,7 @@ static void gateway_failsafe_safety_check(void)
     if (rc_requested_failsafe) {
         gateway_safety_disarm_latched = true;
 
-#if GATEWAY_FAILSAFE_ACTION_MODE == GATEWAY_FAILSAFE_ACTION_BENCH_DISARM
-        gateway_start_real_disarm_for_safety(
-            "RC state FAILSAFE"
-        );
-#elif GATEWAY_FAILSAFE_ACTION_MODE == GATEWAY_FAILSAFE_ACTION_FLIGHT_RTL
-        gateway_start_rtl_for_safety(
-            "RC state FAILSAFE"
-        );
-#endif
+    gateway_apply_failsafe_action("RC state FAILSAFE");
 
         return;
     }
@@ -2781,15 +2825,7 @@ static void gateway_failsafe_safety_check(void)
         gateway_last_remote_state = RC_FAILSAFE;
         gateway_safety_disarm_latched = true;
 
-#if GATEWAY_FAILSAFE_ACTION_MODE == GATEWAY_FAILSAFE_ACTION_BENCH_DISARM
-        gateway_start_real_disarm_for_safety(
-            "RC link timeout"
-        );
-#elif GATEWAY_FAILSAFE_ACTION_MODE == GATEWAY_FAILSAFE_ACTION_FLIGHT_RTL
-        gateway_start_rtl_for_safety(
-            "RC link timeout"
-        );
-#endif
+        gateway_apply_failsafe_action("RC link timeout");
 
         return;
     }
@@ -2798,15 +2834,7 @@ static void gateway_failsafe_safety_check(void)
         gateway_last_remote_state = RC_FAILSAFE;
         gateway_safety_disarm_latched = true;
 
-#if GATEWAY_FAILSAFE_ACTION_MODE == GATEWAY_FAILSAFE_ACTION_BENCH_DISARM
-        gateway_start_real_disarm_for_safety(
-            "FC heartbeat timeout"
-        );
-#elif GATEWAY_FAILSAFE_ACTION_MODE == GATEWAY_FAILSAFE_ACTION_FLIGHT_RTL
-        gateway_start_rtl_for_safety(
-            "FC heartbeat timeout"
-        );
-#endif
+        gateway_apply_failsafe_action("FC heartbeat timeout");
 
         return;
     }
@@ -2975,21 +3003,8 @@ static void gateway_process_rc_state_action(
             gateway_session_recovery_required = true;
             gateway_safety_disarm_latched = true;
 
-        #if GATEWAY_FAILSAFE_ACTION_MODE == \
-            GATEWAY_FAILSAFE_ACTION_BENCH_DISARM
-
-            gateway_start_real_disarm_for_safety(
-                "RC new session while FC armed"
-            );
-
-        #elif GATEWAY_FAILSAFE_ACTION_MODE == \
-            GATEWAY_FAILSAFE_ACTION_FLIGHT_RTL
-
-            gateway_start_rtl_for_safety(
-                "RC new session while FC armed"
-            );
-
-        #endif
+            gateway_apply_failsafe_action(
+                "RC new session while FC armed");
 
             ESP_LOGW(
                 TAG,
@@ -3320,15 +3335,8 @@ else if (packet->state == RC_DISARMED) {
         if (fc_is_armed) {
             gateway_safety_disarm_latched = true;
 
-#if GATEWAY_FAILSAFE_ACTION_MODE == GATEWAY_FAILSAFE_ACTION_BENCH_DISARM
-            gateway_start_real_disarm_for_safety(
-                "RC state changed to FAILSAFE"
-            );
-#elif GATEWAY_FAILSAFE_ACTION_MODE == GATEWAY_FAILSAFE_ACTION_FLIGHT_RTL
-            gateway_start_rtl_for_safety(
-                "RC state changed to FAILSAFE"
-            );
-#endif
+            gateway_apply_failsafe_action(
+                "RC state changed to FAILSAFE");
         }
 #else
         gateway_action_publish(GATEWAY_ACTION_FAILSAFE_DRY_RUN);
@@ -3763,9 +3771,12 @@ static void mavlink_tx_task(void *arg)
             age_ms = (now_us - last_good_packet_time_us) / 1000;
         }
 
+        const bool fc_fresh = fc_heartbeat_is_fresh();
+
         if (have_packet &&
             age_ms <= RC_PACKET_TIMEOUT_MS &&
             latest_packet.state == RC_ARMED &&
+            fc_fresh &&
             !gateway_session_recovery_required) {
             send_rc_override_from_packet(&latest_packet);
             released = false;
@@ -3787,6 +3798,16 @@ static void mavlink_tx_task(void *arg)
                         "RC state is %s. Releasing RC override.",
                         mathos_rc_state_to_string(latest_packet.state)
                     );
+                }
+                else if (!fc_fresh) {
+                    ESP_LOGW(
+                        TAG,
+                        "FC heartbeat is not fresh. Releasing RC override.");
+                }
+                else if (gateway_session_recovery_required) {
+                    ESP_LOGW(
+                        TAG,
+                        "Session recovery required. Releasing RC override.");
                 }
                 else {
                     ESP_LOGW(TAG, "RC override released for unknown reason.");
@@ -5214,7 +5235,29 @@ ESP_LOGI(
         ? 1U
         : 0U,
     gateway_runtime_config.configuration_counter);
+const char *saved_failsafe_name =
+    gateway_runtime_config.failsafe_policy ==
+            MATHOS_GATEWAY_FAILSAFE_FC_NATIVE
+        ? "FC_NATIVE"
+        : gateway_runtime_config.failsafe_policy ==
+                  MATHOS_GATEWAY_FAILSAFE_RTL
+              ? "RTL"
+              : "INVALID";
 
+#if !FEATURE_REAL_MAVLINK_ARMING
+const char *effective_failsafe_name = "DRY_RUN";
+#elif FEATURE_BENCH_FAILSAFE_REAL_DISARM
+const char *effective_failsafe_name = "BENCH_DISARM";
+#else
+const char *effective_failsafe_name = saved_failsafe_name;
+#endif
+
+ESP_LOGW(
+    TAG,
+    "FAILSAFE POLICY saved=%s effective=%s bench_override=%u",
+    saved_failsafe_name,
+    effective_failsafe_name,
+    (unsigned int)FEATURE_BENCH_FAILSAFE_REAL_DISARM);
 if (!gateway_runtime_config_loaded_from_nvs ||
     gateway_runtime_config.key_generation == 0)
 {

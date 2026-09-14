@@ -1,3 +1,16 @@
+# Target MCU
+CONFIG_IDF_TARGET="esp32s3"
+
+# Flash capacity required by the current RC partition layout
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
+# RC storage and application partitions
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+CONFIG_PARTITION_TABLE_MD5=y
+
+# Operational authenticated encryption
 CONFIG_MBEDTLS_CHACHA20_C=y
 CONFIG_MBEDTLS_POLY1305_C=y
 CONFIG_MBEDTLS_CHACHAPOLY_C=y
