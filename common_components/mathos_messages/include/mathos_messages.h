@@ -26,9 +26,88 @@
 /*
     Encrypted Mathos payload types.
 */
-#define SECURITY_PAYLOAD_TYPE_RC                1U
-#define SECURITY_PAYLOAD_TYPE_GATEWAY_STATUS    2U
-#define SECURITY_PAYLOAD_TYPE_GATEWAY_TELEMETRY 3U
+#define SECURITY_PAYLOAD_TYPE_RC                 1U
+#define SECURITY_PAYLOAD_TYPE_GATEWAY_STATUS     2U
+#define SECURITY_PAYLOAD_TYPE_GATEWAY_TELEMETRY  3U
+
+/*
+    Operational session establishment.
+
+    These packets are authenticated with the persistent
+    Pair Key. Normal control/status/telemetry will later
+    switch to the derived directional session keys.
+*/
+#define SECURITY_PAYLOAD_TYPE_SESSION_HELLO      4U
+#define SECURITY_PAYLOAD_TYPE_SESSION_CONFIRM    5U
+#define MATHOS_SESSION_PROTOCOL_VERSION 1U
+
+
+typedef enum
+{
+    MATHOS_SESSION_ROLE_INVALID = 0,
+    MATHOS_SESSION_ROLE_RC = 1,
+    MATHOS_SESSION_ROLE_GATEWAY = 2
+
+} mathos_session_role_t;
+
+
+/*
+    First stage of operational session establishment.
+
+    Gateway sends its persistent transmit-session ID.
+    RC answers with its own persistent transmit-session ID
+    while echoing the Gateway session ID.
+
+    Both session IDs ultimately participate in directional
+    operational-key derivation.
+*/
+typedef struct __attribute__((packed))
+{
+    uint32_t rc_session_id;
+    uint32_t gateway_session_id;
+
+    uint8_t sender_role;
+    uint8_t protocol_version;
+
+    uint8_t reserved[2];
+
+} mathos_session_hello_t;
+
+
+/*
+    Final acknowledgement of the session pair.
+
+    A SESSION_CONFIRM is accepted only when both IDs exactly
+    match the session currently being established.
+
+    Once confirmed, both sides may derive:
+
+        RC -> Gateway key
+        Gateway -> RC key
+*/
+typedef struct __attribute__((packed))
+{
+    uint32_t rc_session_id;
+    uint32_t gateway_session_id;
+
+    uint8_t sender_role;
+    uint8_t protocol_version;
+
+    uint8_t reserved[2];
+
+} mathos_session_confirm_t;
+
+
+_Static_assert(
+    sizeof(mathos_session_hello_t) == 12,
+    "mathos_session_hello_t size mismatch"
+);
+
+_Static_assert(
+    sizeof(mathos_session_confirm_t) == 12,
+    "mathos_session_confirm_t size mismatch"
+);
+
 typedef enum
 {
     RC_DISARMED = 0,

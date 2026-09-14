@@ -539,6 +539,27 @@ volatile uint8_t fc_base_mode = 0;
 volatile uint8_t fc_system_status = 0;
 volatile uint32_t fc_custom_mode = 0;
 static uint32_t mathos_session_id = 1;
+#define RC_SESSION_HELLO_PERIOD_MS 1000U
+
+static uint32_t
+    rc_session_hello_tx_sequence = 1;
+/*
+    Authenticated Gateway operational-session candidate.
+
+    This does NOT mean session establishment is complete.
+*/
+static volatile uint32_t
+    gateway_session_candidate_id = 0;
+
+static volatile int
+    gateway_session_candidate_valid = 0;
+    /*
+    True only after an authenticated SESSION_CONFIRM
+    for the exact current R,G pair has been verified
+    and the directional keys have been derived.
+*/
+static volatile int
+    rc_operational_session_ready = 0;
 static gateway_status_packet_t gateway_status_snapshot = {0};
 static gateway_telemetry_packet_t gateway_telemetry_snapshot = {0};
 static uint32_t gateway_session_history[GATEWAY_SESSION_HISTORY_LEN] = {0};
@@ -4895,6 +4916,362 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
 
         return;
     }
+/*
+    Operational SESSION_HELLO is authenticated with the
+    persistent Pair Key.
+
+    Process it before the ordinary Gateway status/telemetry
+    replay state machine because it establishes the new
+    operational session itself.
+*/
+if (packet.payload_type ==
+    SECURITY_PAYLOAD_TYPE_SESSION_HELLO)
+{
+    if (packet.payload_len !=
+        sizeof(mathos_session_hello_t))
+    {
+        bad_count++;
+
+        printf(
+            "[SESSION] HELLO bad length=%u expected=%u\n",
+            packet.payload_len,
+            (unsigned int)
+                sizeof(mathos_session_hello_t));
+
+        return;
+    }
+
+    mathos_session_hello_t hello;
+
+    memset(
+        &hello,
+        0,
+        sizeof(hello));
+
+    memcpy(
+        &hello,
+        packet.payload,
+        sizeof(hello));
+
+    if (hello.protocol_version !=
+        MATHOS_SESSION_PROTOCOL_VERSION)
+    {
+        bad_count++;
+
+        printf(
+            "[SESSION] HELLO protocol mismatch got=%u expected=%u\n",
+            hello.protocol_version,
+            MATHOS_SESSION_PROTOCOL_VERSION);
+
+        return;
+    }
+
+    if (hello.sender_role !=
+        MATHOS_SESSION_ROLE_GATEWAY)
+    {
+        bad_count++;
+
+        printf(
+            "[SESSION] HELLO bad sender role=%u\n",
+            hello.sender_role);
+
+        return;
+    }
+
+    /*
+        Gateway does not know the RC session yet.
+    */
+    if (hello.rc_session_id != 0)
+    {
+        bad_count++;
+
+        printf(
+            "[SESSION] HELLO invalid RC session=%lu\n",
+            (unsigned long)
+                hello.rc_session_id);
+
+        return;
+    }
+
+    if (hello.gateway_session_id == 0)
+    {
+        bad_count++;
+
+        printf(
+            "[SESSION] HELLO invalid Gateway session=0\n");
+
+        return;
+    }
+
+    /*
+        Bind the authenticated outer header to the
+        session identifier inside the HELLO.
+    */
+    if (hello.gateway_session_id !=
+        packet.timestamp_ms)
+    {
+        bad_count++;
+
+        printf(
+            "[SESSION] HELLO session mismatch "
+            "payload=%lu header=%lu\n",
+            (unsigned long)
+                hello.gateway_session_id,
+            (unsigned long)
+                packet.timestamp_ms);
+
+        return;
+    }
+
+    /*
+        Sequence zero is never valid.
+    */
+    if (packet.sequence == 0)
+    {
+        bad_count++;
+
+        printf(
+            "[SESSION] HELLO invalid sequence=0\n");
+
+        return;
+    }
+/*
+    Persistent rollback protection comes next.
+
+    For now also refuse rollback during this RC uptime.
+*/
+if (gateway_session_candidate_valid &&
+    hello.gateway_session_id <
+        gateway_session_candidate_id)
+{
+    bad_count++;
+
+    printf(
+        "[SESSION] Gateway session rollback rejected "
+        "current=%lu received=%lu\n",
+        (unsigned long)
+            gateway_session_candidate_id,
+        (unsigned long)
+            hello.gateway_session_id);
+
+    return;
+}
+    /*
+        A different authenticated Gateway session means
+        any old derived session keys must no longer be used.
+    */
+if (!gateway_session_candidate_valid ||
+    gateway_session_candidate_id !=
+        hello.gateway_session_id)
+{
+    rc_operational_session_ready = 0;
+
+    mathos_secure_clear_session_keys();
+
+        gateway_session_candidate_id =
+            hello.gateway_session_id;
+
+        gateway_session_candidate_valid =
+            1;
+
+        printf(
+            "[SESSION] Gateway HELLO authenticated "
+            "gateway_session=%lu "
+            "rc_session=%lu\n",
+            (unsigned long)
+                gateway_session_candidate_id,
+            (unsigned long)
+                mathos_session_id);
+    }
+
+    /*
+        SESSION_HELLO is not ordinary telemetry/status.
+    */
+    return;
+}
+
+/*
+    Gateway confirmation of the exact operational
+    RC/Gateway session pair.
+
+    SESSION_CONFIRM is authenticated with the persistent
+    Pair Key. Only after validating it do we derive the
+    temporary directional session keys on the RC.
+*/
+if (packet.payload_type ==
+    SECURITY_PAYLOAD_TYPE_SESSION_CONFIRM)
+{
+    if (packet.payload_len !=
+        sizeof(mathos_session_confirm_t))
+    {
+        bad_count++;
+
+        printf(
+            "[SESSION] CONFIRM bad length=%u expected=%u\n",
+            packet.payload_len,
+            (unsigned int)
+                sizeof(mathos_session_confirm_t));
+
+        return;
+    }
+
+    mathos_session_confirm_t confirm;
+
+    memset(
+        &confirm,
+        0,
+        sizeof(confirm));
+
+    memcpy(
+        &confirm,
+        packet.payload,
+        sizeof(confirm));
+
+    if (confirm.protocol_version !=
+        MATHOS_SESSION_PROTOCOL_VERSION)
+    {
+        bad_count++;
+
+        printf(
+            "[SESSION] CONFIRM protocol mismatch "
+            "got=%u expected=%u\n",
+            confirm.protocol_version,
+            MATHOS_SESSION_PROTOCOL_VERSION);
+
+        return;
+    }
+
+    if (confirm.sender_role !=
+        MATHOS_SESSION_ROLE_GATEWAY)
+    {
+        bad_count++;
+
+        printf(
+            "[SESSION] CONFIRM bad sender role=%u\n",
+            confirm.sender_role);
+
+        return;
+    }
+
+    if (!gateway_session_candidate_valid ||
+        gateway_session_candidate_id == 0)
+    {
+        bad_count++;
+
+        printf(
+            "[SESSION] CONFIRM rejected: "
+            "no authenticated Gateway candidate\n");
+
+        return;
+    }
+
+    if (confirm.rc_session_id !=
+        mathos_session_id)
+    {
+        bad_count++;
+
+        printf(
+            "[SESSION] CONFIRM wrong RC session "
+            "received=%lu local=%lu\n",
+            (unsigned long)
+                confirm.rc_session_id,
+            (unsigned long)
+                mathos_session_id);
+
+        return;
+    }
+
+    if (confirm.gateway_session_id !=
+        gateway_session_candidate_id)
+    {
+        bad_count++;
+
+        printf(
+            "[SESSION] CONFIRM wrong Gateway session "
+            "received=%lu expected=%lu\n",
+            (unsigned long)
+                confirm.gateway_session_id,
+            (unsigned long)
+                gateway_session_candidate_id);
+
+        return;
+    }
+
+    /*
+        Bind the authenticated outer Gateway session
+        to the value inside the confirmation payload.
+    */
+    if (packet.timestamp_ms !=
+        confirm.gateway_session_id)
+    {
+        bad_count++;
+
+        printf(
+            "[SESSION] CONFIRM header mismatch "
+            "header=%lu payload=%lu\n",
+            (unsigned long)
+                packet.timestamp_ms,
+            (unsigned long)
+                confirm.gateway_session_id);
+
+        return;
+    }
+
+    if (packet.sequence == 0)
+    {
+        bad_count++;
+
+        printf(
+            "[SESSION] CONFIRM invalid sequence=0\n");
+
+        return;
+    }
+
+    /*
+        A repeated authentic confirmation for the exact
+        established session is harmless.
+    */
+    if (rc_operational_session_ready &&
+        mathos_secure_session_keys_are_set())
+    {
+        return;
+    }
+
+    rc_operational_session_ready = 0;
+
+    mathos_secure_clear_session_keys();
+
+    mathos_secure_status_t session_status =
+        mathos_secure_derive_session_keys(
+            confirm.rc_session_id,
+            confirm.gateway_session_id,
+            MATHOS_SECURE_ROLE_RC);
+
+    if (session_status !=
+        MATHOS_SECURE_STATUS_OK)
+    {
+        mathos_secure_clear_session_keys();
+
+        printf(
+            "[SESSION] RC key derivation failed: %s\n",
+            mathos_secure_status_to_string(
+                session_status));
+
+        return;
+    }
+
+    rc_operational_session_ready = 1;
+
+    printf(
+        "[SESSION] READY "
+        "rc=%lu gateway=%lu\n",
+        (unsigned long)
+            confirm.rc_session_id,
+        (unsigned long)
+            confirm.gateway_session_id);
+
+    return;
+}
 
     uint32_t session_id =
         packet.timestamp_ms;
@@ -4902,8 +5279,8 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
     /*
         Session zero is never valid.
 
-        The gateway generates a nonzero random session
-        identifier during boot.
+        The Gateway reserves a nonzero persistent monotonic
+        session identifier during boot.
     */
     if (session_id == 0)
     {
@@ -7913,11 +8290,144 @@ void controller_task(void *pvParameters)
     }
 }
 
+static bool rc_session_hello_send_once(void)
+{
+    if (!gateway_session_candidate_valid ||
+        gateway_session_candidate_id == 0 ||
+        mathos_session_id == 0)
+    {
+        return false;
+    }
+
+    /*
+        Do not wrap and reuse a Pair-Key nonce.
+    */
+    if (rc_session_hello_tx_sequence == 0)
+    {
+        printf(
+            "[SESSION] RC HELLO TX blocked: "
+            "sequence exhausted\n");
+
+        return false;
+    }
+
+    mathos_session_hello_t hello;
+
+    memset(
+        &hello,
+        0,
+        sizeof(hello));
+
+    hello.rc_session_id =
+        mathos_session_id;
+
+    hello.gateway_session_id =
+        gateway_session_candidate_id;
+
+    hello.sender_role =
+        MATHOS_SESSION_ROLE_RC;
+
+    hello.protocol_version =
+        MATHOS_SESSION_PROTOCOL_VERSION;
+
+    mathos_secure_packet_t packet;
+
+    memset(
+        &packet,
+        0,
+        sizeof(packet));
+
+    packet.sequence =
+        rc_session_hello_tx_sequence++;
+
+    /*
+        Outer session ID belongs to the sender.
+    */
+    packet.timestamp_ms =
+        mathos_session_id;
+
+    packet.controller_id =
+        rc_runtime_pairing_config.rc_id;
+
+    packet.link_id =
+        (uint8_t)read_link_mode_switch();
+
+    packet.payload_type =
+        SECURITY_PAYLOAD_TYPE_SESSION_HELLO;
+
+    packet.payload_len =
+        sizeof(hello);
+
+    memcpy(
+        packet.payload,
+        &hello,
+        sizeof(hello));
+
+    /*
+        The handshake is still authenticated using the
+        persistent Pair Key.
+    */
+    mathos_secure_status_t crypto_status =
+        mathos_secure_encrypt_packet(
+            &packet);
+
+    if (crypto_status !=
+        MATHOS_SECURE_STATUS_OK)
+    {
+        printf(
+            "[SESSION] RC HELLO encrypt failed: %s\n",
+            mathos_secure_status_to_string(
+                crypto_status));
+
+        return false;
+    }
+
+    uint8_t frame[
+        MATHOS_WIRE_MAX_FRAME_LEN];
+
+    size_t frame_len = 0;
+
+    mathos_status_t encode_status =
+        mathos_wire_encode(
+            &packet,
+            frame,
+            sizeof(frame),
+            &frame_len);
+
+    if (encode_status !=
+        MATHOS_STATUS_OK)
+    {
+        printf(
+            "[SESSION] RC HELLO encode failed: %s\n",
+            mathos_status_to_string(
+                encode_status));
+
+        return false;
+    }
+
+#if FEATURE_LINK_UART_TX
+
+    if (!link_uart_send_frame(
+            frame,
+            frame_len))
+    {
+        printf(
+            "[SESSION] RC HELLO UART TX failed\n");
+
+        return false;
+    }
+
+#endif
+
+    return true;
+}
+
 void radio_tx_task(void *pvParameters)
 {
 
     TickType_t last_wake = xTaskGetTickCount();
     const TickType_t period = pdMS_TO_TICKS(RADIO_TX_PERIOD_MS);
+    TickType_t last_session_hello_tick = 0;
 
     while (1)
     {
@@ -7954,7 +8464,41 @@ void radio_tx_task(void *pvParameters)
 
             continue;
         }
+/*
+    Once an authenticated Gateway HELLO has been seen,
+    answer periodically until complete session-key
+    establishment is confirmed.
+*/
+if (gateway_session_candidate_valid &&
+    !rc_operational_session_ready)
+{
+    TickType_t now_tick =
+        xTaskGetTickCount();
 
+    if (last_session_hello_tick == 0 ||
+        (now_tick -
+         last_session_hello_tick) >=
+            pdMS_TO_TICKS(
+                RC_SESSION_HELLO_PERIOD_MS))
+    {
+        bool hello_ok =
+            rc_session_hello_send_once();
+
+        if (hello_ok)
+        {
+            printf(
+                "[SESSION] RC HELLO TX "
+                "rc=%lu gateway=%lu\n",
+                (unsigned long)
+                    mathos_session_id,
+                (unsigned long)
+                    gateway_session_candidate_id);
+        }
+
+        last_session_hello_tick =
+            now_tick;
+    }
+}
 #endif
         rc_input_t input_snapshot;
         TickType_t input_last_update;
@@ -9915,8 +10459,34 @@ the queued pairing callback in a later step.
         Generate a new nonzero controller session
         identifier for this boot.
     */
-    mathos_session_id =
-        esp_random();
+/*
+    Reserve the next persistent controller session.
+
+    The Fleet partition also holds the currently selected
+    aircraft's persistent operational authority, so the
+    session counter lives in the same persistence domain.
+*/
+mathos_secure_status_t tx_session_status =
+    mathos_secure_reserve_session_id(
+        MATHOS_FLEET_PARTITION_NAME,
+        &mathos_session_id);
+
+if (tx_session_status !=
+    MATHOS_SECURE_STATUS_OK)
+{
+    printf(
+        "[SECURITY] FATAL: persistent TX session "
+        "reservation failed: %s\n",
+        mathos_secure_status_to_string(
+            tx_session_status));
+
+    mathos_secure_clear_key();
+    return;
+}
+
+printf(
+    "[SECURITY] persistent session_id=%lu\n",
+    (unsigned long)mathos_session_id);
 
     if (mathos_session_id == 0)
     {

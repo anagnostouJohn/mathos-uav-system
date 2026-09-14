@@ -47,7 +47,6 @@ static const char *TAG = "DRONE_GATEWAY";
 
 #define RC_PACKET_QUEUE_LEN    1
 
-#define RC_PACKET_TIMEOUT_MS   250
 #define MAVLINK_SEND_PERIOD_MS 50
 #define HEARTBEAT_PERIOD_MS    1000
 #define HEALTH_PERIOD_MS       1000
@@ -162,6 +161,19 @@ static volatile uint8_t gateway_last_action_repeat_remaining = 0;
 static portMUX_TYPE gateway_action_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t gateway_status_tx_sequence = 1;
 static uint32_t gateway_status_session_id = 1;
+/*
+    Authenticated RC session participating in the current
+    operational session-key derivation.
+*/
+static volatile uint32_t
+    gateway_authenticated_rc_session_id = 0;
+
+static volatile bool
+    gateway_session_keys_ready = false;
+static uint32_t gateway_session_hello_tx_sequence = 1;
+static uint32_t gateway_session_confirm_tx_sequence = 1;
+#define GATEWAY_SESSION_HELLO_PERIOD_MS 1000
+
 static volatile uint32_t replay_packets = 0;
 static uint32_t gateway_rc_session_history[ GATEWAY_RC_SESSION_HISTORY_LEN ] = {0};
 
@@ -2103,6 +2115,8 @@ static void gateway_process_rc_state_action(const rc_packet_t *packet,bool new_s
 static void gateway_session_recovery_check(const rc_packet_t *packet);
 static bool gateway_status_send_once(void);
 static bool gateway_telemetry_send_once(void);
+static bool gateway_session_hello_send_once(void);
+static bool gateway_session_confirm_send_once(void);
 static bool gateway_send_rtl_command(void);
 static bool gateway_start_rtl_for_safety(const char *reason);
 static void gateway_rtl_timeout_check(void);
@@ -2210,7 +2224,8 @@ static bool fc_heartbeat_is_fresh(void)
     int64_t now_us = esp_timer_get_time();
     int64_t age_ms = (now_us - last_fc_heartbeat_us) / 1000;
 
-    return age_ms <= 1500;
+    return age_ms <=
+    (int64_t)gateway_runtime_config.fc_heartbeat_timeout_ms;
 }
 static int64_t gateway_remote_link_age_ms(void)
 {
@@ -2242,7 +2257,8 @@ static bool gateway_remote_link_is_fresh(void)
     int64_t now_us = esp_timer_get_time();
     int64_t age_ms = (now_us - gateway_last_remote_packet_time_us) / 1000;
 
-    return age_ms <= RC_PACKET_TIMEOUT_MS;
+   return age_ms <=
+    (int64_t)gateway_runtime_config.rc_packet_timeout_ms;
 }
 static void gateway_session_recovery_check(
     const rc_packet_t *packet)
@@ -3455,7 +3471,243 @@ if (packet.controller_id !=
 
     return;
 }
+/*
+    RC response to Gateway SESSION_HELLO.
 
+    This message is authenticated with the persistent
+    Pair Key because directional session keys do not
+    exist until this exchange succeeds.
+*/
+if (packet.payload_type ==
+    SECURITY_PAYLOAD_TYPE_SESSION_HELLO)
+{
+    if (packet.payload_len !=
+        sizeof(mathos_session_hello_t))
+    {
+        bad_packets++;
+
+        ESP_LOGW(
+            TAG,
+            "SESSION RC_HELLO bad length=%u expected=%u",
+            packet.payload_len,
+            (unsigned int)
+                sizeof(mathos_session_hello_t));
+
+        return;
+    }
+
+    mathos_session_hello_t hello;
+
+    memset(
+        &hello,
+        0,
+        sizeof(hello));
+
+    memcpy(
+        &hello,
+        packet.payload,
+        sizeof(hello));
+
+    if (hello.protocol_version !=
+        MATHOS_SESSION_PROTOCOL_VERSION)
+    {
+        bad_packets++;
+
+        ESP_LOGW(
+            TAG,
+            "SESSION RC_HELLO protocol mismatch "
+            "got=%u expected=%u",
+            hello.protocol_version,
+            MATHOS_SESSION_PROTOCOL_VERSION);
+
+        return;
+    }
+
+    if (hello.sender_role !=
+        MATHOS_SESSION_ROLE_RC)
+    {
+        bad_packets++;
+
+        ESP_LOGW(
+            TAG,
+            "SESSION RC_HELLO bad role=%u",
+            hello.sender_role);
+
+        return;
+    }
+
+    if (hello.rc_session_id == 0 ||
+        hello.gateway_session_id == 0)
+    {
+        bad_packets++;
+
+        ESP_LOGW(
+            TAG,
+            "SESSION RC_HELLO zero session "
+            "rc=%" PRIu32 " gateway=%" PRIu32,
+            hello.rc_session_id,
+            hello.gateway_session_id);
+
+        return;
+    }
+
+    /*
+        The Gateway only accepts a response for its
+        current persistent boot session.
+    */
+    if (hello.gateway_session_id !=
+        gateway_status_session_id)
+    {
+        bad_packets++;
+
+        ESP_LOGW(
+            TAG,
+            "SESSION RC_HELLO wrong Gateway session "
+            "received=%" PRIu32 " local=%" PRIu32,
+            hello.gateway_session_id,
+            gateway_status_session_id);
+
+        return;
+    }
+
+    /*
+        Bind authenticated outer sender-session ID to
+        the RC session advertised inside the payload.
+    */
+    if (packet.timestamp_ms !=
+        hello.rc_session_id)
+    {
+        bad_packets++;
+
+        ESP_LOGW(
+            TAG,
+            "SESSION RC_HELLO RC session mismatch "
+            "payload=%" PRIu32 " header=%" PRIu32,
+            hello.rc_session_id,
+            packet.timestamp_ms);
+
+        return;
+    }
+
+    if (packet.sequence == 0)
+    {
+        bad_packets++;
+
+        ESP_LOGW(
+            TAG,
+            "SESSION RC_HELLO invalid sequence=0");
+
+        return;
+    }
+
+    /*
+        During this Gateway uptime, monotonic RC session
+        IDs must never move backwards.
+    */
+    if (gateway_session_keys_ready &&
+        hello.rc_session_id <
+            gateway_authenticated_rc_session_id)
+    {
+        bad_packets++;
+        replay_packets++;
+
+        ESP_LOGE(
+            TAG,
+            "SESSION RC rollback rejected "
+            "current=%" PRIu32
+            " received=%" PRIu32,
+            gateway_authenticated_rc_session_id,
+            hello.rc_session_id);
+
+        return;
+    }
+
+    /*
+        Repeated HELLO for the same established candidate
+        is harmless. Do not repeatedly derive the key.
+    */
+/*
+    The RC may repeat HELLO because our previous
+    SESSION_CONFIRM was lost.
+
+    Do not derive again. Simply retransmit confirmation.
+*/
+if (gateway_session_keys_ready &&
+    hello.rc_session_id ==
+        gateway_authenticated_rc_session_id)
+{
+    if (!gateway_session_confirm_send_once())
+    {
+        ESP_LOGW(
+            TAG,
+            "SESSION_CONFIRM retry TX failed");
+    }
+
+    return;
+}
+
+    /*
+        A newer authenticated RC session replaces any
+        previous derived keys.
+    */
+/*
+    From this point until derivation succeeds there is
+    deliberately no usable operational session.
+*/
+gateway_session_keys_ready = false;
+
+mathos_secure_clear_session_keys();
+
+mathos_secure_status_t session_status =
+    mathos_secure_derive_session_keys(
+        hello.rc_session_id,
+        hello.gateway_session_id,
+        MATHOS_SECURE_ROLE_GATEWAY);
+
+    if (session_status !=
+        MATHOS_SECURE_STATUS_OK)
+    {
+        gateway_session_keys_ready =
+            false;
+
+        gateway_authenticated_rc_session_id =
+            0;
+
+        ESP_LOGE(
+            TAG,
+            "SESSION key derivation failed: %s",
+            mathos_secure_status_to_string(
+                session_status));
+
+        return;
+    }
+
+    gateway_authenticated_rc_session_id =
+        hello.rc_session_id;
+
+    gateway_session_keys_ready =
+        true;
+
+    ESP_LOGW(
+        TAG,
+        "SESSION KEYS DERIVED "
+        "rc=%" PRIu32
+        " gateway=%" PRIu32,
+        gateway_authenticated_rc_session_id,
+        gateway_status_session_id);
+
+    /*
+        Do not process SESSION_HELLO as a control packet.
+    */
+    if (!gateway_session_confirm_send_once())
+{
+    ESP_LOGW(
+        TAG,
+        "SESSION_CONFIRM initial TX failed; "
+        "waiting for RC HELLO retry");
+}
+    return;
+}
     if (packet.payload_type != SECURITY_PAYLOAD_TYPE_RC) {
         bad_packets++;
 
@@ -3546,8 +3798,8 @@ uint32_t session_id =
 /*
    Session zero is never valid.
 
-   The remote generates a nonzero random session identifier
-   at boot.
+The remote reserves a nonzero persistent monotonic
+session identifier at boot.
 */
 if (session_id == 0) {
     bad_packets++;
@@ -3774,7 +4026,8 @@ static void mavlink_tx_task(void *arg)
         const bool fc_fresh = fc_heartbeat_is_fresh();
 
         if (have_packet &&
-            age_ms <= RC_PACKET_TIMEOUT_MS &&
+            age_ms <=
+                (int64_t)gateway_runtime_config.rc_packet_timeout_ms &&
             latest_packet.state == RC_ARMED &&
             fc_fresh &&
             !gateway_session_recovery_required) {
@@ -3785,7 +4038,9 @@ static void mavlink_tx_task(void *arg)
                 if (!have_packet) {
                     ESP_LOGW(TAG, "No RC packet yet. Releasing RC override.");
                 }
-                else if (age_ms > RC_PACKET_TIMEOUT_MS) {
+                else if (
+                    age_ms >
+                    (int64_t)gateway_runtime_config.rc_packet_timeout_ms) {
                     ESP_LOGW(
                         TAG,
                         "RC packet timeout age=%" PRId64 "ms. Releasing RC override.",
@@ -4633,10 +4888,38 @@ if (ack.command ==
 static void gateway_status_tx_task(void *arg)
 {
     uint32_t print_counter = 0;
-
+    TickType_t last_session_hello_tick = 0;
     ESP_LOGI(TAG, "Gateway status TX task started");
 
     while (true) {
+        TickType_t now_tick =
+    xTaskGetTickCount();
+
+if (last_session_hello_tick == 0 ||
+    (now_tick - last_session_hello_tick) >=
+        pdMS_TO_TICKS(
+            GATEWAY_SESSION_HELLO_PERIOD_MS))
+{
+    bool hello_ok =
+        gateway_session_hello_send_once();
+
+    if (hello_ok)
+    {
+        ESP_LOGI(
+            TAG,
+            "SESSION_HELLO TX gateway_session=%" PRIu32,
+            gateway_status_session_id);
+    }
+    else
+    {
+        ESP_LOGW(
+            TAG,
+            "SESSION_HELLO TX failed");
+    }
+
+    last_session_hello_tick =
+        now_tick;
+}
         bool ok = gateway_status_send_once();
         bool telemetry_ok = gateway_telemetry_send_once();
 
@@ -4666,6 +4949,295 @@ static void gateway_status_tx_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(GATEWAY_STATUS_TX_PERIOD_MS));
     }
 }
+
+static bool gateway_session_hello_send_once(void)
+{
+    if (gateway_status_session_id == 0)
+    {
+        ESP_LOGE(
+            TAG,
+            "SESSION_HELLO blocked: Gateway session ID is zero");
+
+        return false;
+    }
+    /*
+    Never wrap a Pair-Key handshake sequence.
+*/
+if (gateway_session_hello_tx_sequence == 0)
+{
+    ESP_LOGE(
+        TAG,
+        "SESSION_HELLO blocked: sequence exhausted");
+
+    return false;
+}
+
+    mathos_session_hello_t hello;
+
+    memset(
+        &hello,
+        0,
+        sizeof(hello));
+
+    /*
+        Gateway initiates operational session establishment.
+
+        RC session is not known yet.
+    */
+    hello.rc_session_id = 0;
+
+    hello.gateway_session_id =
+        gateway_status_session_id;
+
+    hello.sender_role =
+        MATHOS_SESSION_ROLE_GATEWAY;
+
+    hello.protocol_version =
+        MATHOS_SESSION_PROTOCOL_VERSION;
+
+    mathos_secure_packet_t packet;
+
+    memset(
+        &packet,
+        0,
+        sizeof(packet));
+
+    packet.sequence =
+        gateway_session_hello_tx_sequence++;
+
+    /*
+        The outer authenticated session ID must exactly
+        match the Gateway session advertised in the payload.
+    */
+    packet.timestamp_ms =
+        gateway_status_session_id;
+
+    packet.controller_id =
+        gateway_runtime_config.gateway_id;
+
+    packet.link_id =
+        GATEWAY_STATUS_LINK_ID;
+
+    packet.payload_type =
+        SECURITY_PAYLOAD_TYPE_SESSION_HELLO;
+
+    packet.payload_len =
+        sizeof(hello);
+
+    memcpy(
+        packet.payload,
+        &hello,
+        sizeof(hello));
+
+    /*
+        SESSION_HELLO is authenticated using the persistent
+        Pair Key.
+
+        Session keys do not exist yet.
+    */
+    mathos_secure_status_t crypto_status =
+        mathos_secure_encrypt_packet(
+            &packet);
+
+    if (crypto_status !=
+        MATHOS_SECURE_STATUS_OK)
+    {
+        ESP_LOGW(
+            TAG,
+            "SESSION_HELLO encrypt failed: %s",
+            mathos_secure_status_to_string(
+                crypto_status));
+
+        return false;
+    }
+
+    uint8_t frame[
+        MATHOS_WIRE_MAX_FRAME_LEN];
+
+    size_t frame_len = 0;
+
+    mathos_status_t encode_status =
+        mathos_wire_encode(
+            &packet,
+            frame,
+            sizeof(frame),
+            &frame_len);
+
+    if (encode_status !=
+        MATHOS_STATUS_OK)
+    {
+        ESP_LOGW(
+            TAG,
+            "SESSION_HELLO encode failed: %s",
+            mathos_status_to_string(
+                encode_status));
+
+        return false;
+    }
+
+    int written =
+        uart_write_bytes(
+            LINK_UART_NUM,
+            (const char *)frame,
+            frame_len);
+
+    if (written != (int)frame_len)
+    {
+        ESP_LOGW(
+            TAG,
+            "SESSION_HELLO TX incomplete written=%d expected=%u",
+            written,
+            (unsigned int)frame_len);
+
+        return false;
+    }
+
+    return true;
+}
+
+static bool gateway_session_confirm_send_once(void)
+{
+    if (!gateway_session_keys_ready ||
+        gateway_authenticated_rc_session_id == 0 ||
+        gateway_status_session_id == 0)
+    {
+        return false;
+    }
+
+    /*
+        SESSION_CONFIRM is still authenticated with the
+        persistent Pair Key.
+
+        It proves that the Gateway accepted the exact
+        RC/Gateway session pair.
+    */
+    if (gateway_session_confirm_tx_sequence == 0)
+    {
+        ESP_LOGE(
+            TAG,
+            "SESSION_CONFIRM blocked: sequence exhausted");
+
+        return false;
+    }
+
+    mathos_session_confirm_t confirm;
+
+    memset(
+        &confirm,
+        0,
+        sizeof(confirm));
+
+    confirm.rc_session_id =
+        gateway_authenticated_rc_session_id;
+
+    confirm.gateway_session_id =
+        gateway_status_session_id;
+
+    confirm.sender_role =
+        MATHOS_SESSION_ROLE_GATEWAY;
+
+    confirm.protocol_version =
+        MATHOS_SESSION_PROTOCOL_VERSION;
+
+    mathos_secure_packet_t packet;
+
+    memset(
+        &packet,
+        0,
+        sizeof(packet));
+
+    packet.sequence =
+        gateway_session_confirm_tx_sequence++;
+
+    packet.timestamp_ms =
+        gateway_status_session_id;
+
+    packet.controller_id =
+        gateway_runtime_config.gateway_id;
+
+    packet.link_id =
+        GATEWAY_STATUS_LINK_ID;
+
+    packet.payload_type =
+        SECURITY_PAYLOAD_TYPE_SESSION_CONFIRM;
+
+    packet.payload_len =
+        sizeof(confirm);
+
+    memcpy(
+        packet.payload,
+        &confirm,
+        sizeof(confirm));
+
+    mathos_secure_status_t crypto_status =
+        mathos_secure_encrypt_packet(
+            &packet);
+
+    if (crypto_status !=
+        MATHOS_SECURE_STATUS_OK)
+    {
+        ESP_LOGW(
+            TAG,
+            "SESSION_CONFIRM encrypt failed: %s",
+            mathos_secure_status_to_string(
+                crypto_status));
+
+        return false;
+    }
+
+    uint8_t frame[
+        MATHOS_WIRE_MAX_FRAME_LEN];
+
+    size_t frame_len = 0;
+
+    mathos_status_t encode_status =
+        mathos_wire_encode(
+            &packet,
+            frame,
+            sizeof(frame),
+            &frame_len);
+
+    if (encode_status !=
+        MATHOS_STATUS_OK)
+    {
+        ESP_LOGW(
+            TAG,
+            "SESSION_CONFIRM encode failed: %s",
+            mathos_status_to_string(
+                encode_status));
+
+        return false;
+    }
+
+    int written =
+        uart_write_bytes(
+            LINK_UART_NUM,
+            (const char *)frame,
+            frame_len);
+
+    if (written != (int)frame_len)
+    {
+        ESP_LOGW(
+            TAG,
+            "SESSION_CONFIRM TX incomplete "
+            "written=%d expected=%u",
+            written,
+            (unsigned int)frame_len);
+
+        return false;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "SESSION_CONFIRM TX "
+        "rc=%" PRIu32
+        " gateway=%" PRIu32,
+        gateway_authenticated_rc_session_id,
+        gateway_status_session_id);
+
+    return true;
+}
+
 static bool gateway_status_send_once(void)
 {
     gateway_status_packet_t status;
@@ -5112,7 +5684,6 @@ static bool gateway_maintenance_switch_enabled(void)
 
 void app_main(void)
 {
-    gateway_status_session_id = esp_random();
         /*
         NVS must be initialized before loading or saving
         maintenance configuration.
@@ -5474,14 +6045,34 @@ ESP_LOGI(
     "key_generation=%" PRIu32,
     gateway_runtime_config.key_generation);
 
-if (gateway_status_session_id == 0)
+/*
+    Reserve a persistent Gateway transmit session.
+
+    Gateway pairing configuration and this counter both
+    live in default NVS.
+*/
+mathos_secure_status_t gateway_session_status =
+    mathos_secure_reserve_session_id(
+        NULL,
+        &gateway_status_session_id);
+
+if (gateway_session_status !=
+    MATHOS_SECURE_STATUS_OK)
 {
-    gateway_status_session_id = 1;
+    ESP_LOGE(
+        TAG,
+        "OPERATIONAL STARTUP BLOCKED: "
+        "persistent TX session reservation failed: %s",
+        mathos_secure_status_to_string(
+            gateway_session_status));
+
+    mathos_secure_clear_key();
+    return;
 }
 
 ESP_LOGI(
     TAG,
-    "Gateway status session_id=0x%08" PRIx32,
+    "Gateway persistent session_id=%" PRIu32,
     gateway_status_session_id);
 
 ESP_LOGI(
