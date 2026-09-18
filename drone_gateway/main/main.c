@@ -3470,6 +3470,29 @@ if (packet.payload_type ==
 else if (packet.payload_type ==
          SECURITY_PAYLOAD_TYPE_RC)
 {
+    /*
+        Operational RC traffic is forbidden until an
+        authenticated RC SESSION_HELLO has established
+        the directional session keys.
+
+        gateway_operational_session_ready is deliberately
+        NOT required here because the first successfully
+        authenticated RC packet is what proves readiness.
+    */
+    if (!gateway_session_keys_ready ||
+        gateway_authenticated_rc_session_id == 0 ||
+        !mathos_secure_session_keys_are_set())
+    {
+        bad_packets++;
+
+        ESP_LOGW(
+            TAG,
+            "Operational RC packet rejected before "
+            "session keys are ready");
+
+        return;
+    }
+
     crypto_status =
         mathos_secure_decrypt_session_packet(
             &packet);
@@ -3762,7 +3785,30 @@ mathos_secure_status_t session_status =
 
         return;
     }
+/*
+    Operational RC traffic must belong to the exact
+    authenticated RC session used to derive K_RC->Gateway.
 
+    A successfully authenticated packet with a different
+    RC session identifier must never influence control state,
+    freshness, replay state, or FC output.
+*/
+if (!gateway_session_keys_ready ||
+    gateway_authenticated_rc_session_id == 0 ||
+    packet.timestamp_ms !=
+        gateway_authenticated_rc_session_id)
+{
+    bad_packets++;
+
+    ESP_LOGE(
+        TAG,
+        "OPERATIONAL RC SESSION CONTEXT MISMATCH "
+        "received=%" PRIu32 " expected=%" PRIu32,
+        packet.timestamp_ms,
+        gateway_authenticated_rc_session_id);
+
+    return;
+}
     if (packet.payload_len != sizeof(rc_packet_t)) {
         bad_packets++;
 

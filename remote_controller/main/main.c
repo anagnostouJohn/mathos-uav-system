@@ -2615,14 +2615,13 @@ uint32_t security_next_tx_sequence(void)
     taskENTER_CRITICAL(&security_mux);
 
     /*
-        Sequence value 0 is permanently reserved as invalid.
+        Sequence zero is permanently invalid.
 
-        UINT32_MAX is allowed once as the final valid value.
-        After that, the counter moves to 0 and remains
-        exhausted until a new operational session/reboot.
+        UINT32_MAX is allowed once as the final valid
+        operational sequence.
 
-        This prevents sequence wrap from reusing a nonce
-        under the same session key.
+        After that, the counter remains zero and
+        operational transmission must fail closed.
     */
     if (security_tx_sequence != 0)
     {
@@ -5355,7 +5354,60 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
 
         return;
     }
+    /*
+        Operational Gateway traffic must belong to the exact
+        Gateway session authenticated during SESSION_HELLO /
+        SESSION_CONFIRM.
 
+        Successful AEAD authentication alone is not enough to
+        change the negotiated protocol session context.
+    */
+    if (!gateway_session_candidate_valid ||
+        gateway_session_candidate_id == 0 ||
+        packet.timestamp_ms !=
+            gateway_session_candidate_id)
+    {
+        bad_count++;
+
+        fault_set(
+            FAULT_PACKET_SEQUENCE);
+
+        /*
+            Fail closed.
+
+            Previously trusted Gateway status and telemetry must
+            not remain usable after a session-context violation.
+        */
+        taskENTER_CRITICAL(
+            &gateway_status_mux);
+
+        gateway_status_valid = 0;
+
+        taskEXIT_CRITICAL(
+            &gateway_status_mux);
+
+        taskENTER_CRITICAL(
+            &gateway_telemetry_mux);
+
+        gateway_telemetry_valid = 0;
+
+        taskEXIT_CRITICAL(
+            &gateway_telemetry_mux);
+
+        rc_operational_session_ready = 0;
+
+        mathos_secure_clear_session_keys();
+
+        printf(
+            "[SESSION] OPERATIONAL GATEWAY CONTEXT MISMATCH "
+            "received=%lu expected=%lu\n",
+            (unsigned long)
+                packet.timestamp_ms,
+            (unsigned long)
+                gateway_session_candidate_id);
+
+        return;
+    }
     uint32_t session_id =
         packet.timestamp_ms;
 
