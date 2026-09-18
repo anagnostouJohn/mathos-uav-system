@@ -36,7 +36,7 @@ static int mathos_session_keys_set = 0;
     Persistent transmit-session counter storage.
 */
 #define MATHOS_SECURE_SESSION_NAMESPACE "mathos_sec"
-#define MATHOS_SECURE_SESSION_KEY       "tx_session"
+#define MATHOS_SECURE_SESSION_KEY "tx_session"
 
 mathos_secure_status_t mathos_secure_set_key(
     const uint8_t *key,
@@ -124,11 +124,10 @@ mathos_secure_derive_direction_key(
     static const uint8_t label[] =
         "MATHOS-OP-V1";
 
-    uint8_t info[
-        (sizeof(label) - 1U) +
-        sizeof(uint32_t) +
-        sizeof(uint32_t) +
-        1U];
+    uint8_t info[(sizeof(label) - 1U) +
+                 sizeof(uint32_t) +
+                 sizeof(uint32_t) +
+                 1U];
 
     size_t index = 0;
 
@@ -185,6 +184,15 @@ mathos_secure_status_t mathos_secure_derive_session_keys(
     uint32_t gateway_session_id,
     mathos_secure_role_t local_role)
 {
+    /*
+    Fail closed before attempting to establish a new
+    operational session.
+
+    Any derivation attempt invalidates previously derived
+    directional session keys. A validation or cryptographic
+    failure must never leave old session authority active.
+*/
+    mathos_secure_clear_session_keys();
     if (!mathos_runtime_key_set)
     {
         return MATHOS_SECURE_STATUS_KEY_NOT_SET;
@@ -202,10 +210,8 @@ mathos_secure_status_t mathos_secure_derive_session_keys(
         return MATHOS_SECURE_STATUS_BAD_ARGUMENT;
     }
 
-uint8_t rc_to_gateway[MATHOS_SECURE_KEY_LEN] = {0};
-uint8_t gateway_to_rc[MATHOS_SECURE_KEY_LEN] = {0};
-
-    mathos_secure_clear_session_keys();
+    uint8_t rc_to_gateway[MATHOS_SECURE_KEY_LEN] = {0};
+    uint8_t gateway_to_rc[MATHOS_SECURE_KEY_LEN] = {0};
 
     mathos_secure_status_t status =
         mathos_secure_derive_direction_key(
@@ -400,11 +406,11 @@ const char *mathos_secure_status_to_string(mathos_secure_status_t status)
     case MATHOS_SECURE_STATUS_AUTH_FAILED:
         return "AUTH_FAILED";
 
-case MATHOS_SECURE_STATUS_STORAGE_FAILED:
-    return "STORAGE_FAILED";
+    case MATHOS_SECURE_STATUS_STORAGE_FAILED:
+        return "STORAGE_FAILED";
 
-case MATHOS_SECURE_STATUS_SESSION_NOT_SET:
-    return "SESSION_NOT_SET";
+    case MATHOS_SECURE_STATUS_SESSION_NOT_SET:
+        return "SESSION_NOT_SET";
 
     default:
         return "UNKNOWN";
@@ -626,7 +632,6 @@ mathos_secure_decrypt_with_key(
     return MATHOS_SECURE_STATUS_OK;
 }
 
-
 mathos_secure_status_t
 mathos_secure_decrypt_packet(
     mathos_secure_packet_t *packet)
@@ -640,7 +645,6 @@ mathos_secure_decrypt_packet(
         packet,
         mathos_runtime_key);
 }
-
 
 mathos_secure_status_t
 mathos_secure_decrypt_session_packet(
