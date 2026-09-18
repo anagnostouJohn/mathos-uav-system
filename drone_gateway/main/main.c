@@ -170,6 +170,15 @@ static volatile uint32_t
 
 static volatile bool
     gateway_session_keys_ready = false;
+/*
+    True only after a normal RC control packet has been
+    successfully authenticated with K_RC->Gateway.
+
+    This proves the RC received SESSION_CONFIRM and
+    derived the same directional session keys.
+*/
+static volatile bool
+    gateway_operational_session_ready = false;
 static uint32_t gateway_session_hello_tx_sequence = 1;
 static uint32_t gateway_session_confirm_tx_sequence = 1;
 #define GATEWAY_SESSION_HELLO_PERIOD_MS 1000
@@ -3443,7 +3452,39 @@ static void link_handle_mathos_frame(const uint8_t *frame, size_t frame_len)
         return;
     }
 
-    mathos_secure_status_t crypto_status = mathos_secure_decrypt_packet(&packet);
+    mathos_secure_status_t crypto_status;
+
+/*
+    RC SESSION_HELLO is part of session establishment
+    and therefore uses the permanent Pair Key.
+
+    Normal RC control uses K_RC->Gateway.
+*/
+if (packet.payload_type ==
+    SECURITY_PAYLOAD_TYPE_SESSION_HELLO)
+{
+    crypto_status =
+        mathos_secure_decrypt_packet(
+            &packet);
+}
+else if (packet.payload_type ==
+         SECURITY_PAYLOAD_TYPE_RC)
+{
+    crypto_status =
+        mathos_secure_decrypt_session_packet(
+            &packet);
+}
+else
+{
+    bad_packets++;
+
+    ESP_LOGW(
+        TAG,
+        "Unexpected RC-side payload type=%u",
+        packet.payload_type);
+
+    return;
+}
 
     if (crypto_status != MATHOS_SECURE_STATUS_OK) {
         bad_packets++;
@@ -3654,6 +3695,7 @@ if (gateway_session_keys_ready &&
     From this point until derivation succeeds there is
     deliberately no usable operational session.
 */
+gateway_operational_session_ready = false;
 gateway_session_keys_ready = false;
 
 mathos_secure_clear_session_keys();
@@ -3904,11 +3946,34 @@ else if (session_id != last_session_id) {
         return;
     }
 
-    last_sequence = packet.sequence;
+last_sequence = packet.sequence;
 
-    handle_valid_rc_packet(
-        &rc_packet,
-        new_session);
+/*
+    We have now successfully:
+      - decrypted with K_RC->Gateway,
+      - validated the RC packet format,
+      - validated the current session,
+      - validated the packet sequence.
+
+    Therefore the RC demonstrably possesses the same
+    operational session keys.
+*/
+if (!gateway_operational_session_ready)
+{
+    gateway_operational_session_ready = true;
+
+    ESP_LOGW(
+        TAG,
+        "OPERATIONAL SESSION READY "
+        "rc=%" PRIu32
+        " gateway=%" PRIu32,
+        gateway_authenticated_rc_session_id,
+        gateway_status_session_id);
+}
+
+handle_valid_rc_packet(
+    &rc_packet,
+    new_session);
 }
 
 static void link_process_byte(uint8_t byte)
@@ -5240,6 +5305,17 @@ static bool gateway_session_confirm_send_once(void)
 
 static bool gateway_status_send_once(void)
 {
+    /*
+        Do not send operational status until the RC has
+        demonstrated possession of K_RC->Gateway.
+    */
+    if (!gateway_operational_session_ready ||
+        !gateway_session_keys_ready ||
+        !mathos_secure_session_keys_are_set())
+    {
+        return false;
+    }
+
     gateway_status_packet_t status;
     memset(&status, 0, sizeof(status));
 
@@ -5289,7 +5365,9 @@ static bool gateway_status_send_once(void)
 
     memcpy(packet.payload, &status, sizeof(status));
 
-    mathos_secure_status_t crypto_status = mathos_secure_encrypt_packet(&packet);
+    mathos_secure_status_t crypto_status =
+    mathos_secure_encrypt_session_packet(
+        &packet);
 
     if (crypto_status != MATHOS_SECURE_STATUS_OK) {
         ESP_LOGW(
@@ -5353,6 +5431,17 @@ static bool gateway_telemetry_value_is_fresh(int64_t update_us, int64_t now_us)
 
 static bool gateway_telemetry_send_once(void)
 {
+    /*
+        Telemetry is operational traffic and therefore
+        requires a mutually established session.
+    */
+    if (!gateway_operational_session_ready ||
+        !gateway_session_keys_ready ||
+        !mathos_secure_session_keys_are_set())
+    {
+        return false;
+    }
+
     gateway_telemetry_packet_t telemetry;
     memset(&telemetry, 0, sizeof(telemetry));
 
@@ -5547,7 +5636,9 @@ if (gateway_telemetry_value_is_fresh(
 
     memcpy(packet.payload, &telemetry, sizeof(telemetry));
 
-    mathos_secure_status_t crypto_status = mathos_secure_encrypt_packet(&packet);
+    mathos_secure_status_t crypto_status =
+    mathos_secure_encrypt_session_packet(
+        &packet);
 
     if (crypto_status != MATHOS_SECURE_STATUS_OK) {
         ESP_LOGW(
