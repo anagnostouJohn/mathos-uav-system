@@ -124,7 +124,15 @@
 #define RC_PAIRING_REQUEST_MAX_AGE_MS 5000U
 
 #define FEATURE_LINK_UART_TX 1
+/*
+    TEMPORARY SECURITY TEST:
+    transmit one valid operational encrypted frame twice.
 
+    Expected result:
+    Gateway accepts the first copy and rejects the second
+    as replay/old sequence.
+*/
+#define TEST_DUPLICATE_SESSION_FRAME_ONCE 1
 //////////////////// UART
 //////////////////// MAVLINK
 #define MAVLINK2_STX 0xFD
@@ -8704,6 +8712,58 @@ void radio_tx_task(void *pvParameters)
 #if FEATURE_LINK_UART_TX
                         link_send_ok = link_uart_send_frame(wire_frame, wire_frame_len);
 
+
+                        #if TEST_DUPLICATE_SESSION_FRAME_ONCE
+                        /*
+                            Security negative test.
+
+                            wire_frame already contains one fully valid
+                            RC operational frame encrypted with the
+                            current RC -> Gateway session key.
+
+                            Send the exact same bytes a second time.
+
+                            This means:
+                              same R,G session
+                              same sequence
+                              same nonce
+                              same ciphertext
+                              same authentication tag
+
+                            The first copy is legitimate.
+                            The second copy MUST be rejected by the
+                            Gateway replay/sequence check.
+                        */
+                        static bool duplicate_test_done = false;
+
+                        if (link_send_ok &&
+                            !duplicate_test_done)
+                        {
+                            /*
+                                Give the Gateway a short moment to
+                                process the first copy before the exact
+                                duplicate arrives.
+                            */
+                            vTaskDelay(
+                                pdMS_TO_TICKS(5));
+
+                            int duplicate_ok =
+                                link_uart_send_frame(
+                                    wire_frame,
+                                    wire_frame_len);
+
+                            duplicate_test_done = true;
+
+                            printf(
+                                "[SECURITY TEST] DUPLICATE FRAME SENT "
+                                "seq=%lu result=%s\n",
+                                (unsigned long)
+                                    wire_packet.sequence,
+                                duplicate_ok
+                                    ? "TX_OK"
+                                    : "TX_FAILED");
+                        }
+#endif
                         static uint32_t link_uart_ok_count = 0;
 
                         if (link_send_ok)
