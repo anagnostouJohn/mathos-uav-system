@@ -5303,6 +5303,43 @@ static bool gateway_session_confirm_send_once(void)
     return true;
 }
 
+static uint32_t gateway_next_operational_tx_sequence(void)
+{
+    uint32_t sequence = 0;
+
+    taskENTER_CRITICAL(
+        &gateway_command_state_mux);
+
+    /*
+        Sequence zero is permanently invalid.
+
+        UINT32_MAX may be used once as the final valid
+        operational sequence. After that, the counter
+        remains exhausted at zero until a new Gateway boot
+        establishes a new persistent session.
+    */
+    if (gateway_status_tx_sequence != 0)
+    {
+        sequence =
+            gateway_status_tx_sequence;
+
+        if (gateway_status_tx_sequence ==
+            UINT32_MAX)
+        {
+            gateway_status_tx_sequence = 0;
+        }
+        else
+        {
+            gateway_status_tx_sequence++;
+        }
+    }
+
+    taskEXIT_CRITICAL(
+        &gateway_command_state_mux);
+
+    return sequence;
+}
+
 static bool gateway_status_send_once(void)
 {
     /*
@@ -5319,7 +5356,18 @@ static bool gateway_status_send_once(void)
     gateway_status_packet_t status;
     memset(&status, 0, sizeof(status));
 
-    uint32_t seq = gateway_status_tx_sequence++;
+    uint32_t seq =
+    gateway_next_operational_tx_sequence();
+
+if (seq == 0)
+{
+    ESP_LOGE(
+        TAG,
+        "Operational Gateway TX blocked: "
+        "sequence exhausted");
+
+    return false;
+}
 
     status.packet_id = seq;
     status.session_id = gateway_status_session_id;
@@ -5445,7 +5493,18 @@ static bool gateway_telemetry_send_once(void)
     gateway_telemetry_packet_t telemetry;
     memset(&telemetry, 0, sizeof(telemetry));
 
-    uint32_t seq = gateway_status_tx_sequence++;
+    uint32_t seq =
+    gateway_next_operational_tx_sequence();
+
+if (seq == 0)
+{
+    ESP_LOGE(
+        TAG,
+        "Operational Gateway TX blocked: "
+        "sequence exhausted");
+
+    return false;
+}
 
     /*
     Local copies of values that need conversion or freshness checks

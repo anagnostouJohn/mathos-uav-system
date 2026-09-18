@@ -2610,10 +2610,36 @@ void drone_set_state(rc_state_t new_state, const char *reason)
 
 uint32_t security_next_tx_sequence(void)
 {
-    uint32_t sequence;
+    uint32_t sequence = 0;
 
     taskENTER_CRITICAL(&security_mux);
-    sequence = security_tx_sequence++;
+
+    /*
+        Sequence value 0 is permanently reserved as invalid.
+
+        UINT32_MAX is allowed once as the final valid value.
+        After that, the counter moves to 0 and remains
+        exhausted until a new operational session/reboot.
+
+        This prevents sequence wrap from reusing a nonce
+        under the same session key.
+    */
+    if (security_tx_sequence != 0)
+    {
+        sequence =
+            security_tx_sequence;
+
+        if (security_tx_sequence ==
+            UINT32_MAX)
+        {
+            security_tx_sequence = 0;
+        }
+        else
+        {
+            security_tx_sequence++;
+        }
+    }
+
     taskEXIT_CRITICAL(&security_mux);
 
     return sequence;
@@ -4898,56 +4924,56 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
 
     mathos_secure_status_t crypto_status;
 
-/*
-    SESSION_HELLO and SESSION_CONFIRM belong to the
-    handshake and are authenticated with the permanent
-    Pair Key.
+    /*
+        SESSION_HELLO and SESSION_CONFIRM belong to the
+        handshake and are authenticated with the permanent
+        Pair Key.
 
-    Normal status and telemetry are authenticated with
-    the derived Gateway -> RC session key.
-*/
-if (packet.payload_type ==
-        SECURITY_PAYLOAD_TYPE_SESSION_HELLO ||
-    packet.payload_type ==
-        SECURITY_PAYLOAD_TYPE_SESSION_CONFIRM)
-{
-    crypto_status =
-        mathos_secure_decrypt_packet(
-            &packet);
-}
-else if (packet.payload_type ==
-             SECURITY_PAYLOAD_TYPE_GATEWAY_STATUS ||
-         packet.payload_type ==
-             SECURITY_PAYLOAD_TYPE_GATEWAY_TELEMETRY)
-{
-    if (!rc_operational_session_ready ||
-        !mathos_secure_session_keys_are_set())
+        Normal status and telemetry are authenticated with
+        the derived Gateway -> RC session key.
+    */
+    if (packet.payload_type ==
+            SECURITY_PAYLOAD_TYPE_SESSION_HELLO ||
+        packet.payload_type ==
+            SECURITY_PAYLOAD_TYPE_SESSION_CONFIRM)
+    {
+        crypto_status =
+            mathos_secure_decrypt_packet(
+                &packet);
+    }
+    else if (packet.payload_type ==
+                 SECURITY_PAYLOAD_TYPE_GATEWAY_STATUS ||
+             packet.payload_type ==
+                 SECURITY_PAYLOAD_TYPE_GATEWAY_TELEMETRY)
+    {
+        if (!rc_operational_session_ready ||
+            !mathos_secure_session_keys_are_set())
+        {
+            bad_count++;
+
+            printf(
+                "[SESSION] operational Gateway packet "
+                "rejected before SESSION READY "
+                "type=%u\n",
+                packet.payload_type);
+
+            return;
+        }
+
+        crypto_status =
+            mathos_secure_decrypt_session_packet(
+                &packet);
+    }
+    else
     {
         bad_count++;
 
         printf(
-            "[SESSION] operational Gateway packet "
-            "rejected before SESSION READY "
-            "type=%u\n",
+            "[GATEWAY RX] unexpected payload type=%u\n",
             packet.payload_type);
 
         return;
     }
-
-    crypto_status =
-        mathos_secure_decrypt_session_packet(
-            &packet);
-}
-else
-{
-    bad_count++;
-
-    printf(
-        "[GATEWAY RX] unexpected payload type=%u\n",
-        packet.payload_type);
-
-    return;
-}
 
     if (crypto_status != MATHOS_SECURE_STATUS_OK)
     {
@@ -8618,8 +8644,41 @@ void radio_tx_task(void *pvParameters)
 
 #endif
 
+        uint32_t tx_sequence =
+            security_next_tx_sequence();
+
+        if (tx_sequence == 0)
+        {
+            /*
+                Fail closed after sequence exhaustion.
+
+                No further operational packet may be encrypted
+                under this session because doing so could reuse
+                ChaCha20-Poly1305 nonces.
+            */
+            fault_set(
+                FAULT_PACKET_SEQUENCE);
+
+            static int sequence_exhaustion_logged = 0;
+
+            if (!sequence_exhaustion_logged)
+            {
+                sequence_exhaustion_logged = 1;
+
+                printf(
+                    "[SECURITY] RC TX BLOCKED: "
+                    "operational sequence exhausted\n");
+            }
+
+            vTaskDelayUntil(
+                &last_wake,
+                period);
+
+            continue;
+        }
+
         rc_packet_t packet = {
-            .packet_id = security_next_tx_sequence(),
+            .packet_id = tx_sequence,
             .state = command_state,
             .throttle = throttle_to_send,
             .yaw = yaw_to_send,
@@ -8712,8 +8771,7 @@ void radio_tx_task(void *pvParameters)
 #if FEATURE_LINK_UART_TX
                         link_send_ok = link_uart_send_frame(wire_frame, wire_frame_len);
 
-
-                        #if TEST_DUPLICATE_SESSION_FRAME_ONCE
+#if TEST_DUPLICATE_SESSION_FRAME_ONCE
                         /*
                             Security negative test.
 
