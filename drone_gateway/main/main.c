@@ -2272,23 +2272,74 @@ static bool gateway_remote_link_is_fresh(void)
 static void gateway_session_recovery_check(
     const rc_packet_t *packet)
 {
+    /*
+       Track continuity of accepted RC packets while the
+       recovery hold is active.
+
+       This is deliberately local to the recovery logic.
+    */
+    static int64_t recovery_last_packet_us = 0;
+
     if (packet == NULL) {
         return;
     }
 
+    int64_t now_us = esp_timer_get_time();
+
     /*
-       No recovery lock exists. Keep the timer reset.
+       No recovery lock exists. Keep all recovery timing
+       state reset.
     */
     if (!gateway_session_recovery_required) {
         gateway_session_recovery_disarmed_since_us = 0;
+        recovery_last_packet_us = 0;
         return;
     }
+
+    /*
+       Recovery requires a continuous stream of accepted
+       RC packets.
+
+       If the gap since the previous accepted recovery
+       packet exceeds the normal RC freshness timeout,
+       the previous recovery hold is no longer continuous.
+    */
+    bool rc_stream_continuous = true;
+
+    if (recovery_last_packet_us > 0) {
+        int64_t recovery_packet_gap_ms =
+            (now_us - recovery_last_packet_us) / 1000;
+
+        if (recovery_packet_gap_ms >
+            (int64_t)gateway_runtime_config.rc_packet_timeout_ms) {
+
+            rc_stream_continuous = false;
+
+            ESP_LOGW(
+                TAG,
+                "RC SESSION RECOVERY packet gap "
+                "gap_ms=%" PRId64
+                " limit_ms=%u",
+                recovery_packet_gap_ms,
+                (unsigned int)
+                    gateway_runtime_config.rc_packet_timeout_ms
+            );
+        }
+    }
+
+    /*
+       This function is reached only after the packet has
+       already passed the operational authentication,
+       session and sequence admission path.
+    */
+    recovery_last_packet_us = now_us;
 
     /*
        Every required safety condition must remain true
        continuously for the complete hold period.
     */
     bool safe_for_recovery =
+        rc_stream_continuous &&
         packet->state == RC_DISARMED &&
         packet->throttle <= GATEWAY_ARM_THROTTLE_MAX &&
         fc_heartbeat_is_fresh() &&
@@ -2322,7 +2373,7 @@ static void gateway_session_recovery_check(
         return;
     }
 
-    int64_t now_us = esp_timer_get_time();
+
 
     /*
        Start the continuous DISARMED observation period.
@@ -2356,8 +2407,9 @@ static void gateway_session_recovery_check(
        Recovery conditions remained continuously valid for
        the complete hold period. Restore control authority.
     */
-    gateway_session_recovery_required = false;
-    gateway_session_recovery_disarmed_since_us = 0;
+gateway_session_recovery_required = false;
+gateway_session_recovery_disarmed_since_us = 0;
+recovery_last_packet_us = 0;
 
     ESP_LOGW(
         TAG,
