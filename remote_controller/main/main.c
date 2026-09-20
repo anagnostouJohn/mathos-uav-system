@@ -130,7 +130,7 @@
 
     Expected result:
     Gateway accepts the first copy and rejects the second
-    as replay/old sequence.
+    as replay/old sequence. test last
 */
 #define TEST_DUPLICATE_SESSION_FRAME_ONCE 0
 
