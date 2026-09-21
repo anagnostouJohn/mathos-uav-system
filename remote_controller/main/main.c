@@ -28,7 +28,7 @@
 ////////////////////////////////////////////////////////////////////////////////////
 #define COMMAND_STATUS_MESSAGE_CLEAR_MS 3000
 
-#define DEBUG_CRYPTO_TAMPER_TEST 1
+#define DEBUG_CRYPTO_TAMPER_TEST 0
 #define CRYPTO_TAMPER_EVERY 200
 
 #define BENCH_FAILSAFE_DISARM 1
@@ -8925,8 +8925,10 @@ void radio_tx_task(void *pvParameters)
 
 #endif
                         link_send_ok = link_uart_send_frame(wire_frame, wire_frame_len);
+#if DEBUG_CRYPTO_TAMPER_TEST
 security_frame_sent:
                         ;
+#endif
 #if TEST_DUPLICATE_SESSION_FRAME_ONCE
                         /*
                             Security negative test.
