@@ -28,8 +28,9 @@
 ////////////////////////////////////////////////////////////////////////////////////
 #define COMMAND_STATUS_MESSAGE_CLEAR_MS 3000
 
-#define DEBUG_CRYPTO_TAMPER_TEST 0
-#define CRYPTO_TAMPER_EVERY 200
+#define DEBUG_CRYPTO_TAMPER_TEST 1
+#define CRYPTO_TAMPER_EVERY 2
+#define CRYPTO_TAMPER_TARGET_COUNT 1000U
 
 #define BENCH_FAILSAFE_DISARM 1
 
@@ -138,7 +139,7 @@
 #define CRYPTO_TAMPER_MODE_TAG 2
 #define CRYPTO_TAMPER_MODE_AAD 3
 #define CRYPTO_TAMPER_MODE \
-    CRYPTO_TAMPER_MODE_AAD
+    CRYPTO_TAMPER_MODE_CIPHERTEXT
 //////////////////// UART
 //////////////////// MAVLINK
 #define MAVLINK2_STX 0xFD
@@ -8829,9 +8830,13 @@ void radio_tx_task(void *pvParameters)
 #if FEATURE_LINK_UART_TX
 #if DEBUG_CRYPTO_TAMPER_TEST
 
-                        static bool ciphertext_tamper_test_done = false;
+                        static uint32_t crypto_tamper_frame_count = 0;
+                        static uint32_t crypto_tamper_sent_count = 0;
 
-                        if (!ciphertext_tamper_test_done &&
+                        crypto_tamper_frame_count++;
+
+                        if (crypto_tamper_sent_count < CRYPTO_TAMPER_TARGET_COUNT &&
+                            (crypto_tamper_frame_count % CRYPTO_TAMPER_EVERY) == 0U &&
                             wire_frame_len >=
                                 (MATHOS_WIRE_HEADER_LEN +
                                  MATHOS_AUTH_TAG_LEN +
@@ -8904,11 +8909,14 @@ void radio_tx_task(void *pvParameters)
                                     wire_frame,
                                     wire_frame_len);
 
-                            ciphertext_tamper_test_done = true;
+                            crypto_tamper_sent_count++;
 
                             printf(
                                 "[SECURITY TEST] AEAD TAMPER SENT "
-                                "seq=%lu result=%s\n",
+                                "mode=%u count=%lu/%u seq=%lu result=%s\n",
+                                (unsigned int)CRYPTO_TAMPER_MODE,
+                                (unsigned long)crypto_tamper_sent_count,
+                                (unsigned int)CRYPTO_TAMPER_TARGET_COUNT,
                                 (unsigned long)wire_packet.sequence,
                                 tamper_tx_ok
                                     ? "TX_OK"
@@ -8926,8 +8934,7 @@ void radio_tx_task(void *pvParameters)
 #endif
                         link_send_ok = link_uart_send_frame(wire_frame, wire_frame_len);
 #if DEBUG_CRYPTO_TAMPER_TEST
-security_frame_sent:
-                        ;
+                    security_frame_sent:;
 #endif
 #if TEST_DUPLICATE_SESSION_FRAME_ONCE
                         /*
