@@ -30,7 +30,7 @@
 
 #define DEBUG_CRYPTO_TAMPER_TEST 1
 #define CRYPTO_TAMPER_EVERY 2
-#define CRYPTO_TAMPER_TARGET_COUNT 1000U
+#define CRYPTO_TAMPER_TARGET_COUNT 10000U
 
 #define BENCH_FAILSAFE_DISARM 1
 
@@ -104,6 +104,13 @@
 
 //////////////////// UART
 
+#define DEBUG_GATEWAY_WRONG_KEY_RX_TEST 0
+#define GATEWAY_WRONG_KEY_RX_TARGET_COUNT 1000U
+
+#define DEBUG_GATEWAY_WRONG_IDENTITY_RX_TEST 0
+#define DEBUG_GATEWAY_WRONG_DIRECTION_RX_TEST 0
+#define GATEWAY_WRONG_DIRECTION_RX_TARGET_COUNT 1000U
+
 #define CONTROL_UART_PORT UART_NUM_1
 #define CONTROL_UART_TX_PIN 8
 #define CONTROL_UART_RX_PIN 9
@@ -133,13 +140,217 @@
     Gateway accepts the first copy and rejects the second
     as replay/old sequence. test last
 */
-#define TEST_DUPLICATE_SESSION_FRAME_ONCE 0
+#define DEBUG_DUPLICATE_SEQUENCE_TEST 0
+#define DUPLICATE_SEQUENCE_TEST_TARGET_COUNT 1000U
+
+#define DEBUG_OLD_SEQUENCE_TEST 0
+#define OLD_SEQUENCE_TEST_TARGET_COUNT 1000U
+
+/*
+    E05-A — archived RC -> Gateway replay across Gateway session change.
+
+    Procedure:
+      1. Archive one successfully transmitted valid RC operational frame.
+      2. Keep the RC running.
+      3. Reboot only the Gateway.
+      4. Wait for a new Gateway operational session.
+      5. Replay the archived old-session wire frame unchanged 30 times.
+
+    Expected result:
+      All archived frames are rejected by the Gateway.
+*/
+#define DEBUG_E05_A_ARCHIVED_REPLAY_TEST 0
+#define E05_A_ARCHIVED_REPLAY_TARGET_COUNT 30U
+
+#define DEBUG_GATEWAY_EXACT_DUPLICATE_RX_TEST 0
+#define GATEWAY_EXACT_DUPLICATE_RX_TARGET_COUNT 1000U
+
+#define DEBUG_GATEWAY_OLD_SEQUENCE_RX_TEST 0
+#define GATEWAY_OLD_SEQUENCE_RX_TARGET_COUNT 1000U
+
+/*
+    E05-B — archived Gateway -> RC replay
+    after RC operational-session change.
+*/
+#define DEBUG_E05_B_ARCHIVED_REPLAY_RX_TEST 0
+#define E05_B_ARCHIVED_REPLAY_RX_TARGET_COUNT 30U
+
+#define DEBUG_GATEWAY_WRONG_IDENTITY_RX_TEST 0
+#define GATEWAY_WRONG_IDENTITY_RX_TARGET_COUNT 1000U
+
+/*
+    E06-B — Gateway -> RC communication interruption
+    and restoration.
+
+    RC -> Gateway remains operational.
+
+    Expected:
+      1. Gateway status freshness expires at the RC.
+      2. RC enters FAILSAFE while previously ARMED.
+      3. FAILSAFE state continues over the healthy uplink.
+      4. Reconnection does not automatically restore ARMED authority.
+
+    Planned repetitions: 30.
+*/
+#define DEBUG_E06_B_GATEWAY_DOWNLINK_INTERRUPTION_TEST 0
+
+/*
+    E07-A — FC HEARTBEAT suppression observed from RC.
+
+    RC <-> Gateway communication must remain healthy while
+    Gateway reports FC heartbeat freshness loss.
+
+    Planned repetitions: 30.
+*/
+#define DEBUG_E07_A_FC_HEARTBEAT_SUPPRESSION_TEST 0
+#define DEBUG_E07_B_FC_STREAM_SUPPRESSION_TEST 0
+#define E07_B_TARGET_COUNT 30U
+#define E07_A_TARGET_COUNT 30U
+
+/*
+    E06-C — Bidirectional RC <-> Gateway communication
+    interruption and restoration.
+
+    Expected:
+      1. RC loses fresh Gateway status and enters FAILSAFE.
+      2. Gateway independently loses fresh RC packets.
+      3. Gateway withdraws manual override.
+      4. Gateway applies the configured bench safety policy.
+      5. FC becomes DISARMED.
+      6. Restoring both directions does not restore ARMED authority.
+
+    Planned repetitions: 30.
+*/
+#define DEBUG_E06_C_BIDIRECTIONAL_INTERRUPTION_TEST 0
+#define E06_C_TARGET_COUNT 30U
+
+#define E06_B_TARGET_COUNT 30U
+
+
+/*
+ * E12-B receiver-side accounting.
+ *
+ * Gateway operational STATUS and TELEMETRY frames share one
+ * monotonically increasing sequence space.
+ *
+ * The Gateway campaign offers exactly 10000 operational frames.
+ * Missing sequence numbers inside that window therefore represent
+ * frames that were not observed by the RC.
+ */
+#define E12B_RX_TARGET_SEQUENCE 10000U
+static const bool e12b_rx_enabled = false;
+
+static uint32_t e12b_rx_accepted = 0U;
+static uint32_t e12b_rx_missing = 0U;
+static uint32_t e12b_rx_bad_baseline = 0U;
+static uint32_t e12b_rx_replay_baseline = 0U;
+static bool e12b_rx_complete = false;
+
+static void e12b_rx_reset(
+    uint32_t bad_now,
+    uint32_t replay_now)
+{
+        if (!e12b_rx_enabled)
+    {
+        e12b_rx_complete = true;
+        return;
+    }
+    e12b_rx_accepted = 0U;
+    e12b_rx_missing = 0U;
+
+    e12b_rx_bad_baseline = bad_now;
+    e12b_rx_replay_baseline = replay_now;
+
+    e12b_rx_complete = false;
+
+    printf(
+        "[E12-B RX] WINDOW RESET "
+        "target=%u "
+        "bad_baseline=%lu "
+        "replay_baseline=%lu\n",
+        (unsigned int)E12B_RX_TARGET_SEQUENCE,
+        (unsigned long)e12b_rx_bad_baseline,
+        (unsigned long)e12b_rx_replay_baseline);
+}
+
+static void e12b_rx_record_accepted(
+    uint32_t sequence,
+    uint32_t previous_sequence,
+    uint32_t bad_now,
+    uint32_t replay_now)
+{
+        if (!e12b_rx_enabled)
+    {
+        return;
+    }
+    if (e12b_rx_complete)
+    {
+        return;
+    }
+
+    /*
+     * Frame belongs to the fixed E12-B sender window.
+     */
+    if (sequence <= E12B_RX_TARGET_SEQUENCE)
+    {
+        if (sequence > previous_sequence + 1U)
+        {
+            e12b_rx_missing +=
+                sequence - previous_sequence - 1U;
+        }
+
+        e12b_rx_accepted++;
+
+        if (sequence < E12B_RX_TARGET_SEQUENCE)
+        {
+            return;
+        }
+    }
+    else
+    {
+        /*
+         * The final offered frame may itself have been dropped.
+         * In that case the first normal post-campaign frame closes
+         * the receiver window without being counted as accepted.
+         */
+        if (previous_sequence <
+            E12B_RX_TARGET_SEQUENCE)
+        {
+            e12b_rx_missing +=
+                E12B_RX_TARGET_SEQUENCE -
+                previous_sequence;
+        }
+    }
+
+    e12b_rx_complete = true;
+
+    printf(
+        "[E12-B RX] CAMPAIGN COMPLETE "
+        "target=%u "
+        "accepted=%lu "
+        "missing=%lu "
+        "bad_delta=%lu "
+        "replay_delta=%lu "
+        "last_campaign_seq=%u\n",
+        (unsigned int)E12B_RX_TARGET_SEQUENCE,
+        (unsigned long)e12b_rx_accepted,
+        (unsigned long)e12b_rx_missing,
+        (unsigned long)(
+            bad_now - e12b_rx_bad_baseline),
+        (unsigned long)(
+            replay_now - e12b_rx_replay_baseline),
+        (unsigned int)E12B_RX_TARGET_SEQUENCE);
+}
+
+static void gateway_status_handle_frame(
+    const uint8_t *frame,
+    size_t frame_len);
 
 #define CRYPTO_TAMPER_MODE_CIPHERTEXT 1
 #define CRYPTO_TAMPER_MODE_TAG 2
 #define CRYPTO_TAMPER_MODE_AAD 3
 #define CRYPTO_TAMPER_MODE \
-    CRYPTO_TAMPER_MODE_CIPHERTEXT
+    CRYPTO_TAMPER_MODE_TAG
 //////////////////// UART
 //////////////////// MAVLINK
 #define MAVLINK2_STX 0xFD
@@ -225,6 +436,37 @@
 #define TEST_PROVISION_CALIBRATION_ONCE 0
 #define FEATURE_TREAT_GATEWAY_DRY_RUN_AS_CONFIRMED 0
 
+/*
+    E10-C — New RC session begins with ARMED state.
+
+    Bench-only experiment:
+    the first successfully transmitted operational RC packet
+    after RC boot will report RC_ARMED while the RC's real
+    internal command state remains unchanged.
+*/
+#define DEBUG_E10C_FIRST_PACKET_ARMED_TEST 0
+
+/*
+    E10-D — New RC session begins with FAILSAFE state.
+
+    Bench-only experiment:
+    the first successfully transmitted operational RC packet
+    after RC boot will report RC_FAILSAFE while the RC's real
+    internal command state remains unchanged.
+*/
+#define DEBUG_E10D_FIRST_PACKET_FAILSAFE_TEST 0
+/*
+ * E10-F — Recovery hold interrupted by RC freshness timeout.
+ *
+ * Bench-only experiment:
+ * after operational packet 2 has been successfully transmitted,
+ * intentionally suppress RC operational-frame transmission for
+ * 500 ms. The Gateway runtime RC freshness limit is * 3500 ms for E10-G., so
+ * this must invalidate the current recovery hold.
+ */
+#define DEBUG_E10F_RECOVERY_GAP_TEST 0
+#define E10F_RECOVERY_GAP_MS 3500U
+
 #if FEATURE_DIRECT_MAVLINK_MODE && FEATURE_SECURE_GATEWAY_MODE
 #error "Only one control mode can be enabled: DIRECT MAVLINK or SECURE GATEWAY"
 #endif
@@ -236,7 +478,19 @@
 ///////////////////FEATURE FLAGS//////////////////
 
 //////////////////// SECURITY LAYER
+#if DEBUG_E07_A_FC_HEARTBEAT_SUPPRESSION_TEST
 
+static uint32_t e07_a_trial_count = 0U;
+static uint32_t e07_a_pass_count = 0U;
+static uint32_t e07_a_fail_count = 0U;
+
+static bool e07_a_event_active = false;
+static bool e07_a_fc_stale_seen = false;
+static bool e07_a_failsafe_seen = false;
+
+static TickType_t e07_a_stale_detect_tick = 0;
+
+#endif
 #define SECURITY_SKELETON_DIAGNOSTIC FEATURE_SECURITY_SKELETON
 
 #define SECURITY_LINK_ID_LOCAL_TEST 0
@@ -249,6 +503,47 @@
 #define SECURITY_TIMING_DIAGNOSTIC DEBUG_SECURITY_TIMING
 #define SECURITY_TIMING_PRINT_EVERY 100
 #define SECURITY_TIMING_WARN_US 1000
+
+#define DEBUG_WRONG_IDENTITY_TEST 0
+
+#define DEBUG_WRONG_DIRECTION_TEST 0
+#define WRONG_DIRECTION_TEST_EVERY 2U
+#define WRONG_DIRECTION_TEST_TARGET_COUNT 1000U
+
+#define DEBUG_WRONG_KEY_TEST 0
+#define WRONG_KEY_TEST_EVERY 2U
+#define WRONG_KEY_TEST_TARGET_COUNT 1000U
+
+#define WRONG_IDENTITY_TEST_EVERY 2U
+#define WRONG_IDENTITY_TEST_TARGET_COUNT 1000U
+#define WRONG_IDENTITY_CONTROLLER_ID 0xEEU
+
+#if DEBUG_OLD_SEQUENCE_TEST
+static uint8_t old_sequence_saved_frame[MATHOS_WIRE_MAX_FRAME_LEN];
+static size_t old_sequence_saved_frame_len = 0;
+static uint32_t old_sequence_saved_seq = 0;
+static bool old_sequence_saved_valid = false;
+static uint32_t old_sequence_sent_count = 0;
+#endif
+
+#if DEBUG_GATEWAY_WRONG_KEY_RX_TEST
+static uint32_t gateway_wrong_key_reject_count = 0U;
+#endif
+
+#if DEBUG_E07_B_FC_STREAM_SUPPRESSION_TEST
+
+static uint32_t e07_b_trial_count = 0U;
+static uint32_t e07_b_pass_count = 0U;
+static uint32_t e07_b_fail_count = 0U;
+
+static bool e07_b_event_active = false;
+static bool e07_b_fc_stale_seen = false;
+static bool e07_b_failsafe_seen = false;
+
+static TickType_t e07_b_stale_detect_tick = 0;
+
+#endif
+
 //////////////////// SECURITY LAYER
 #if DEBUG_SERIAL
 #define DBG_PRINT(...) printf(__VA_ARGS__)
@@ -626,6 +921,53 @@ static spi_device_handle_t lcd_spi = NULL;
 static uint8_t mavlink_tx_seq = 0;
 static uint32_t security_tx_sequence = 1;
 static security_timing_stats_t security_timing_stats = {0};
+
+#if DEBUG_E10C_FIRST_PACKET_ARMED_TEST
+static bool e10c_first_operational_packet_pending = true;
+#endif
+
+#if DEBUG_E10D_FIRST_PACKET_FAILSAFE_TEST
+static bool e10d_first_operational_packet_pending = true;
+#endif
+
+#if DEBUG_E10F_RECOVERY_GAP_TEST
+static bool e10f_gap_started = false;
+static bool e10f_gap_active = false;
+static bool e10f_gap_completed = false;
+static int64_t e10f_gap_start_us = 0;
+#endif
+
+#if DEBUG_E06_C_BIDIRECTIONAL_INTERRUPTION_TEST
+
+static uint32_t e06_c_trial_count = 0U;
+static uint32_t e06_c_pass_count = 0U;
+static uint32_t e06_c_fail_count = 0U;
+
+static bool e06_c_interruption_active = false;
+static bool e06_c_status_stale_seen = false;
+static bool e06_c_failsafe_seen = false;
+static bool e06_c_restoration_seen = false;
+
+static TickType_t e06_c_stale_detect_tick = 0;
+
+#endif
+
+#if DEBUG_E06_B_GATEWAY_DOWNLINK_INTERRUPTION_TEST
+
+static uint32_t e06_b_trial_count = 0U;
+static uint32_t e06_b_pass_count = 0U;
+static uint32_t e06_b_fail_count = 0U;
+
+static bool e06_b_interruption_active = false;
+static bool e06_b_status_stale_seen = false;
+static bool e06_b_failsafe_seen = false;
+static bool e06_b_restoration_seen = false;
+
+static TickType_t e06_b_last_gateway_status_tick = 0;
+static TickType_t e06_b_stale_detect_tick = 0;
+
+#endif
+
 static const uint8_t font_5x7[37][7] = {
     // A
     {0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001},
@@ -2965,6 +3307,13 @@ void enter_failsafe(const char *reason)
 
     drone_command_set(RC_FAILSAFE, reason);
 
+    if (command_status_get() == COMMAND_STATUS_ARMING)
+{
+    command_status_set(
+        COMMAND_STATUS_IDLE,
+        "failsafe cancelled pending ARM");
+}
+
     printf("[FAILSAFE] ENTERED reason=%s\n",
            reason ? reason : "none");
 }
@@ -3782,7 +4131,143 @@ void system_health_task(void *pvParameters)
 
         int fc_heartbeat_fresh =
             gateway_fc_heartbeat_is_fresh();
+#if DEBUG_E07_A_FC_HEARTBEAT_SUPPRESSION_TEST
 
+        if (command_state == RC_ARMED &&
+            gateway_control_ok &&
+            !fc_heartbeat_fresh &&
+            !e07_a_event_active &&
+            e07_a_trial_count < E07_A_TARGET_COUNT)
+        {
+            e07_a_event_active = true;
+            e07_a_fc_stale_seen = true;
+            e07_a_stale_detect_tick =
+                xTaskGetTickCount();
+
+            printf(
+                "[E07-A] FC STALE WHILE LINK HEALTHY "
+                "trial=%lu/%u "
+                "gateway_link=%u "
+                "fc_fresh=%u "
+                "command=%s\n",
+                (unsigned long)(e07_a_trial_count + 1U),
+                (unsigned int)E07_A_TARGET_COUNT,
+                gateway_control_ok ? 1U : 0U,
+                fc_heartbeat_fresh ? 1U : 0U,
+                mathos_rc_state_to_string(command_state));
+        }
+
+#endif
+#if DEBUG_E07_B_FC_STREAM_SUPPRESSION_TEST
+
+        if (command_state == RC_ARMED &&
+            gateway_control_ok &&
+            !fc_heartbeat_fresh &&
+            !e07_b_event_active &&
+            e07_b_trial_count < E07_B_TARGET_COUNT)
+        {
+            e07_b_event_active = true;
+            e07_b_fc_stale_seen = true;
+            e07_b_stale_detect_tick =
+                xTaskGetTickCount();
+
+            printf(
+                "[E07-B] FC STREAM STALE WHILE LINK HEALTHY "
+                "trial=%lu/%u "
+                "gateway_link=%u "
+                "fc_fresh=%u "
+                "command=%s\n",
+                (unsigned long)(e07_b_trial_count + 1U),
+                (unsigned int)E07_B_TARGET_COUNT,
+                gateway_control_ok ? 1U : 0U,
+                fc_heartbeat_fresh ? 1U : 0U,
+                mathos_rc_state_to_string(command_state));
+        }
+
+#endif
+
+#if DEBUG_E06_B_GATEWAY_DOWNLINK_INTERRUPTION_TEST
+
+        int e06_b_status_valid;
+        TickType_t e06_b_status_last_update;
+
+        taskENTER_CRITICAL(&gateway_status_mux);
+        e06_b_status_valid = gateway_status_valid;
+        e06_b_status_last_update = gateway_status_last_update_tick;
+        taskEXIT_CRITICAL(&gateway_status_mux);
+
+        if (command_state == RC_ARMED &&
+            e06_b_status_valid &&
+            !e06_b_interruption_active &&
+            e06_b_trial_count < E06_B_TARGET_COUNT)
+        {
+            TickType_t status_age_ticks =
+                now - e06_b_status_last_update;
+
+            uint32_t status_age_ms =
+                pdTICKS_TO_MS(status_age_ticks);
+
+            if (status_age_ms > GATEWAY_STATUS_FRESH_MS)
+            {
+                e06_b_interruption_active = true;
+                e06_b_status_stale_seen = true;
+                e06_b_last_gateway_status_tick =
+                    e06_b_status_last_update;
+                e06_b_stale_detect_tick = now;
+
+                printf(
+                    "[E06-B] DOWNLINK STALE "
+                    "trial=%lu/%u "
+                    "status_age=%lu ms "
+                    "command=%s\n",
+                    (unsigned long)(e06_b_trial_count + 1U),
+                    (unsigned int)E06_B_TARGET_COUNT,
+                    (unsigned long)status_age_ms,
+                    mathos_rc_state_to_string(command_state));
+            }
+        }
+
+#endif
+#if DEBUG_E06_C_BIDIRECTIONAL_INTERRUPTION_TEST
+
+        int e06_c_status_valid;
+        TickType_t e06_c_status_last_update;
+
+        taskENTER_CRITICAL(&gateway_status_mux);
+        e06_c_status_valid = gateway_status_valid;
+        e06_c_status_last_update = gateway_status_last_update_tick;
+        taskEXIT_CRITICAL(&gateway_status_mux);
+
+        if (command_state == RC_ARMED &&
+            e06_c_status_valid &&
+            !e06_c_interruption_active &&
+            e06_c_trial_count < E06_C_TARGET_COUNT)
+        {
+            TickType_t status_age_ticks =
+                now - e06_c_status_last_update;
+
+            uint32_t status_age_ms =
+                pdTICKS_TO_MS(status_age_ticks);
+
+            if (status_age_ms > GATEWAY_STATUS_FRESH_MS)
+            {
+                e06_c_interruption_active = true;
+                e06_c_status_stale_seen = true;
+                e06_c_stale_detect_tick = now;
+
+                printf(
+                    "[E06-C] DOWNLINK STALE "
+                    "trial=%lu/%u "
+                    "status_age=%lu ms "
+                    "command=%s\n",
+                    (unsigned long)(e06_c_trial_count + 1U),
+                    (unsigned int)E06_C_TARGET_COUNT,
+                    (unsigned long)status_age_ms,
+                    mathos_rc_state_to_string(command_state));
+            }
+        }
+
+#endif
         /*
             DRONE_LINK_BAD means the RC-to-gateway
             control link itself is unavailable.
@@ -3830,6 +4315,66 @@ void system_health_task(void *pvParameters)
             printf(
                 "[HEALTH] FAILSAFE: "
                 "gateway control link bad while ARMED\n");
+#if DEBUG_E06_B_GATEWAY_DOWNLINK_INTERRUPTION_TEST
+
+            if (e06_b_interruption_active &&
+                e06_b_status_stale_seen &&
+                !e06_b_failsafe_seen &&
+                e06_b_trial_count < E06_B_TARGET_COUNT)
+            {
+                e06_b_failsafe_seen = true;
+
+                TickType_t now_tick =
+                    xTaskGetTickCount();
+
+                uint32_t since_stale_ms =
+                    pdTICKS_TO_MS(
+                        now_tick -
+                        e06_b_stale_detect_tick);
+
+                printf(
+                    "[E06-B] RC FAILSAFE ENTERED "
+                    "trial=%lu/%u "
+                    "after_stale=%lu ms "
+                    "command=%s\n",
+                    (unsigned long)(e06_b_trial_count + 1U),
+                    (unsigned int)E06_B_TARGET_COUNT,
+                    (unsigned long)since_stale_ms,
+                    mathos_rc_state_to_string(
+                        drone_command_get()));
+            }
+
+#endif
+#if DEBUG_E06_C_BIDIRECTIONAL_INTERRUPTION_TEST
+
+            if (e06_c_interruption_active &&
+                e06_c_status_stale_seen &&
+                !e06_c_failsafe_seen &&
+                e06_c_trial_count < E06_C_TARGET_COUNT)
+            {
+                e06_c_failsafe_seen = true;
+
+                TickType_t now_tick =
+                    xTaskGetTickCount();
+
+                uint32_t since_stale_ms =
+                    pdTICKS_TO_MS(
+                        now_tick -
+                        e06_c_stale_detect_tick);
+
+                printf(
+                    "[E06-C] RC FAILSAFE ENTERED "
+                    "trial=%lu/%u "
+                    "after_stale=%lu ms "
+                    "command=%s\n",
+                    (unsigned long)(e06_c_trial_count + 1U),
+                    (unsigned int)E06_C_TARGET_COUNT,
+                    (unsigned long)since_stale_ms,
+                    mathos_rc_state_to_string(
+                        drone_command_get()));
+            }
+
+#endif
         }
         else if (command_state == RC_ARMED &&
                  !fc_heartbeat_fresh)
@@ -3844,6 +4389,64 @@ void system_health_task(void *pvParameters)
                 "FC heartbeat stale while ARMED\n");
         }
 
+#if DEBUG_E07_A_FC_HEARTBEAT_SUPPRESSION_TEST
+
+        if (e07_a_event_active &&
+            e07_a_fc_stale_seen &&
+            !e07_a_failsafe_seen &&
+            e07_a_trial_count < E07_A_TARGET_COUNT)
+        {
+            e07_a_failsafe_seen = true;
+
+            uint32_t since_stale_ms =
+                pdTICKS_TO_MS(
+                    xTaskGetTickCount() -
+                    e07_a_stale_detect_tick);
+
+            printf(
+                "[E07-A] RC FAILSAFE ENTERED "
+                "trial=%lu/%u "
+                "after_stale=%lu ms "
+                "gateway_link=%u "
+                "command=%s\n",
+                (unsigned long)(e07_a_trial_count + 1U),
+                (unsigned int)E07_A_TARGET_COUNT,
+                (unsigned long)since_stale_ms,
+                gateway_control_link_is_ok() ? 1U : 0U,
+                mathos_rc_state_to_string(
+                    drone_command_get()));
+        }
+
+#endif
+#if DEBUG_E07_B_FC_STREAM_SUPPRESSION_TEST
+
+        if (e07_b_event_active &&
+            e07_b_fc_stale_seen &&
+            !e07_b_failsafe_seen &&
+            e07_b_trial_count < E07_B_TARGET_COUNT)
+        {
+            e07_b_failsafe_seen = true;
+
+            uint32_t since_stale_ms =
+                pdTICKS_TO_MS(
+                    xTaskGetTickCount() -
+                    e07_b_stale_detect_tick);
+
+            printf(
+                "[E07-B] RC FAILSAFE ENTERED "
+                "trial=%lu/%u "
+                "after_stale=%lu ms "
+                "gateway_link=%u "
+                "command=%s\n",
+                (unsigned long)(e07_b_trial_count + 1U),
+                (unsigned int)E07_B_TARGET_COUNT,
+                (unsigned long)since_stale_ms,
+                gateway_control_link_is_ok() ? 1U : 0U,
+                mathos_rc_state_to_string(
+                    drone_command_get()));
+        }
+
+#endif
 #endif
 #if FEATURE_DIRECT_MAVLINK_MODE
 
@@ -4900,6 +5503,20 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
     static uint32_t ok_count = 0;
     static uint32_t bad_count = 0;
     static uint32_t replay_count = 0;
+#if DEBUG_GATEWAY_WRONG_DIRECTION_RX_TEST
+    static uint32_t gateway_wrong_direction_reject_count = 0U;
+#endif
+
+#if DEBUG_GATEWAY_WRONG_IDENTITY_RX_TEST
+    static uint32_t gateway_wrong_identity_reject_count = 0U;
+#endif
+#if DEBUG_GATEWAY_EXACT_DUPLICATE_RX_TEST
+    static uint32_t exact_duplicate_reject_count = 0;
+#endif
+
+#if DEBUG_GATEWAY_OLD_SEQUENCE_RX_TEST
+    static uint32_t old_sequence_reject_count = 0;
+#endif
     int new_gateway_session = 0;
 
     if (frame == NULL || frame_len == 0)
@@ -4966,9 +5583,188 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
             return;
         }
 
+        /*
+         * E13-B4:
+         * Measure successful operational authenticated
+         * decryption of Gateway -> RC STATUS and TELEMETRY.
+         *
+         * Wire decoding is NOT included.
+         * Session-establishment packets are NOT included.
+         */
+        enum
+        {
+            E13_RC_RX_AEAD_TARGET = 10000,
+            E13_RC_RX_AEAD_HIST_MAX_US = 2000
+        };
+
+        static uint32_t e13_rc_rx_aead_count = 0U;
+        static uint64_t e13_rc_rx_aead_total_us = 0ULL;
+        static int64_t e13_rc_rx_aead_max_us = 0;
+
+        static uint16_t
+            e13_rc_rx_aead_hist[
+                E13_RC_RX_AEAD_HIST_MAX_US + 1] = {0};
+
+        static uint32_t e13_rc_rx_aead_overflow = 0U;
+        static uint32_t e13_rc_rx_status_count = 0U;
+        static uint32_t e13_rc_rx_telemetry_count = 0U;
+
+        static bool e13_rc_rx_aead_final_printed = false;
+
+        const uint8_t e13_rc_rx_payload_type =
+            packet.payload_type;
+
+        int64_t e13_rc_rx_aead_start_us =
+            esp_timer_get_time();
+
         crypto_status =
             mathos_secure_decrypt_session_packet(
                 &packet);
+
+        int64_t e13_rc_rx_aead_us =
+            esp_timer_get_time() -
+            e13_rc_rx_aead_start_us;
+
+        if (crypto_status == MATHOS_SECURE_STATUS_OK &&
+            e13_rc_rx_aead_us >= 0 &&
+            e13_rc_rx_aead_count < E13_RC_RX_AEAD_TARGET)
+        {
+            e13_rc_rx_aead_count++;
+
+            e13_rc_rx_aead_total_us +=
+                (uint64_t)e13_rc_rx_aead_us;
+
+            if (e13_rc_rx_aead_us >
+                e13_rc_rx_aead_max_us)
+            {
+                e13_rc_rx_aead_max_us =
+                    e13_rc_rx_aead_us;
+            }
+
+            if (e13_rc_rx_aead_us <=
+                E13_RC_RX_AEAD_HIST_MAX_US)
+            {
+                e13_rc_rx_aead_hist[
+                    e13_rc_rx_aead_us]++;
+            }
+            else
+            {
+                e13_rc_rx_aead_overflow++;
+            }
+
+            if (e13_rc_rx_payload_type ==
+                SECURITY_PAYLOAD_TYPE_GATEWAY_STATUS)
+            {
+                e13_rc_rx_status_count++;
+            }
+            else if (e13_rc_rx_payload_type ==
+                     SECURITY_PAYLOAD_TYPE_GATEWAY_TELEMETRY)
+            {
+                e13_rc_rx_telemetry_count++;
+            }
+
+            /*
+             * Progress output occurs AFTER the measured
+             * decrypt call, once every 1000 samples.
+             */
+            if ((e13_rc_rx_aead_count % 1000U) == 0U &&
+                e13_rc_rx_aead_count <
+                    E13_RC_RX_AEAD_TARGET)
+            {
+                printf(
+                    "[E13 AEAD RC-RX PROGRESS] "
+                    "n=%lu/%u status_n=%lu telemetry_n=%lu\n",
+                    (unsigned long)e13_rc_rx_aead_count,
+                    E13_RC_RX_AEAD_TARGET,
+                    (unsigned long)e13_rc_rx_status_count,
+                    (unsigned long)e13_rc_rx_telemetry_count);
+            }
+
+            if (e13_rc_rx_aead_count ==
+                    E13_RC_RX_AEAD_TARGET &&
+                !e13_rc_rx_aead_final_printed)
+            {
+                uint32_t cumulative = 0U;
+
+                uint32_t p50_us =
+                    E13_RC_RX_AEAD_HIST_MAX_US + 1U;
+
+                uint32_t p95_us =
+                    E13_RC_RX_AEAD_HIST_MAX_US + 1U;
+
+                uint32_t p99_us =
+                    E13_RC_RX_AEAD_HIST_MAX_US + 1U;
+
+                const uint32_t p50_rank =
+                    (E13_RC_RX_AEAD_TARGET * 50U + 99U) /
+                    100U;
+
+                const uint32_t p95_rank =
+                    (E13_RC_RX_AEAD_TARGET * 95U + 99U) /
+                    100U;
+
+                const uint32_t p99_rank =
+                    (E13_RC_RX_AEAD_TARGET * 99U + 99U) /
+                    100U;
+
+                for (uint32_t us = 0U;
+                     us <= E13_RC_RX_AEAD_HIST_MAX_US;
+                     us++)
+                {
+                    cumulative +=
+                        e13_rc_rx_aead_hist[us];
+
+                    if (p50_us >
+                            E13_RC_RX_AEAD_HIST_MAX_US &&
+                        cumulative >= p50_rank)
+                    {
+                        p50_us = us;
+                    }
+
+                    if (p95_us >
+                            E13_RC_RX_AEAD_HIST_MAX_US &&
+                        cumulative >= p95_rank)
+                    {
+                        p95_us = us;
+                    }
+
+                    if (p99_us >
+                            E13_RC_RX_AEAD_HIST_MAX_US &&
+                        cumulative >= p99_rank)
+                    {
+                        p99_us = us;
+                    }
+                }
+
+                double mean_us =
+                    (double)e13_rc_rx_aead_total_us /
+                    (double)e13_rc_rx_aead_count;
+
+                printf(
+                    "[E13 AEAD RC-RX FINAL] "
+                    "n=%lu "
+                    "status_n=%lu "
+                    "telemetry_n=%lu "
+                    "mean_us=%.2f "
+                    "p50_us=%lu "
+                    "p95_us=%lu "
+                    "p99_us=%lu "
+                    "max_us=%lld "
+                    "overflow_gt_2000us=%lu "
+                    "resolution_us=1\n",
+                    (unsigned long)e13_rc_rx_aead_count,
+                    (unsigned long)e13_rc_rx_status_count,
+                    (unsigned long)e13_rc_rx_telemetry_count,
+                    mean_us,
+                    (unsigned long)p50_us,
+                    (unsigned long)p95_us,
+                    (unsigned long)p99_us,
+                    (long long)e13_rc_rx_aead_max_us,
+                    (unsigned long)e13_rc_rx_aead_overflow);
+
+                e13_rc_rx_aead_final_printed = true;
+            }
+        }
     }
     else
     {
@@ -4983,15 +5779,191 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
 
     if (crypto_status != MATHOS_SECURE_STATUS_OK)
     {
-        bad_count++;
+        static uint32_t gateway_auth_fail_count = 0;
 
-        if ((bad_count % 20) == 1)
+        bad_count++;
+        gateway_auth_fail_count++;
+
+#if DEBUG_E05_B_ARCHIVED_REPLAY_RX_TEST
+        /*
+            E05-B receiver instrumentation.
+
+            After RC reboot:
+              - RC has a new persistent RC session,
+              - Gateway session remains unchanged,
+              - fresh directional operational keys are derived,
+              - current-session Gateway traffic is accepted first.
+
+            The archived old-session STATUS frame should then:
+              1. decode normally,
+              2. fail AEAD authentication under the new RX key,
+              3. retain the same Gateway session identifier,
+              4. carry an older sequence than current traffic.
+        */
+        static uint32_t
+            e05_b_archived_reject_count = 0U;
+
+        static uint32_t
+            e05_b_archived_sequence = 0U;
+
+        if (packet.payload_type ==
+                SECURITY_PAYLOAD_TYPE_GATEWAY_STATUS &&
+            rc_operational_session_ready &&
+            gateway_session_candidate_valid &&
+            gateway_session_candidate_id != 0U &&
+            packet.timestamp_ms ==
+                gateway_session_candidate_id &&
+            crypto_status ==
+                MATHOS_SECURE_STATUS_AUTH_FAILED &&
+            packet.sequence != 0U &&
+            packet.sequence < last_sequence)
         {
-            printf("[GATEWAY RX] crypto BAD status=%s bad_count=%lu len=%u\n",
-                   mathos_secure_status_to_string(crypto_status),
-                   (unsigned long)bad_count,
-                   (unsigned int)frame_len);
+            /*
+                First qualifying rejection establishes the
+                archived sequence for this E05-B run.
+            */
+            if (e05_b_archived_reject_count == 0U)
+            {
+                e05_b_archived_sequence =
+                    packet.sequence;
+            }
+
+            /*
+                Count only repeated rejection of the exact
+                same archived frame sequence.
+            */
+            if (packet.sequence ==
+                e05_b_archived_sequence)
+            {
+                e05_b_archived_reject_count++;
+
+                if (e05_b_archived_reject_count == 1U ||
+                    (e05_b_archived_reject_count % 10U) == 0U ||
+                    e05_b_archived_reject_count ==
+                        E05_B_ARCHIVED_REPLAY_RX_TARGET_COUNT)
+                {
+                    printf(
+                        "[SECURITY TEST] "
+                        "E05-B ARCHIVED REPLAY REJECTED "
+                        "count=%lu/%u "
+                        "status=%s "
+                        "archived_seq=%lu "
+                        "last=%lu "
+                        "rc_session=%lu "
+                        "gateway_session=%lu\n",
+                        (unsigned long)
+                            e05_b_archived_reject_count,
+                        (unsigned int)
+                            E05_B_ARCHIVED_REPLAY_RX_TARGET_COUNT,
+                        mathos_secure_status_to_string(
+                            crypto_status),
+                        (unsigned long)
+                            packet.sequence,
+                        (unsigned long)
+                            last_sequence,
+                        (unsigned long)
+                            mathos_session_id,
+                        (unsigned long)
+                            gateway_session_candidate_id);
+                }
+
+                if (e05_b_archived_reject_count ==
+                    E05_B_ARCHIVED_REPLAY_RX_TARGET_COUNT)
+                {
+                    printf(
+                        "[SECURITY TEST] "
+                        "E05-B RX COMPLETE "
+                        "rejected=%lu/%u "
+                        "archived_seq=%lu\n",
+                        (unsigned long)
+                            e05_b_archived_reject_count,
+                        (unsigned int)
+                            E05_B_ARCHIVED_REPLAY_RX_TARGET_COUNT,
+                        (unsigned long)
+                            e05_b_archived_sequence);
+                }
+
+                return;
+            }
         }
+#endif
+
+#if DEBUG_GATEWAY_WRONG_KEY_RX_TEST
+
+        if (packet.payload_type ==
+                SECURITY_PAYLOAD_TYPE_GATEWAY_STATUS &&
+            crypto_status ==
+                MATHOS_SECURE_STATUS_AUTH_FAILED)
+        {
+            gateway_wrong_key_reject_count++;
+
+            if (gateway_wrong_key_reject_count == 1U ||
+                (gateway_wrong_key_reject_count %
+                 100U) == 0U ||
+                gateway_wrong_key_reject_count ==
+                    GATEWAY_WRONG_KEY_RX_TARGET_COUNT)
+            {
+                printf(
+                    "[SECURITY TEST] "
+                    "GATEWAY WRONG KEY REJECTED "
+                    "count=%lu/%u "
+                    "status=%s "
+                    "bad_count=%lu\n",
+                    (unsigned long)
+                        gateway_wrong_key_reject_count,
+                    (unsigned int)
+                        GATEWAY_WRONG_KEY_RX_TARGET_COUNT,
+                    mathos_secure_status_to_string(
+                        crypto_status),
+                    (unsigned long)bad_count);
+            }
+        }
+
+#endif
+#if DEBUG_GATEWAY_WRONG_DIRECTION_RX_TEST
+
+        if (packet.payload_type ==
+                SECURITY_PAYLOAD_TYPE_GATEWAY_STATUS &&
+            crypto_status ==
+                MATHOS_SECURE_STATUS_AUTH_FAILED)
+        {
+            gateway_wrong_direction_reject_count++;
+
+            if (gateway_wrong_direction_reject_count == 1U ||
+                (gateway_wrong_direction_reject_count %
+                 100U) == 0U ||
+                gateway_wrong_direction_reject_count ==
+                    GATEWAY_WRONG_DIRECTION_RX_TARGET_COUNT)
+            {
+                printf(
+                    "[SECURITY TEST] "
+                    "GATEWAY WRONG DIRECTION REJECTED "
+                    "count=%lu/%u "
+                    "status=%s "
+                    "bad_count=%lu\n",
+                    (unsigned long)
+                        gateway_wrong_direction_reject_count,
+                    (unsigned int)
+                        GATEWAY_WRONG_DIRECTION_RX_TARGET_COUNT,
+                    mathos_secure_status_to_string(
+                        crypto_status),
+                    (unsigned long)bad_count);
+            }
+        }
+
+#endif
+        if (gateway_auth_fail_count == 1U ||
+            (gateway_auth_fail_count % 100U) == 0U)
+        {
+            printf(
+                "[SECURITY TEST] GATEWAY AUTH FAIL "
+                "count=%lu status=%s bad_count=%lu len=%u\n",
+                (unsigned long)gateway_auth_fail_count,
+                mathos_secure_status_to_string(crypto_status),
+                (unsigned long)bad_count,
+                (unsigned int)frame_len);
+        }
+
         return;
     }
 
@@ -5000,10 +5972,38 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
     {
         bad_count++;
 
+#if DEBUG_GATEWAY_WRONG_IDENTITY_RX_TEST
+
+        gateway_wrong_identity_reject_count++;
+
+        if (gateway_wrong_identity_reject_count == 1U ||
+            (gateway_wrong_identity_reject_count % 100U) == 0U ||
+            gateway_wrong_identity_reject_count ==
+                GATEWAY_WRONG_IDENTITY_RX_TARGET_COUNT)
+        {
+            printf(
+                "[SECURITY TEST] "
+                "GATEWAY WRONG IDENTITY REJECTED "
+                "count=%lu/%u "
+                "controller_id=%u expected=%u "
+                "bad_count=%lu\n",
+                (unsigned long)
+                    gateway_wrong_identity_reject_count,
+                (unsigned int)
+                    GATEWAY_WRONG_IDENTITY_RX_TARGET_COUNT,
+                packet.controller_id,
+                rc_runtime_pairing_config.authorised_gateway_id,
+                (unsigned long)bad_count);
+        }
+
+#else
+
         printf(
             "[GATEWAY RX] bad controller_id=%u expected=%u\n",
             packet.controller_id,
             rc_runtime_pairing_config.authorised_gateway_id);
+
+#endif
 
         return;
     }
@@ -5350,7 +6350,38 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
         }
 
         rc_operational_session_ready = 1;
+#if DEBUG_GATEWAY_WRONG_DIRECTION_RX_TEST
 
+        gateway_wrong_direction_reject_count = 0U;
+
+        printf(
+            "[SECURITY TEST] "
+            "Gateway wrong-direction RX counter reset "
+            "for operational session\n");
+
+#endif
+
+#if DEBUG_GATEWAY_WRONG_KEY_RX_TEST
+
+        gateway_wrong_key_reject_count = 0U;
+
+        printf(
+            "[SECURITY TEST] "
+            "Gateway wrong-key RX counter reset "
+            "for operational session\n");
+
+#endif
+
+#if DEBUG_GATEWAY_WRONG_IDENTITY_RX_TEST
+
+        gateway_wrong_identity_reject_count = 0U;
+
+        printf(
+            "[SECURITY TEST] "
+            "Gateway wrong-identity RX counter reset "
+            "for operational session\n");
+
+#endif
         printf(
             "[SESSION] READY "
             "rc=%lu gateway=%lu\n",
@@ -5451,11 +6482,34 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
         last_session_id =
             session_id;
 
-        last_sequence = 0;
-        has_session = 1;
+#if DEBUG_GATEWAY_OLD_SEQUENCE_RX_TEST
+
+        old_sequence_reject_count = 0;
+
+        printf(
+            "[SECURITY TEST] "
+            "Gateway old-sequence RX counter reset "
+            "for initial session\n");
+
+#endif
+
+last_sequence = 0;
+
+e12b_rx_reset(
+    bad_count,
+    replay_count);
+
+has_session = 1;
 
         gateway_session_remember(session_id);
+#if DEBUG_GATEWAY_EXACT_DUPLICATE_RX_TEST
+        exact_duplicate_reject_count = 0;
 
+        printf(
+            "[SECURITY TEST] "
+            "Gateway exact duplicate RX counter reset "
+            "for initial session\n");
+#endif
         /*
         Data received from the previous gateway boot must
         no longer remain trusted.
@@ -5518,7 +6572,27 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
             session_id;
 
         last_sequence = 0;
+e12b_rx_reset(
+    bad_count,
+    replay_count);
+#if DEBUG_GATEWAY_EXACT_DUPLICATE_RX_TEST
+        exact_duplicate_reject_count = 0;
 
+        printf(
+            "[SECURITY TEST] "
+            "Gateway exact duplicate RX counter reset "
+            "for new session\n");
+#endif
+#if DEBUG_GATEWAY_OLD_SEQUENCE_RX_TEST
+
+        old_sequence_reject_count = 0;
+
+        printf(
+            "[SECURITY TEST] "
+            "Gateway old-sequence RX counter reset "
+            "for new session\n");
+
+#endif
         gateway_session_remember(
             session_id);
 
@@ -5549,15 +6623,86 @@ status or telemetry from the previous session.
     {
         replay_count++;
 
-        printf("[GATEWAY RX] REPLAY/OLD session=0x%08lx seq=%lu last=%lu replay_count=%lu\n",
-               (unsigned long)session_id,
-               (unsigned long)packet.sequence,
-               (unsigned long)last_sequence,
-               (unsigned long)replay_count);
+#if DEBUG_GATEWAY_EXACT_DUPLICATE_RX_TEST
+
+        if (packet.sequence == last_sequence)
+        {
+            exact_duplicate_reject_count++;
+
+            if (exact_duplicate_reject_count == 1U ||
+                (exact_duplicate_reject_count % 100U) == 0U ||
+                exact_duplicate_reject_count ==
+                    GATEWAY_EXACT_DUPLICATE_RX_TARGET_COUNT)
+            {
+                printf(
+                    "[SECURITY TEST] "
+                    "GATEWAY EXACT DUPLICATE REJECTED "
+                    "count=%lu/%u "
+                    "session=0x%08lx "
+                    "seq=%lu last=%lu "
+                    "replay_count=%lu\n",
+                    (unsigned long)
+                        exact_duplicate_reject_count,
+                    (unsigned int)
+                        GATEWAY_EXACT_DUPLICATE_RX_TARGET_COUNT,
+                    (unsigned long)session_id,
+                    (unsigned long)packet.sequence,
+                    (unsigned long)last_sequence,
+                    (unsigned long)replay_count);
+            }
+
+            return;
+        }
+
+#endif
+#if DEBUG_GATEWAY_OLD_SEQUENCE_RX_TEST
+
+        if (packet.sequence < last_sequence)
+        {
+            old_sequence_reject_count++;
+
+            if (old_sequence_reject_count == 1U ||
+                (old_sequence_reject_count % 100U) == 0U ||
+                old_sequence_reject_count ==
+                    GATEWAY_OLD_SEQUENCE_RX_TARGET_COUNT)
+            {
+                printf(
+                    "[SECURITY TEST] "
+                    "GATEWAY OLD SEQUENCE REJECTED "
+                    "count=%lu/%u "
+                    "session=0x%08lx "
+                    "replay_seq=%lu last=%lu "
+                    "replay_count=%lu\n",
+                    (unsigned long)
+                        old_sequence_reject_count,
+                    (unsigned int)
+                        GATEWAY_OLD_SEQUENCE_RX_TARGET_COUNT,
+                    (unsigned long)session_id,
+                    (unsigned long)packet.sequence,
+                    (unsigned long)last_sequence,
+                    (unsigned long)replay_count);
+            }
+
+            return;
+        }
+
+#endif
+        printf(
+            "[GATEWAY RX] REPLAY/OLD "
+            "session=0x%08lx seq=%lu last=%lu "
+            "replay_count=%lu\n",
+            (unsigned long)session_id,
+            (unsigned long)packet.sequence,
+            (unsigned long)last_sequence,
+            (unsigned long)replay_count);
+
         return;
     }
 
-    last_sequence = packet.sequence;
+    uint32_t e12b_previous_sequence =
+    last_sequence;
+
+last_sequence = packet.sequence;
     fault_clear(FAULT_PACKET_SEQUENCE);
     if (new_gateway_session &&
         (drone_command_get() == RC_ARMED ||
@@ -5715,8 +6860,404 @@ status or telemetry from the previous session.
         validated_status_session_id = session_id;
         gateway_status_update(&status);
         gateway_status_apply_to_remote(&status);
-        ok_count++;
+#if DEBUG_E07_A_FC_HEARTBEAT_SUPPRESSION_TEST
 
+        /*
+            Do not evaluate the trial until FC heartbeat freshness
+            has actually returned.
+        */
+        if (e07_a_event_active &&
+            e07_a_fc_stale_seen &&
+            e07_a_failsafe_seen &&
+            status.fc_heartbeat_fresh == 1 &&
+            e07_a_trial_count < E07_A_TARGET_COUNT)
+        {
+            TickType_t now_tick =
+                xTaskGetTickCount();
+
+            uint32_t since_stale_ms =
+                pdTICKS_TO_MS(
+                    now_tick -
+                    e07_a_stale_detect_tick);
+
+            rc_state_t current_command =
+                drone_command_get();
+
+            bool trial_pass =
+                (current_command == RC_FAILSAFE &&
+                 status.fc_heartbeat_fresh == 1 &&
+                 status.fc_is_armed == 0 &&
+                 status.gateway_link_ok == 1);
+
+            e07_a_trial_count++;
+
+            if (trial_pass)
+            {
+                e07_a_pass_count++;
+
+                printf(
+                    "[E07-A] TRIAL PASS "
+                    "trial=%lu/%u "
+                    "passes=%lu fails=%lu "
+                    "command=%s "
+                    "fc_fresh=%u "
+                    "fc_armed=%u "
+                    "gateway_link=%u "
+                    "since_stale=%lu ms\n",
+                    (unsigned long)e07_a_trial_count,
+                    (unsigned int)E07_A_TARGET_COUNT,
+                    (unsigned long)e07_a_pass_count,
+                    (unsigned long)e07_a_fail_count,
+                    mathos_rc_state_to_string(
+                        current_command),
+                    status.fc_heartbeat_fresh,
+                    status.fc_is_armed,
+                    status.gateway_link_ok,
+                    (unsigned long)since_stale_ms);
+            }
+            else
+            {
+                e07_a_fail_count++;
+
+                printf(
+                    "[E07-A] TRIAL FAIL "
+                    "trial=%lu/%u "
+                    "passes=%lu fails=%lu "
+                    "command=%s "
+                    "fc_fresh=%u "
+                    "fc_armed=%u "
+                    "gateway_link=%u\n",
+                    (unsigned long)e07_a_trial_count,
+                    (unsigned int)E07_A_TARGET_COUNT,
+                    (unsigned long)e07_a_pass_count,
+                    (unsigned long)e07_a_fail_count,
+                    mathos_rc_state_to_string(
+                        current_command),
+                    status.fc_heartbeat_fresh,
+                    status.fc_is_armed,
+                    status.gateway_link_ok);
+            }
+
+            e07_a_event_active = false;
+            e07_a_fc_stale_seen = false;
+            e07_a_failsafe_seen = false;
+            e07_a_stale_detect_tick = 0;
+
+            if (e07_a_trial_count ==
+                E07_A_TARGET_COUNT)
+            {
+                printf(
+                    "[E07-A] COMPLETE "
+                    "executed=%lu "
+                    "passed=%lu "
+                    "failed=%lu\n",
+                    (unsigned long)e07_a_trial_count,
+                    (unsigned long)e07_a_pass_count,
+                    (unsigned long)e07_a_fail_count);
+            }
+        }
+
+#endif
+#if DEBUG_E07_B_FC_STREAM_SUPPRESSION_TEST
+
+        /*
+            Complete the E07-B trial only after the restored
+            Gateway status reports a fresh FC heartbeat again.
+
+            PASS requires:
+              - RC command remains FAILSAFE;
+              - FC heartbeat freshness restored;
+              - FC heartbeat confirms DISARMED;
+              - Gateway control link remained healthy.
+        */
+        if (e07_b_event_active &&
+            e07_b_fc_stale_seen &&
+            e07_b_failsafe_seen &&
+            status.fc_heartbeat_fresh == 1 &&
+            e07_b_trial_count < E07_B_TARGET_COUNT)
+        {
+            TickType_t now_tick =
+                xTaskGetTickCount();
+
+            uint32_t since_stale_ms =
+                pdTICKS_TO_MS(
+                    now_tick -
+                    e07_b_stale_detect_tick);
+
+            rc_state_t current_command =
+                drone_command_get();
+
+            bool trial_pass =
+                (current_command == RC_FAILSAFE &&
+                 status.fc_heartbeat_fresh == 1 &&
+                 status.fc_is_armed == 0 &&
+                 status.gateway_link_ok == 1);
+
+            e07_b_trial_count++;
+
+            if (trial_pass)
+            {
+                e07_b_pass_count++;
+
+                printf(
+                    "[E07-B] TRIAL PASS "
+                    "trial=%lu/%u "
+                    "passes=%lu fails=%lu "
+                    "command=%s "
+                    "fc_fresh=%u "
+                    "fc_armed=%u "
+                    "gateway_link=%u "
+                    "since_stale=%lu ms\n",
+                    (unsigned long)e07_b_trial_count,
+                    (unsigned int)E07_B_TARGET_COUNT,
+                    (unsigned long)e07_b_pass_count,
+                    (unsigned long)e07_b_fail_count,
+                    mathos_rc_state_to_string(
+                        current_command),
+                    status.fc_heartbeat_fresh,
+                    status.fc_is_armed,
+                    status.gateway_link_ok,
+                    (unsigned long)since_stale_ms);
+            }
+            else
+            {
+                e07_b_fail_count++;
+
+                printf(
+                    "[E07-B] TRIAL FAIL "
+                    "trial=%lu/%u "
+                    "passes=%lu fails=%lu "
+                    "command=%s "
+                    "fc_fresh=%u "
+                    "fc_armed=%u "
+                    "gateway_link=%u\n",
+                    (unsigned long)e07_b_trial_count,
+                    (unsigned int)E07_B_TARGET_COUNT,
+                    (unsigned long)e07_b_pass_count,
+                    (unsigned long)e07_b_fail_count,
+                    mathos_rc_state_to_string(
+                        current_command),
+                    status.fc_heartbeat_fresh,
+                    status.fc_is_armed,
+                    status.gateway_link_ok);
+            }
+
+            /*
+                Reset experiment instrumentation only.
+                Keep the real RC command/state machine untouched.
+            */
+            e07_b_event_active = false;
+            e07_b_fc_stale_seen = false;
+            e07_b_failsafe_seen = false;
+            e07_b_stale_detect_tick = 0;
+
+            if (e07_b_trial_count ==
+                E07_B_TARGET_COUNT)
+            {
+                printf(
+                    "[E07-B] COMPLETE "
+                    "executed=%lu "
+                    "passed=%lu "
+                    "failed=%lu\n",
+                    (unsigned long)e07_b_trial_count,
+                    (unsigned long)e07_b_pass_count,
+                    (unsigned long)e07_b_fail_count);
+            }
+        }
+
+#endif
+#if DEBUG_E06_B_GATEWAY_DOWNLINK_INTERRUPTION_TEST
+
+        if (e06_b_interruption_active &&
+            e06_b_status_stale_seen &&
+            e06_b_failsafe_seen &&
+            !e06_b_restoration_seen &&
+            e06_b_trial_count < E06_B_TARGET_COUNT)
+        {
+            e06_b_restoration_seen = true;
+
+            TickType_t now_tick = xTaskGetTickCount();
+
+            uint32_t since_stale_ms =
+                pdTICKS_TO_MS(
+                    now_tick -
+                    e06_b_stale_detect_tick);
+
+            rc_state_t current_command =
+                drone_command_get();
+
+            bool trial_pass =
+                (current_command == RC_FAILSAFE &&
+                 status.fc_is_armed == 0);
+
+            e06_b_trial_count++;
+
+            if (trial_pass)
+            {
+                e06_b_pass_count++;
+
+                printf(
+                    "[E06-B] TRIAL PASS "
+                    "trial=%lu/%u "
+                    "passes=%lu "
+                    "fails=%lu "
+                    "command=%s "
+                    "fc_armed=%u "
+                    "since_stale=%lu ms\n",
+                    (unsigned long)e06_b_trial_count,
+                    (unsigned int)E06_B_TARGET_COUNT,
+                    (unsigned long)e06_b_pass_count,
+                    (unsigned long)e06_b_fail_count,
+                    mathos_rc_state_to_string(current_command),
+                    status.fc_is_armed,
+                    (unsigned long)since_stale_ms);
+            }
+            else
+            {
+                e06_b_fail_count++;
+
+                printf(
+                    "[E06-B] TRIAL FAIL "
+                    "trial=%lu/%u "
+                    "passes=%lu "
+                    "fails=%lu "
+                    "command=%s "
+                    "fc_armed=%u\n",
+                    (unsigned long)e06_b_trial_count,
+                    (unsigned int)E06_B_TARGET_COUNT,
+                    (unsigned long)e06_b_pass_count,
+                    (unsigned long)e06_b_fail_count,
+                    mathos_rc_state_to_string(current_command),
+                    status.fc_is_armed);
+            }
+
+            e06_b_interruption_active = false;
+            e06_b_status_stale_seen = false;
+            e06_b_failsafe_seen = false;
+            e06_b_restoration_seen = false;
+            e06_b_last_gateway_status_tick = 0;
+            e06_b_stale_detect_tick = 0;
+
+            if (e06_b_trial_count == E06_B_TARGET_COUNT)
+            {
+                printf(
+                    "[E06-B] COMPLETE "
+                    "executed=%lu "
+                    "passed=%lu "
+                    "failed=%lu\n",
+                    (unsigned long)e06_b_trial_count,
+                    (unsigned long)e06_b_pass_count,
+                    (unsigned long)e06_b_fail_count);
+            }
+        }
+
+#endif
+#if DEBUG_E06_C_BIDIRECTIONAL_INTERRUPTION_TEST
+
+        if (e06_c_interruption_active &&
+            e06_c_status_stale_seen &&
+            e06_c_failsafe_seen &&
+            !e06_c_restoration_seen &&
+            e06_c_trial_count < E06_C_TARGET_COUNT)
+        {
+            e06_c_restoration_seen = true;
+
+            TickType_t now_tick =
+                xTaskGetTickCount();
+
+            uint32_t since_stale_ms =
+                pdTICKS_TO_MS(
+                    now_tick -
+                    e06_c_stale_detect_tick);
+
+            rc_state_t current_command =
+                drone_command_get();
+
+            /*
+                PASS requires:
+                  - RC is still FAILSAFE after communication returns.
+                  - Gateway reports FC heartbeat-confirmed DISARMED.
+
+                Reconnection must never recreate ARMED authority.
+            */
+            bool trial_pass =
+                (current_command == RC_FAILSAFE &&
+                 status.fc_is_armed == 0);
+
+            e06_c_trial_count++;
+
+            if (trial_pass)
+            {
+                e06_c_pass_count++;
+
+                printf(
+                    "[E06-C] TRIAL PASS "
+                    "trial=%lu/%u "
+                    "passes=%lu "
+                    "fails=%lu "
+                    "command=%s "
+                    "fc_armed=%u "
+                    "since_stale=%lu ms\n",
+                    (unsigned long)e06_c_trial_count,
+                    (unsigned int)E06_C_TARGET_COUNT,
+                    (unsigned long)e06_c_pass_count,
+                    (unsigned long)e06_c_fail_count,
+                    mathos_rc_state_to_string(
+                        current_command),
+                    status.fc_is_armed,
+                    (unsigned long)since_stale_ms);
+            }
+            else
+            {
+                e06_c_fail_count++;
+
+                printf(
+                    "[E06-C] TRIAL FAIL "
+                    "trial=%lu/%u "
+                    "passes=%lu "
+                    "fails=%lu "
+                    "command=%s "
+                    "fc_armed=%u\n",
+                    (unsigned long)e06_c_trial_count,
+                    (unsigned int)E06_C_TARGET_COUNT,
+                    (unsigned long)e06_c_pass_count,
+                    (unsigned long)e06_c_fail_count,
+                    mathos_rc_state_to_string(
+                        current_command),
+                    status.fc_is_armed);
+            }
+
+            /*
+                Reset E06-C instrumentation only.
+                Do not change the real RC safety state.
+            */
+            e06_c_interruption_active = false;
+            e06_c_status_stale_seen = false;
+            e06_c_failsafe_seen = false;
+            e06_c_restoration_seen = false;
+            e06_c_stale_detect_tick = 0;
+
+            if (e06_c_trial_count ==
+                E06_C_TARGET_COUNT)
+            {
+                printf(
+                    "[E06-C] COMPLETE "
+                    "executed=%lu "
+                    "passed=%lu "
+                    "failed=%lu\n",
+                    (unsigned long)e06_c_trial_count,
+                    (unsigned long)e06_c_pass_count,
+                    (unsigned long)e06_c_fail_count);
+            }
+        }
+
+#endif
+        ok_count++;
+e12b_rx_record_accepted(
+    packet.sequence,
+    e12b_previous_sequence,
+    bad_count,
+    replay_count);
         static uint32_t print_counter = 0;
         static uint8_t last_fc_armed = 255;
         static uint8_t last_fc_fresh = 255;
@@ -5842,11 +7383,16 @@ status or telemetry from the previous session.
 
             return;
         }
+gateway_telemetry_handle_packet(
+    &packet);
 
-        gateway_telemetry_handle_packet(
-            &packet);
+ok_count++;
 
-        ok_count++;
+e12b_rx_record_accepted(
+    packet.sequence,
+    e12b_previous_sequence,
+    bad_count,
+    replay_count);
     }
     else
     {
@@ -8749,6 +10295,38 @@ void radio_tx_task(void *pvParameters)
 
             .reserved = {0, 0, 0},
         };
+
+#if DEBUG_E10D_FIRST_PACKET_FAILSAFE_TEST
+
+        if (e10d_first_operational_packet_pending)
+        {
+            packet.state = RC_FAILSAFE;
+
+            printf(
+                "[E10-D] FORCING FIRST OPERATIONAL PACKET "
+                "packet_id=%lu state=FAILSAFE "
+                "real_command=%s\n",
+                (unsigned long)packet.packet_id,
+                mathos_rc_state_to_string(command_state));
+        }
+
+#endif
+
+#if DEBUG_E10C_FIRST_PACKET_ARMED_TEST
+
+        if (e10c_first_operational_packet_pending)
+        {
+            packet.state = RC_ARMED;
+
+            printf(
+                "[E10-C] FORCING FIRST OPERATIONAL PACKET "
+                "packet_id=%lu state=ARMED "
+                "real_command=%s\n",
+                (unsigned long)packet.packet_id,
+                mathos_rc_state_to_string(command_state));
+        }
+
+#endif
 #if DEBUG_RC_PACKET_TX
         static uint32_t rc_tx_print_counter = 0;
         static rc_state_t last_print_state = (rc_state_t)-1;
@@ -8797,6 +10375,34 @@ void radio_tx_task(void *pvParameters)
             static uint32_t security_print_counter = 0;
             static uint32_t security_test_last_sequence = 0;
 
+#if DEBUG_E05_A_ARCHIVED_REPLAY_TEST
+
+            static uint8_t
+                e05_a_archived_frame[MATHOS_WIRE_MAX_FRAME_LEN];
+
+            static size_t
+                e05_a_archived_frame_len = 0U;
+
+            static uint32_t
+                e05_a_archived_sequence = 0U;
+
+            static uint32_t
+                e05_a_archived_rc_session = 0U;
+
+            static uint32_t
+                e05_a_archived_gateway_session = 0U;
+
+            static uint32_t
+                e05_a_replay_sent_count = 0U;
+
+            static bool
+                e05_a_archive_valid = false;
+
+            static bool
+                e05_a_new_gateway_session_seen = false;
+
+#endif
+
             security_status =
                 security_verify_packet_basic(&secure_packet, &security_test_last_sequence);
             //////////////////////////////////////////////
@@ -8809,14 +10415,198 @@ void radio_tx_task(void *pvParameters)
             mathos_status_t encode_status = MATHOS_STATUS_BAD_ARGUMENT;
 
             int link_send_ok = 0;
-
             if (security_status == SECURITY_STATUS_OK &&
                 mathos_from_local_secure_packet(&secure_packet, &wire_packet))
             {
+#if DEBUG_WRONG_IDENTITY_TEST
+                static uint32_t wrong_identity_frame_count = 0;
+                static uint32_t wrong_identity_sent_count = 0;
+
+                bool wrong_identity_this_frame = false;
+
+                wrong_identity_frame_count++;
+
+                if (wrong_identity_sent_count <
+                        WRONG_IDENTITY_TEST_TARGET_COUNT &&
+                    (wrong_identity_frame_count %
+                     WRONG_IDENTITY_TEST_EVERY) == 0U)
+                {
+                    wire_packet.controller_id =
+                        WRONG_IDENTITY_CONTROLLER_ID;
+
+                    wrong_identity_this_frame = true;
+                }
+#endif
+
+
+/*
+ * E13-B1:
+ * Measure production operational authenticated-encryption
+ * processing on the RC.
+ *
+ * Local ESP32 monotonic timing only.
+ * The measured interval surrounds
+ * mathos_secure_encrypt_session_packet().
+ *
+ * Wire encoding and UART transmission are NOT included.
+ */
+enum
+{
+    E13_RC_TX_AEAD_TARGET = 10000,
+    E13_RC_TX_AEAD_HIST_MAX_US = 2000
+};
+
+static uint32_t e13_rc_tx_aead_count = 0U;
+static uint64_t e13_rc_tx_aead_total_us = 0ULL;
+static int64_t e13_rc_tx_aead_max_us = 0;
+
+static uint16_t
+    e13_rc_tx_aead_hist[E13_RC_TX_AEAD_HIST_MAX_US + 1] = {0};
+
+static uint32_t e13_rc_tx_aead_overflow = 0U;
+static bool e13_rc_tx_aead_final_printed = false;
+
+int64_t e13_rc_tx_aead_start_us =
+    esp_timer_get_time();
+
+#if DEBUG_WRONG_KEY_TEST
+                static uint32_t wrong_key_frame_count = 0;
+                static uint32_t wrong_key_sent_count = 0;
+
+                bool wrong_key_this_frame = false;
+
+                wrong_key_frame_count++;
+
+                if (wrong_key_sent_count <
+                        WRONG_KEY_TEST_TARGET_COUNT &&
+                    (wrong_key_frame_count %
+                     WRONG_KEY_TEST_EVERY) == 0U)
+                {
+                    wrong_key_this_frame = true;
+
+                    encrypt_status =
+                        mathos_secure_test_encrypt_session_packet_with_wrong_key(
+                            &wire_packet);
+                }
+                else
+                {
+                    encrypt_status =
+                        mathos_secure_encrypt_session_packet(
+                            &wire_packet);
+                }
+#else
                 encrypt_status =
                     mathos_secure_encrypt_session_packet(
                         &wire_packet);
+#endif
+int64_t e13_rc_tx_aead_us =
+    esp_timer_get_time() -
+    e13_rc_tx_aead_start_us;
 
+if (encrypt_status == MATHOS_SECURE_STATUS_OK &&
+    e13_rc_tx_aead_us >= 0 &&
+    e13_rc_tx_aead_count < E13_RC_TX_AEAD_TARGET)
+{
+    e13_rc_tx_aead_count++;
+
+    e13_rc_tx_aead_total_us +=
+        (uint64_t)e13_rc_tx_aead_us;
+
+    if (e13_rc_tx_aead_us >
+        e13_rc_tx_aead_max_us)
+    {
+        e13_rc_tx_aead_max_us =
+            e13_rc_tx_aead_us;
+    }
+
+    if (e13_rc_tx_aead_us <=
+        E13_RC_TX_AEAD_HIST_MAX_US)
+    {
+        e13_rc_tx_aead_hist[e13_rc_tx_aead_us]++;
+    }
+    else
+    {
+        e13_rc_tx_aead_overflow++;
+    }
+
+    if (e13_rc_tx_aead_count ==
+            E13_RC_TX_AEAD_TARGET &&
+        !e13_rc_tx_aead_final_printed)
+    {
+        uint32_t cumulative = 0U;
+
+        uint32_t p50_us =
+            E13_RC_TX_AEAD_HIST_MAX_US + 1U;
+
+        uint32_t p95_us =
+            E13_RC_TX_AEAD_HIST_MAX_US + 1U;
+
+        uint32_t p99_us =
+            E13_RC_TX_AEAD_HIST_MAX_US + 1U;
+
+        const uint32_t p50_rank =
+            (E13_RC_TX_AEAD_TARGET * 50U + 99U) / 100U;
+
+        const uint32_t p95_rank =
+            (E13_RC_TX_AEAD_TARGET * 95U + 99U) / 100U;
+
+        const uint32_t p99_rank =
+            (E13_RC_TX_AEAD_TARGET * 99U + 99U) / 100U;
+
+        for (uint32_t us = 0U;
+             us <= E13_RC_TX_AEAD_HIST_MAX_US;
+             us++)
+        {
+            cumulative +=
+                e13_rc_tx_aead_hist[us];
+
+            if (p50_us >
+                    E13_RC_TX_AEAD_HIST_MAX_US &&
+                cumulative >= p50_rank)
+            {
+                p50_us = us;
+            }
+
+            if (p95_us >
+                    E13_RC_TX_AEAD_HIST_MAX_US &&
+                cumulative >= p95_rank)
+            {
+                p95_us = us;
+            }
+
+            if (p99_us >
+                    E13_RC_TX_AEAD_HIST_MAX_US &&
+                cumulative >= p99_rank)
+            {
+                p99_us = us;
+            }
+        }
+
+        double mean_us =
+            (double)e13_rc_tx_aead_total_us /
+            (double)e13_rc_tx_aead_count;
+
+        printf(
+            "[E13 AEAD RC-TX FINAL] "
+            "n=%lu "
+            "mean_us=%.2f "
+            "p50_us=%lu "
+            "p95_us=%lu "
+            "p99_us=%lu "
+            "max_us=%lld "
+            "overflow_gt_2000us=%lu "
+            "resolution_us=1\n",
+            (unsigned long)e13_rc_tx_aead_count,
+            mean_us,
+            (unsigned long)p50_us,
+            (unsigned long)p95_us,
+            (unsigned long)p99_us,
+            (long long)e13_rc_tx_aead_max_us,
+            (unsigned long)e13_rc_tx_aead_overflow);
+
+        e13_rc_tx_aead_final_printed = true;
+    }
+}
                 if (encrypt_status == MATHOS_SECURE_STATUS_OK)
                 {
                     encode_status = mathos_wire_encode(
@@ -8828,13 +10618,37 @@ void radio_tx_task(void *pvParameters)
                     if (encode_status == MATHOS_STATUS_OK)
                     {
 #if FEATURE_LINK_UART_TX
+bool e12a_intentionally_dropped_this_frame = false;
 #if DEBUG_CRYPTO_TAMPER_TEST
 
-                        static uint32_t crypto_tamper_frame_count = 0;
-                        static uint32_t crypto_tamper_sent_count = 0;
+static uint32_t crypto_tamper_frame_count = 0U;
+static uint32_t crypto_tamper_sent_count = 0U;
+static uint32_t crypto_tamper_gateway_session = 0U;
 
-                        crypto_tamper_frame_count++;
+/*
+ * E13 tamper campaign counters belong to one fully
+ * established operational Gateway session.
+ *
+ * If the Gateway reboots / changes session, discard the
+ * partial diagnostic sample and restart from zero.
+ */
+if (crypto_tamper_gateway_session !=
+    gateway_session_candidate_id)
+{
+    crypto_tamper_gateway_session =
+        gateway_session_candidate_id;
 
+    crypto_tamper_frame_count = 0U;
+    crypto_tamper_sent_count = 0U;
+
+    printf(
+        "[SECURITY TEST] AEAD TAMPER COUNTERS RESET "
+        "gateway_session=%lu\n",
+        (unsigned long)
+            crypto_tamper_gateway_session);
+}
+
+crypto_tamper_frame_count++;
                         if (crypto_tamper_sent_count < CRYPTO_TAMPER_TARGET_COUNT &&
                             (crypto_tamper_frame_count % CRYPTO_TAMPER_EVERY) == 0U &&
                             wire_frame_len >=
@@ -8911,16 +10725,20 @@ void radio_tx_task(void *pvParameters)
 
                             crypto_tamper_sent_count++;
 
-                            printf(
-                                "[SECURITY TEST] AEAD TAMPER SENT "
-                                "mode=%u count=%lu/%u seq=%lu result=%s\n",
-                                (unsigned int)CRYPTO_TAMPER_MODE,
-                                (unsigned long)crypto_tamper_sent_count,
-                                (unsigned int)CRYPTO_TAMPER_TARGET_COUNT,
-                                (unsigned long)wire_packet.sequence,
-                                tamper_tx_ok
-                                    ? "TX_OK"
-                                    : "TX_FAILED");
+if (crypto_tamper_sent_count == 1U ||
+    (crypto_tamper_sent_count % 1000U) == 0U ||
+    crypto_tamper_sent_count ==
+        CRYPTO_TAMPER_TARGET_COUNT)
+{
+    printf(
+        "[SECURITY TEST] AEAD TAMPER SENT "
+        "mode=%u count=%lu/%u seq=%lu result=%s\n",
+        (unsigned int)CRYPTO_TAMPER_MODE,
+        (unsigned long)crypto_tamper_sent_count,
+        (unsigned int)CRYPTO_TAMPER_TARGET_COUNT,
+        (unsigned long)wire_packet.sequence,
+        tamper_tx_ok ? "TX_OK" : "TX_FAILED");
+}
 
                             /*
                                 Do NOT also transmit this modified frame through the
@@ -8932,64 +10750,652 @@ void radio_tx_task(void *pvParameters)
                         }
 
 #endif
-                        link_send_ok = link_uart_send_frame(wire_frame, wire_frame_len);
+#if DEBUG_E10F_RECOVERY_GAP_TEST
+
+                        bool e10f_suppress_operational_tx = false;
+
+                        if (e10f_gap_active)
+                        {
+                            int64_t e10f_gap_elapsed_ms =
+                                (esp_timer_get_time() -
+                                 e10f_gap_start_us) /
+                                1000;
+
+                            if (e10f_gap_elapsed_ms <
+                                (int64_t)E10F_RECOVERY_GAP_MS)
+                            {
+                                /*
+                                 * Deliberately do not transmit this
+                                 * operational frame. We report success
+                                 * locally so the normal RC fault logic is
+                                 * not triggered by the bench experiment.
+                                 */
+                                e10f_suppress_operational_tx = true;
+                            }
+                            else
+                            {
+                                e10f_gap_active = false;
+                                e10f_gap_completed = true;
+
+                                printf(
+                                    "[E10-F] OPERATIONAL TX RESUMED "
+                                    "gap_ms=%lld next_packet_id=%lu\n",
+                                    (long long)e10f_gap_elapsed_ms,
+                                    (unsigned long)packet.packet_id);
+                            }
+                        }
+
+                        if (e10f_suppress_operational_tx)
+                        {
+                            link_send_ok = 1;
+                        }
+                        else
+#endif
+                            // bool e12a_intentionally_dropped_this_frame = false;
+
+                        {
+                            /*
+                             * E12-A formal independent packet-loss campaign.
+                             *
+                             * Configured loss: 1.00%
+                             * 10 deterministic seeds
+                             * 1000 offered operational frames per seed
+                             */
+                            static const uint32_t e12a_seeds[] =
+                                {
+                                    0x13579BDFU,
+                                    0x2468ACE1U,
+                                    0xA5A5A5A5U,
+                                    0x5A5A5A5AU,
+                                    0x1F2E3D4CU,
+                                    0x89ABCDEFU,
+                                    0x10293847U,
+                                    0xC001D00DU,
+                                    0x31415926U,
+                                    0xDEADBEEFU};
+
+                            static uint32_t e12a_seed_index = 0U;
+                            static uint32_t e12a_offered = 0U;
+                            static uint32_t e12a_dropped = 0U;
+                            static uint32_t e12a_uart_attempted = 0U;
+                            static uint32_t e12a_uart_success = 0U;
+                            static uint32_t e12a_rng_state = 0U;
+
+                            static bool e12a_seed_started = false;
+                            static bool e12a_campaign_complete = true;
+
+                            const uint32_t e12a_target = 1000U;
+                            const uint32_t e12a_loss_threshold = 0U; /* 0.00% */
+                            const uint32_t e12a_seed_count =
+                                (uint32_t)(sizeof(e12a_seeds) / sizeof(e12a_seeds[0]));
+
+                            if (!e12a_campaign_complete)
+                            {
+                                /*
+                                 * Start a new deterministic seed window.
+                                 */
+                                if (!e12a_seed_started)
+                                {
+                                    e12a_offered = 0U;
+                                    e12a_dropped = 0U;
+                                    e12a_uart_attempted = 0U;
+                                    e12a_uart_success = 0U;
+
+                                    e12a_rng_state =
+                                        e12a_seeds[e12a_seed_index];
+
+                                    e12a_seed_started = true;
+
+                                    printf(
+                                        "[E12-A] RUN START "
+                                        "loss_pct=0 "
+                                        "run=%lu/%lu "
+                                        "seed=0x%08lX "
+                                        "target=%lu\n",
+                                        (unsigned long)(e12a_seed_index + 1U),
+                                        (unsigned long)e12a_seed_count,
+                                        (unsigned long)e12a_rng_state,
+                                        (unsigned long)e12a_target);
+                                }
+
+                                e12a_offered++;
+
+                                /*
+                                 * Deterministic xorshift32 PRNG.
+                                 */
+                                e12a_rng_state ^= e12a_rng_state << 13;
+                                e12a_rng_state ^= e12a_rng_state >> 17;
+                                e12a_rng_state ^= e12a_rng_state << 5;
+
+/*
+ * E12-C1 controlled RC -> Gateway burst-loss test.
+ *
+ * Start once at packet_id >= 200 and suppress operational
+ * transmission for 250 ms. This is intentionally below the
+ * Gateway RC freshness threshold of 350 ms.
+ */
+static bool e12c_burst_started = false;
+static bool e12c_burst_active = false;
+static int64_t e12c_burst_start_us = 0;
+
+const uint32_t e12c_burst_ms = 1200U;
+
+static bool e12c_armed_seen = false;
+static uint32_t e12c_armed_packet_id = 0U;
+
+if (!e12c_armed_seen &&
+    packet.state == RC_ARMED)
+{
+    e12c_armed_seen = true;
+    e12c_armed_packet_id = packet.packet_id;
+
+    printf(
+        "[E12-C] ARMED DETECTED packet_id=%lu "
+        "burst_in_packets=200\n",
+        (unsigned long)packet.packet_id);
+}
+
+if (false &&
+    !e12c_burst_started &&
+    e12c_armed_seen &&
+    packet.packet_id >=
+        (e12c_armed_packet_id + 200U))
+{
+    e12c_burst_started = true;
+    e12c_burst_active = true;
+    e12c_burst_start_us = esp_timer_get_time();
+
+    printf(
+        "[E12-C] BURST START "
+        "direction=RC->GW "
+        "requested_ms=%lu "
+        "packet_id=%lu\n",
+        (unsigned long)e12c_burst_ms,
+        (unsigned long)packet.packet_id);
+}
+
+bool e12c_drop_this_frame = false;
+
+if (e12c_burst_active)
+{
+    int64_t e12c_elapsed_ms =
+        (esp_timer_get_time() -
+         e12c_burst_start_us) /
+        1000;
+
+    if (e12c_elapsed_ms <
+        (int64_t)e12c_burst_ms)
+    {
+        e12c_drop_this_frame = true;
+    }
+    else
+    {
+        e12c_burst_active = false;
+
+        printf(
+            "[E12-C] BURST END "
+            "direction=RC->GW "
+            "actual_ms=%lld "
+            "packet_id=%lu\n",
+            (long long)e12c_elapsed_ms,
+            (unsigned long)packet.packet_id);
+    }
+}
+
+bool e12a_drop_this_frame =
+    e12c_drop_this_frame ||
+    ((e12a_rng_state % 10000U) <
+     e12a_loss_threshold);
+
+                                if (e12a_drop_this_frame)
+                                {
+                                    e12a_dropped++;
+                                    e12a_intentionally_dropped_this_frame = true;
+
+                                    /*
+                                     * Intentional experiment loss.
+                                     * Do not trigger the normal RC local-send failure path.
+                                     */
+                                    link_send_ok = 1;
+                                }
+                                else
+                                {
+                                    e12a_uart_attempted++;
+
+                                    link_send_ok =
+                                        link_uart_send_frame(
+                                            wire_frame,
+                                            wire_frame_len);
+
+                                    if (link_send_ok)
+                                    {
+                                        e12a_uart_success++;
+                                    }
+                                }
+
+                                if (e12a_offered == e12a_target)
+                                {
+                                    printf(
+                                        "[E12-A] RUN COMPLETE "
+                                        "loss_pct=0 "
+                                        "run=%lu/%lu "
+                                        "seed=0x%08lX "
+                                        "offered=%lu "
+                                        "dropped=%lu "
+                                        "uart_attempted=%lu "
+                                        "uart_success=%lu\n",
+                                        (unsigned long)(e12a_seed_index + 1U),
+                                        (unsigned long)e12a_seed_count,
+                                        (unsigned long)e12a_seeds[e12a_seed_index],
+                                        (unsigned long)e12a_offered,
+                                        (unsigned long)e12a_dropped,
+                                        (unsigned long)e12a_uart_attempted,
+                                        (unsigned long)e12a_uart_success);
+
+                                    e12a_seed_index++;
+                                    e12a_seed_started = false;
+
+                                    if (e12a_seed_index >= e12a_seed_count)
+                                    {
+                                        e12a_campaign_complete = true;
+
+                                        printf(
+                                            "[E12-A] CAMPAIGN COMPLETE "
+                                            "loss_pct=0 "
+                                            "runs=%lu "
+                                            "frames_per_run=%lu "
+                                            "total_offered=%lu\n",
+                                            (unsigned long)e12a_seed_count,
+                                            (unsigned long)e12a_target,
+                                            (unsigned long)(e12a_seed_count * e12a_target));
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                /*
+                                 * Campaign finished.
+                                 * Resume ordinary transmission unchanged.
+                                 */
+                                link_send_ok =
+                                    link_uart_send_frame(
+                                        wire_frame,
+                                        wire_frame_len);
+                            }
+                        }
+
+#if DEBUG_E10F_RECOVERY_GAP_TEST
+
+                        /*
+                         * Packet 1 is the E10-C injected ARMED packet.
+                         * Packet 2 is the normal DISARMED packet that
+                         * starts the Gateway recovery hold.
+                         *
+                         * Only after packet 2 has really gone onto UART
+                         * do we begin the 500 ms interruption.
+                         */
+                        if (link_send_ok &&
+                            !e10f_suppress_operational_tx &&
+                            !e10f_gap_started &&
+                            packet.packet_id == 2U)
+                        {
+                            e10f_gap_started = true;
+                            e10f_gap_active = true;
+                            e10f_gap_start_us =
+                                esp_timer_get_time();
+
+                            printf(
+                                "[E10-F] RECOVERY GAP START "
+                                "after_packet_id=2 requested_ms=%u\n",
+                                (unsigned int)
+                                    E10F_RECOVERY_GAP_MS);
+                        }
+
+#endif
+#if DEBUG_E10C_FIRST_PACKET_ARMED_TEST
+
+                        if (link_send_ok &&
+                            e10c_first_operational_packet_pending)
+                        {
+                            e10c_first_operational_packet_pending = false;
+
+                            printf(
+                                "[E10-C] FIRST OPERATIONAL PACKET TX_OK "
+                                "packet_id=%lu state=%s "
+                                "real_command=%s\n",
+                                (unsigned long)packet.packet_id,
+                                mathos_rc_state_to_string(packet.state),
+                                mathos_rc_state_to_string(command_state));
+                        }
+
+#endif
+
+#if DEBUG_E10D_FIRST_PACKET_FAILSAFE_TEST
+
+                        if (link_send_ok &&
+                            e10d_first_operational_packet_pending)
+                        {
+                            e10d_first_operational_packet_pending = false;
+
+                            printf(
+                                "[E10-D] FIRST OPERATIONAL PACKET TX_OK "
+                                "packet_id=%lu state=%s "
+                                "real_command=%s\n",
+                                (unsigned long)packet.packet_id,
+                                mathos_rc_state_to_string(packet.state),
+                                mathos_rc_state_to_string(command_state));
+                        }
+
+#endif
+
+#if DEBUG_WRONG_KEY_TEST
+                        if (wrong_key_this_frame)
+                        {
+                            if (link_send_ok)
+                            {
+                                wrong_key_sent_count++;
+
+                                if (wrong_key_sent_count == 1U ||
+                                    (wrong_key_sent_count % 100U) == 0U ||
+                                    wrong_key_sent_count ==
+                                        WRONG_KEY_TEST_TARGET_COUNT)
+                                {
+                                    printf(
+                                        "[SECURITY TEST] WRONG KEY SENT "
+                                        "count=%lu/%u seq=%lu result=TX_OK\n",
+                                        (unsigned long)wrong_key_sent_count,
+                                        (unsigned int)WRONG_KEY_TEST_TARGET_COUNT,
+                                        (unsigned long)wire_packet.sequence);
+                                }
+                            }
+                            else
+                            {
+                                printf(
+                                    "[SECURITY TEST] WRONG KEY TX_FAILED "
+                                    "seq=%lu\n",
+                                    (unsigned long)wire_packet.sequence);
+                            }
+                        }
+#endif
+#if DEBUG_WRONG_IDENTITY_TEST
+                        if (wrong_identity_this_frame)
+                        {
+                            wrong_identity_sent_count++;
+
+                            if (wrong_identity_sent_count == 1U ||
+                                (wrong_identity_sent_count % 100U) == 0U ||
+                                wrong_identity_sent_count ==
+                                    WRONG_IDENTITY_TEST_TARGET_COUNT)
+                            {
+                                printf(
+                                    "[SECURITY TEST] WRONG IDENTITY SENT "
+                                    "controller_id=%u count=%lu/%u seq=%lu result=%s\n",
+                                    (unsigned int)WRONG_IDENTITY_CONTROLLER_ID,
+                                    (unsigned long)wrong_identity_sent_count,
+                                    (unsigned int)WRONG_IDENTITY_TEST_TARGET_COUNT,
+                                    (unsigned long)wire_packet.sequence,
+                                    link_send_ok ? "TX_OK" : "TX_FAILED");
+                            }
+                        }
+#endif
 #if DEBUG_CRYPTO_TAMPER_TEST
                     security_frame_sent:;
 #endif
-#if TEST_DUPLICATE_SESSION_FRAME_ONCE
-                        /*
-                            Security negative test.
 
-                            wire_frame already contains one fully valid
-                            RC operational frame encrypted with the
-                            current RC -> Gateway session key.
-
-                            Send the exact same bytes a second time.
-
-                            This means:
-                              same R,G session
-                              same sequence
-                              same nonce
-                              same ciphertext
-                              same authentication tag
-
-                            The first copy is legitimate.
-                            The second copy MUST be rejected by the
-                            Gateway replay/sequence check.
-                        */
-                        static bool duplicate_test_done = false;
-
-                        if (link_send_ok &&
-                            !duplicate_test_done)
+#if DEBUG_OLD_SEQUENCE_TEST
+                        if (link_send_ok)
                         {
                             /*
-                                Give the Gateway a short moment to
-                                process the first copy before the exact
-                                duplicate arrives.
-                            */
-                            vTaskDelay(
-                                pdMS_TO_TICKS(5));
+                                If we already saved the previous valid frame,
+                                first allow the newly transmitted current frame
+                                to advance the Gateway's last_sequence.
 
-                            int duplicate_ok =
-                                link_uart_send_frame(
+                                Then replay the previous frame unchanged.
+
+                                Example:
+                                    normal seq=2
+                                    replay seq=1
+
+                                Therefore:
+                                    replay_seq < last_sequence
+                            */
+                            if (old_sequence_saved_valid &&
+                                old_sequence_sent_count <
+                                    OLD_SEQUENCE_TEST_TARGET_COUNT)
+                            {
+                                vTaskDelay(pdMS_TO_TICKS(5));
+
+                                int old_sequence_ok =
+                                    link_uart_send_frame(
+                                        old_sequence_saved_frame,
+                                        old_sequence_saved_frame_len);
+
+                                if (old_sequence_ok)
+                                {
+                                    old_sequence_sent_count++;
+
+                                    if (old_sequence_sent_count == 1U ||
+                                        (old_sequence_sent_count % 100U) == 0U ||
+                                        old_sequence_sent_count ==
+                                            OLD_SEQUENCE_TEST_TARGET_COUNT)
+                                    {
+                                        printf(
+                                            "[SECURITY TEST] OLD SEQUENCE FRAME SENT "
+                                            "count=%lu/%u replay_seq=%lu current_seq=%lu "
+                                            "result=TX_OK\n",
+                                            (unsigned long)old_sequence_sent_count,
+                                            (unsigned int)OLD_SEQUENCE_TEST_TARGET_COUNT,
+                                            (unsigned long)old_sequence_saved_seq,
+                                            (unsigned long)wire_packet.sequence);
+                                    }
+                                }
+                                else
+                                {
+                                    printf(
+                                        "[SECURITY TEST] OLD SEQUENCE FRAME TX_FAILED "
+                                        "replay_seq=%lu current_seq=%lu\n",
+                                        (unsigned long)old_sequence_saved_seq,
+                                        (unsigned long)wire_packet.sequence);
+                                }
+                            }
+
+                            /*
+                                Save CURRENT successfully transmitted frame.
+                                It will become the old frame during the next cycle.
+                            */
+                            if (wire_frame_len <=
+                                sizeof(old_sequence_saved_frame))
+                            {
+                                memcpy(
+                                    old_sequence_saved_frame,
                                     wire_frame,
                                     wire_frame_len);
 
-                            duplicate_test_done = true;
+                                old_sequence_saved_frame_len =
+                                    wire_frame_len;
+
+                                old_sequence_saved_seq =
+                                    wire_packet.sequence;
+
+                                old_sequence_saved_valid = true;
+                            }
+                        }
+#endif
+#if DEBUG_E05_A_ARCHIVED_REPLAY_TEST
+                        /*
+                            E05-A capture phase.
+
+                            Archive exactly one VALID operational
+                            RC -> Gateway wire frame.
+
+                            The bytes are copied only after the normal
+                            frame has been successfully transmitted.
+
+                            After capture, this archive is NEVER updated.
+                            It must survive the Gateway reboot unchanged.
+                        */
+                        if (link_send_ok &&
+                            !e05_a_archive_valid &&
+                            rc_operational_session_ready &&
+                            gateway_session_candidate_valid &&
+                            gateway_session_candidate_id != 0U &&
+                            wire_frame_len > 0U &&
+                            wire_frame_len <=
+                                sizeof(e05_a_archived_frame))
+                        {
+                            memcpy(
+                                e05_a_archived_frame,
+                                wire_frame,
+                                wire_frame_len);
+
+                            e05_a_archived_frame_len =
+                                wire_frame_len;
+
+                            e05_a_archived_sequence =
+                                wire_packet.sequence;
+
+                            e05_a_archived_rc_session =
+                                mathos_session_id;
+
+                            e05_a_archived_gateway_session =
+                                gateway_session_candidate_id;
+
+                            e05_a_archive_valid = true;
 
                             printf(
-                                "[SECURITY TEST] DUPLICATE FRAME SENT "
-                                "seq=%lu result=%s\n",
+                                "[SECURITY TEST] E05-A ARCHIVED FRAME CAPTURED "
+                                "rc_session=%lu gateway_session=%lu "
+                                "seq=%lu len=%u\n",
                                 (unsigned long)
-                                    wire_packet.sequence,
-                                duplicate_ok
-                                    ? "TX_OK"
-                                    : "TX_FAILED");
+                                    e05_a_archived_rc_session,
+                                (unsigned long)
+                                    e05_a_archived_gateway_session,
+                                (unsigned long)
+                                    e05_a_archived_sequence,
+                                (unsigned int)
+                                    e05_a_archived_frame_len);
+                        }
+                        /*
+    E05-A transition detection.
+
+    Do not arm replay merely because a different
+    Gateway HELLO was observed.
+
+    Wait until the RC reports the NEW operational
+    session as fully ready.
+*/
+                        if (e05_a_archive_valid &&
+                            !e05_a_new_gateway_session_seen &&
+                            rc_operational_session_ready &&
+                            gateway_session_candidate_valid &&
+                            gateway_session_candidate_id != 0U &&
+                            gateway_session_candidate_id !=
+                                e05_a_archived_gateway_session)
+                        {
+                            e05_a_new_gateway_session_seen = true;
+
+                            printf(
+                                "[SECURITY TEST] E05-A NEW SESSION READY "
+                                "old_rc=%lu old_gateway=%lu "
+                                "new_rc=%lu new_gateway=%lu "
+                                "archived_seq=%lu\n",
+                                (unsigned long)
+                                    e05_a_archived_rc_session,
+                                (unsigned long)
+                                    e05_a_archived_gateway_session,
+                                (unsigned long)
+                                    mathos_session_id,
+                                (unsigned long)
+                                    gateway_session_candidate_id,
+                                (unsigned long)
+                                    e05_a_archived_sequence);
+                        }
+                        /*
+    E05-A replay phase.
+
+    After a different Gateway session has been
+    fully established, retransmit the archived
+    OLD-session frame byte-for-byte unchanged.
+
+    Send one archived replay after each successful
+    normal RC transmission so valid current-session
+    traffic continues throughout the experiment.
+*/
+                        if (link_send_ok &&
+                            e05_a_archive_valid &&
+                            e05_a_new_gateway_session_seen &&
+                            e05_a_replay_sent_count <
+                                E05_A_ARCHIVED_REPLAY_TARGET_COUNT)
+                        {
+                            vTaskDelay(pdMS_TO_TICKS(5));
+
+                            int e05_a_tx_ok =
+                                link_uart_send_frame(
+                                    e05_a_archived_frame,
+                                    e05_a_archived_frame_len);
+
+                            if (e05_a_tx_ok)
+                            {
+                                e05_a_replay_sent_count++;
+
+                                if (e05_a_replay_sent_count == 1U ||
+                                    (e05_a_replay_sent_count % 10U) == 0U ||
+                                    e05_a_replay_sent_count ==
+                                        E05_A_ARCHIVED_REPLAY_TARGET_COUNT)
+                                {
+                                    printf(
+                                        "[SECURITY TEST] E05-A ARCHIVED REPLAY SENT "
+                                        "count=%lu/%u "
+                                        "old_rc=%lu old_gateway=%lu "
+                                        "current_rc=%lu current_gateway=%lu "
+                                        "archived_seq=%lu result=TX_OK\n",
+                                        (unsigned long)
+                                            e05_a_replay_sent_count,
+                                        (unsigned int)
+                                            E05_A_ARCHIVED_REPLAY_TARGET_COUNT,
+                                        (unsigned long)
+                                            e05_a_archived_rc_session,
+                                        (unsigned long)
+                                            e05_a_archived_gateway_session,
+                                        (unsigned long)
+                                            mathos_session_id,
+                                        (unsigned long)
+                                            gateway_session_candidate_id,
+                                        (unsigned long)
+                                            e05_a_archived_sequence);
+                                }
+
+                                if (e05_a_replay_sent_count ==
+                                    E05_A_ARCHIVED_REPLAY_TARGET_COUNT)
+                                {
+                                    printf(
+                                        "[SECURITY TEST] "
+                                        "E05-A TX COMPLETE count=%lu/%u\n",
+                                        (unsigned long)
+                                            e05_a_replay_sent_count,
+                                        (unsigned int)
+                                            E05_A_ARCHIVED_REPLAY_TARGET_COUNT);
+                                }
+                            }
+                            else
+                            {
+                                printf(
+                                    "[SECURITY TEST] "
+                                    "E05-A ARCHIVED REPLAY TX_FAILED "
+                                    "count=%lu/%u archived_seq=%lu\n",
+                                    (unsigned long)
+                                        e05_a_replay_sent_count,
+                                    (unsigned int)
+                                        E05_A_ARCHIVED_REPLAY_TARGET_COUNT,
+                                    (unsigned long)
+                                        e05_a_archived_sequence);
+                            }
                         }
 #endif
                         static uint32_t link_uart_ok_count = 0;
 
-                        if (link_send_ok)
+                        if (link_send_ok &&
+                            !e12a_intentionally_dropped_this_frame)
                         {
                             link_uart_ok_count++;
 

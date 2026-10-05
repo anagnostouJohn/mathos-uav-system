@@ -95,7 +95,13 @@ int mathos_secure_session_keys_are_set(void);
 */
 mathos_secure_status_t mathos_secure_encrypt_session_packet(
     mathos_secure_packet_t *packet);
+mathos_secure_status_t
+mathos_secure_test_encrypt_session_packet_with_rx_key(
+    mathos_secure_packet_t *packet);
 
+mathos_secure_status_t
+mathos_secure_test_encrypt_session_packet_with_wrong_key(
+    mathos_secure_packet_t *packet);
 mathos_secure_status_t mathos_secure_decrypt_session_packet(
     mathos_secure_packet_t *packet);
 

@@ -553,6 +553,68 @@ mathos_secure_encrypt_session_packet(
         mathos_session_tx_key);
 }
 
+mathos_secure_status_t
+mathos_secure_test_encrypt_session_packet_with_rx_key(
+    mathos_secure_packet_t *packet)
+{
+    if (!mathos_session_keys_set)
+    {
+        return MATHOS_SECURE_STATUS_SESSION_NOT_SET;
+    }
+
+    /*
+        EXPERIMENT ONLY.
+
+        Encrypt an outbound packet using this endpoint's
+        operational RX key instead of its TX key.
+
+        On the RC this means using K_GW->RC for an
+        RC->Gateway frame, deliberately violating the
+        directional-key binding.
+    */
+    return mathos_secure_encrypt_with_key(
+        packet,
+        mathos_session_rx_key);
+}
+
+mathos_secure_status_t
+mathos_secure_test_encrypt_session_packet_with_wrong_key(
+    mathos_secure_packet_t *packet)
+{
+    if (!mathos_session_keys_set)
+    {
+        return MATHOS_SECURE_STATUS_SESSION_NOT_SET;
+    }
+
+    /*
+        EXPERIMENT ONLY.
+
+        Create a deterministic key that differs from the
+        correct operational TX key by exactly one bit.
+
+        The real session key is never modified.
+    */
+    uint8_t wrong_key[MATHOS_SECURE_KEY_LEN];
+
+    memcpy(
+        wrong_key,
+        mathos_session_tx_key,
+        sizeof(wrong_key));
+
+    wrong_key[0] ^= 0x01U;
+
+    mathos_secure_status_t status =
+        mathos_secure_encrypt_with_key(
+            packet,
+            wrong_key);
+
+    mbedtls_platform_zeroize(
+        wrong_key,
+        sizeof(wrong_key));
+
+    return status;
+}
+
 static mathos_secure_status_t
 mathos_secure_decrypt_with_key(
     mathos_secure_packet_t *packet,
