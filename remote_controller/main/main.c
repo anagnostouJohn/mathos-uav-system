@@ -5431,9 +5431,7 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
     static uint32_t bad_count = 0;
     static uint32_t replay_count = 0;
 
-#if DEBUG_GATEWAY_WRONG_IDENTITY_RX_TEST
-    static uint32_t gateway_wrong_identity_reject_count = 0U;
-#endif
+
 
     int new_gateway_session = 0;
 
@@ -5722,38 +5720,13 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
     {
         bad_count++;
 
-#if DEBUG_GATEWAY_WRONG_IDENTITY_RX_TEST
 
-        gateway_wrong_identity_reject_count++;
-
-        if (gateway_wrong_identity_reject_count == 1U ||
-            (gateway_wrong_identity_reject_count % 100U) == 0U ||
-            gateway_wrong_identity_reject_count ==
-                GATEWAY_WRONG_IDENTITY_RX_TARGET_COUNT)
-        {
-            printf(
-                "[SECURITY TEST] "
-                "GATEWAY WRONG IDENTITY REJECTED "
-                "count=%lu/%u "
-                "controller_id=%u expected=%u "
-                "bad_count=%lu\n",
-                (unsigned long)
-                    gateway_wrong_identity_reject_count,
-                (unsigned int)
-                    GATEWAY_WRONG_IDENTITY_RX_TARGET_COUNT,
-                packet.controller_id,
-                rc_runtime_pairing_config.authorised_gateway_id,
-                (unsigned long)bad_count);
-        }
-
-#else
 
         printf(
             "[GATEWAY RX] bad controller_id=%u expected=%u\n",
             packet.controller_id,
             rc_runtime_pairing_config.authorised_gateway_id);
 
-#endif
 
         return;
     }
@@ -6102,16 +6075,7 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
         rc_operational_session_ready = 1;
 
 
-#if DEBUG_GATEWAY_WRONG_IDENTITY_RX_TEST
 
-        gateway_wrong_identity_reject_count = 0U;
-
-        printf(
-            "[SECURITY TEST] "
-            "Gateway wrong-identity RX counter reset "
-            "for operational session\n");
-
-#endif
         printf(
             "[SESSION] READY "
             "rc=%lu gateway=%lu\n",
