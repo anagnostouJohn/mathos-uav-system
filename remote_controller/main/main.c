@@ -10614,137 +10614,7 @@ if (encrypt_status == MATHOS_SECURE_STATUS_OK &&
                     {
 #if FEATURE_LINK_UART_TX
 bool e12a_intentionally_dropped_this_frame = false;
-#if DEBUG_CRYPTO_TAMPER_TEST
 
-static uint32_t crypto_tamper_frame_count = 0U;
-static uint32_t crypto_tamper_sent_count = 0U;
-static uint32_t crypto_tamper_gateway_session = 0U;
-
-/*
- * E13 tamper campaign counters belong to one fully
- * established operational Gateway session.
- *
- * If the Gateway reboots / changes session, discard the
- * partial diagnostic sample and restart from zero.
- */
-if (crypto_tamper_gateway_session !=
-    gateway_session_candidate_id)
-{
-    crypto_tamper_gateway_session =
-        gateway_session_candidate_id;
-
-    crypto_tamper_frame_count = 0U;
-    crypto_tamper_sent_count = 0U;
-
-    printf(
-        "[SECURITY TEST] AEAD TAMPER COUNTERS RESET "
-        "gateway_session=%lu\n",
-        (unsigned long)
-            crypto_tamper_gateway_session);
-}
-
-crypto_tamper_frame_count++;
-                        if (crypto_tamper_sent_count < CRYPTO_TAMPER_TARGET_COUNT &&
-                            (crypto_tamper_frame_count % CRYPTO_TAMPER_EVERY) == 0U &&
-                            wire_frame_len >=
-                                (MATHOS_WIRE_HEADER_LEN +
-                                 MATHOS_AUTH_TAG_LEN +
-                                 MATHOS_WIRE_CRC_LEN + 1U))
-                        {
-                            /*
-                                One-shot AEAD ciphertext tamper test.
-
-                                Byte 18 is the first encrypted payload byte.
-
-                                After modifying the ciphertext we recompute CRC16,
-                                otherwise the receiver would reject the frame at the
-                                transport CRC layer before ChaCha20-Poly1305 ever
-                                gets a chance to authenticate it.
-                            */
-#if CRYPTO_TAMPER_MODE == CRYPTO_TAMPER_MODE_CIPHERTEXT
-
-                            /*
-                                Corrupt first encrypted payload byte.
-                            */
-                            wire_frame[MATHOS_WIRE_HEADER_LEN] ^= 0x01U;
-
-#elif CRYPTO_TAMPER_MODE == CRYPTO_TAMPER_MODE_TAG
-
-                            /*
-                                Corrupt first Poly1305 authentication-tag byte.
-                            */
-                            size_t auth_tag_offset =
-                                MATHOS_WIRE_HEADER_LEN +
-                                wire_packet.payload_len;
-
-                            wire_frame[auth_tag_offset] ^= 0x01U;
-
-#elif CRYPTO_TAMPER_MODE == CRYPTO_TAMPER_MODE_AAD
-
-                            /*
-                                Corrupt authenticated header metadata.
-
-                                Wire byte 15 is link_id.
-
-                                link_id participates in both the AEAD nonce and AAD.
-                                The encrypted payload and authentication tag remain
-                                untouched.
-
-                                CRC16 is repaired below so the frame reaches the
-                                ChaCha20-Poly1305 authentication step.
-                            */
-                            wire_frame[15] ^= 0x01U;
-
-#else
-
-#error "Invalid CRYPTO_TAMPER_MODE"
-
-#endif
-
-                            uint16_t test_crc =
-                                mathos_crc16_ccitt(
-                                    wire_frame,
-                                    wire_frame_len -
-                                        MATHOS_WIRE_CRC_LEN);
-
-                            wire_frame[wire_frame_len - 2U] =
-                                (uint8_t)(test_crc & 0xFFU);
-
-                            wire_frame[wire_frame_len - 1U] =
-                                (uint8_t)((test_crc >> 8) & 0xFFU);
-
-                            int tamper_tx_ok =
-                                link_uart_send_frame(
-                                    wire_frame,
-                                    wire_frame_len);
-
-                            crypto_tamper_sent_count++;
-
-if (crypto_tamper_sent_count == 1U ||
-    (crypto_tamper_sent_count % 1000U) == 0U ||
-    crypto_tamper_sent_count ==
-        CRYPTO_TAMPER_TARGET_COUNT)
-{
-    printf(
-        "[SECURITY TEST] AEAD TAMPER SENT "
-        "mode=%u count=%lu/%u seq=%lu result=%s\n",
-        (unsigned int)CRYPTO_TAMPER_MODE,
-        (unsigned long)crypto_tamper_sent_count,
-        (unsigned int)CRYPTO_TAMPER_TARGET_COUNT,
-        (unsigned long)wire_packet.sequence,
-        tamper_tx_ok ? "TX_OK" : "TX_FAILED");
-}
-
-                            /*
-                                Do NOT also transmit this modified frame through the
-                                normal send path below.
-                            */
-                            link_send_ok = tamper_tx_ok;
-
-                            goto security_frame_sent;
-                        }
-
-#endif
 #if DEBUG_E10F_RECOVERY_GAP_TEST
 
                         bool e10f_suppress_operational_tx = false;
@@ -11133,9 +11003,7 @@ bool e12a_drop_this_frame =
                             }
                         }
 #endif
-#if DEBUG_CRYPTO_TAMPER_TEST
-                    security_frame_sent:;
-#endif
+
 
 #if DEBUG_OLD_SEQUENCE_TEST
                         if (link_send_ok)
