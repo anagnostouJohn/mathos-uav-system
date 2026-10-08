@@ -333,10 +333,6 @@ static void gateway_status_handle_frame(
 #define TEST_PROVISION_CALIBRATION_ONCE 0
 #define FEATURE_TREAT_GATEWAY_DRY_RUN_AS_CONFIRMED 0
 
-
-#define DEBUG_E10F_RECOVERY_GAP_TEST 0
-#define E10F_RECOVERY_GAP_MS 3500U
-
 #if FEATURE_DIRECT_MAVLINK_MODE && FEATURE_SECURE_GATEWAY_MODE
 #error "Only one control mode can be enabled: DIRECT MAVLINK or SECURE GATEWAY"
 #endif
