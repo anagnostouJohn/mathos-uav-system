@@ -5768,9 +5768,6 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
 
 last_sequence = 0;
 
-e12b_rx_reset(
-    bad_count,
-    replay_count);
 
 has_session = 1;
 
@@ -5882,8 +5879,7 @@ status or telemetry from the previous session.
         return;
     }
 
-    uint32_t e12b_previous_sequence =
-    last_sequence;
+
 
 last_sequence = packet.sequence;
     fault_clear(FAULT_PACKET_SEQUENCE);
@@ -6046,11 +6042,7 @@ last_sequence = packet.sequence;
 
 
         ok_count++;
-e12b_rx_record_accepted(
-    packet.sequence,
-    e12b_previous_sequence,
-    bad_count,
-    replay_count);
+
         static uint32_t print_counter = 0;
         static uint8_t last_fc_armed = 255;
         static uint8_t last_fc_fresh = 255;
@@ -6181,11 +6173,7 @@ gateway_telemetry_handle_packet(
 
 ok_count++;
 
-e12b_rx_record_accepted(
-    packet.sequence,
-    e12b_previous_sequence,
-    bad_count,
-    replay_count);
+
     }
     else
     {
