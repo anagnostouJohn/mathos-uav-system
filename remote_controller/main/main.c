@@ -130,16 +130,7 @@
 #define RC_PAIRING_REQUEST_MAX_AGE_MS 5000U
 
 #define FEATURE_LINK_UART_TX 1
-/*
-    TEMPORARY SECURITY TEST:
-    transmit one valid operational encrypted frame twice.
 
-    Expected result:
-    Gateway accepts the first copy and rejects the second
-    as replay/old sequence. test last
-*/
-#define DEBUG_DUPLICATE_SEQUENCE_TEST 0
-#define DUPLICATE_SEQUENCE_TEST_TARGET_COUNT 1000U
 
 #define DEBUG_OLD_SEQUENCE_TEST 0
 #define OLD_SEQUENCE_TEST_TARGET_COUNT 1000U
