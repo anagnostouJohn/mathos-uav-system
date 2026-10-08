@@ -131,13 +131,6 @@
 
 #define FEATURE_LINK_UART_TX 1
 
-#define DEBUG_GATEWAY_OLD_SEQUENCE_RX_TEST 0
-#define GATEWAY_OLD_SEQUENCE_RX_TARGET_COUNT 1000U
-
-/*
-    E05-B — archived Gateway -> RC replay
-    after RC operational-session change.
-*/
 #define DEBUG_E05_B_ARCHIVED_REPLAY_RX_TEST 0
 #define E05_B_ARCHIVED_REPLAY_RX_TARGET_COUNT 30U
 
