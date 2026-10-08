@@ -5457,9 +5457,7 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
 #if DEBUG_GATEWAY_WRONG_IDENTITY_RX_TEST
     static uint32_t gateway_wrong_identity_reject_count = 0U;
 #endif
-#if DEBUG_GATEWAY_EXACT_DUPLICATE_RX_TEST
-    static uint32_t exact_duplicate_reject_count = 0;
-#endif
+
 
 #if DEBUG_GATEWAY_OLD_SEQUENCE_RX_TEST
     static uint32_t old_sequence_reject_count = 0;
@@ -6449,18 +6447,7 @@ e12b_rx_reset(
 has_session = 1;
 
         gateway_session_remember(session_id);
-#if DEBUG_GATEWAY_EXACT_DUPLICATE_RX_TEST
-        exact_duplicate_reject_count = 0;
 
-        printf(
-            "[SECURITY TEST] "
-            "Gateway exact duplicate RX counter reset "
-            "for initial session\n");
-#endif
-        /*
-        Data received from the previous gateway boot must
-        no longer remain trusted.
-    */
         taskENTER_CRITICAL(
             &gateway_status_mux);
 
@@ -6522,14 +6509,7 @@ has_session = 1;
 e12b_rx_reset(
     bad_count,
     replay_count);
-#if DEBUG_GATEWAY_EXACT_DUPLICATE_RX_TEST
-        exact_duplicate_reject_count = 0;
 
-        printf(
-            "[SECURITY TEST] "
-            "Gateway exact duplicate RX counter reset "
-            "for new session\n");
-#endif
 #if DEBUG_GATEWAY_OLD_SEQUENCE_RX_TEST
 
         old_sequence_reject_count = 0;
@@ -6570,38 +6550,7 @@ status or telemetry from the previous session.
     {
         replay_count++;
 
-#if DEBUG_GATEWAY_EXACT_DUPLICATE_RX_TEST
 
-        if (packet.sequence == last_sequence)
-        {
-            exact_duplicate_reject_count++;
-
-            if (exact_duplicate_reject_count == 1U ||
-                (exact_duplicate_reject_count % 100U) == 0U ||
-                exact_duplicate_reject_count ==
-                    GATEWAY_EXACT_DUPLICATE_RX_TARGET_COUNT)
-            {
-                printf(
-                    "[SECURITY TEST] "
-                    "GATEWAY EXACT DUPLICATE REJECTED "
-                    "count=%lu/%u "
-                    "session=0x%08lx "
-                    "seq=%lu last=%lu "
-                    "replay_count=%lu\n",
-                    (unsigned long)
-                        exact_duplicate_reject_count,
-                    (unsigned int)
-                        GATEWAY_EXACT_DUPLICATE_RX_TARGET_COUNT,
-                    (unsigned long)session_id,
-                    (unsigned long)packet.sequence,
-                    (unsigned long)last_sequence,
-                    (unsigned long)replay_count);
-            }
-
-            return;
-        }
-
-#endif
 #if DEBUG_GATEWAY_OLD_SEQUENCE_RX_TEST
 
         if (packet.sequence < last_sequence)
