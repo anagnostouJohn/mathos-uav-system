@@ -380,19 +380,7 @@ static void gateway_status_handle_frame(
 ///////////////////FEATURE FLAGS//////////////////
 
 //////////////////// SECURITY LAYER
-#if DEBUG_E07_A_FC_HEARTBEAT_SUPPRESSION_TEST
 
-static uint32_t e07_a_trial_count = 0U;
-static uint32_t e07_a_pass_count = 0U;
-static uint32_t e07_a_fail_count = 0U;
-
-static bool e07_a_event_active = false;
-static bool e07_a_fc_stale_seen = false;
-static bool e07_a_failsafe_seen = false;
-
-static TickType_t e07_a_stale_detect_tick = 0;
-
-#endif
 #define SECURITY_SKELETON_DIAGNOSTIC FEATURE_SECURITY_SKELETON
 
 #define SECURITY_LINK_ID_LOCAL_TEST 0
@@ -3982,33 +3970,7 @@ void system_health_task(void *pvParameters)
 
         int fc_heartbeat_fresh =
             gateway_fc_heartbeat_is_fresh();
-#if DEBUG_E07_A_FC_HEARTBEAT_SUPPRESSION_TEST
 
-        if (command_state == RC_ARMED &&
-            gateway_control_ok &&
-            !fc_heartbeat_fresh &&
-            !e07_a_event_active &&
-            e07_a_trial_count < E07_A_TARGET_COUNT)
-        {
-            e07_a_event_active = true;
-            e07_a_fc_stale_seen = true;
-            e07_a_stale_detect_tick =
-                xTaskGetTickCount();
-
-            printf(
-                "[E07-A] FC STALE WHILE LINK HEALTHY "
-                "trial=%lu/%u "
-                "gateway_link=%u "
-                "fc_fresh=%u "
-                "command=%s\n",
-                (unsigned long)(e07_a_trial_count + 1U),
-                (unsigned int)E07_A_TARGET_COUNT,
-                gateway_control_ok ? 1U : 0U,
-                fc_heartbeat_fresh ? 1U : 0U,
-                mathos_rc_state_to_string(command_state));
-        }
-
-#endif
 #if DEBUG_E07_B_FC_STREAM_SUPPRESSION_TEST
 
         if (command_state == RC_ARMED &&
@@ -4099,35 +4061,6 @@ void system_health_task(void *pvParameters)
                 "FC heartbeat stale while ARMED\n");
         }
 
-#if DEBUG_E07_A_FC_HEARTBEAT_SUPPRESSION_TEST
-
-        if (e07_a_event_active &&
-            e07_a_fc_stale_seen &&
-            !e07_a_failsafe_seen &&
-            e07_a_trial_count < E07_A_TARGET_COUNT)
-        {
-            e07_a_failsafe_seen = true;
-
-            uint32_t since_stale_ms =
-                pdTICKS_TO_MS(
-                    xTaskGetTickCount() -
-                    e07_a_stale_detect_tick);
-
-            printf(
-                "[E07-A] RC FAILSAFE ENTERED "
-                "trial=%lu/%u "
-                "after_stale=%lu ms "
-                "gateway_link=%u "
-                "command=%s\n",
-                (unsigned long)(e07_a_trial_count + 1U),
-                (unsigned int)E07_A_TARGET_COUNT,
-                (unsigned long)since_stale_ms,
-                gateway_control_link_is_ok() ? 1U : 0U,
-                mathos_rc_state_to_string(
-                    drone_command_get()));
-        }
-
-#endif
 #if DEBUG_E07_B_FC_STREAM_SUPPRESSION_TEST
 
         if (e07_b_event_active &&
@@ -6238,104 +6171,6 @@ last_sequence = packet.sequence;
         validated_status_session_id = session_id;
         gateway_status_update(&status);
         gateway_status_apply_to_remote(&status);
-#if DEBUG_E07_A_FC_HEARTBEAT_SUPPRESSION_TEST
-
-        /*
-            Do not evaluate the trial until FC heartbeat freshness
-            has actually returned.
-        */
-        if (e07_a_event_active &&
-            e07_a_fc_stale_seen &&
-            e07_a_failsafe_seen &&
-            status.fc_heartbeat_fresh == 1 &&
-            e07_a_trial_count < E07_A_TARGET_COUNT)
-        {
-            TickType_t now_tick =
-                xTaskGetTickCount();
-
-            uint32_t since_stale_ms =
-                pdTICKS_TO_MS(
-                    now_tick -
-                    e07_a_stale_detect_tick);
-
-            rc_state_t current_command =
-                drone_command_get();
-
-            bool trial_pass =
-                (current_command == RC_FAILSAFE &&
-                 status.fc_heartbeat_fresh == 1 &&
-                 status.fc_is_armed == 0 &&
-                 status.gateway_link_ok == 1);
-
-            e07_a_trial_count++;
-
-            if (trial_pass)
-            {
-                e07_a_pass_count++;
-
-                printf(
-                    "[E07-A] TRIAL PASS "
-                    "trial=%lu/%u "
-                    "passes=%lu fails=%lu "
-                    "command=%s "
-                    "fc_fresh=%u "
-                    "fc_armed=%u "
-                    "gateway_link=%u "
-                    "since_stale=%lu ms\n",
-                    (unsigned long)e07_a_trial_count,
-                    (unsigned int)E07_A_TARGET_COUNT,
-                    (unsigned long)e07_a_pass_count,
-                    (unsigned long)e07_a_fail_count,
-                    mathos_rc_state_to_string(
-                        current_command),
-                    status.fc_heartbeat_fresh,
-                    status.fc_is_armed,
-                    status.gateway_link_ok,
-                    (unsigned long)since_stale_ms);
-            }
-            else
-            {
-                e07_a_fail_count++;
-
-                printf(
-                    "[E07-A] TRIAL FAIL "
-                    "trial=%lu/%u "
-                    "passes=%lu fails=%lu "
-                    "command=%s "
-                    "fc_fresh=%u "
-                    "fc_armed=%u "
-                    "gateway_link=%u\n",
-                    (unsigned long)e07_a_trial_count,
-                    (unsigned int)E07_A_TARGET_COUNT,
-                    (unsigned long)e07_a_pass_count,
-                    (unsigned long)e07_a_fail_count,
-                    mathos_rc_state_to_string(
-                        current_command),
-                    status.fc_heartbeat_fresh,
-                    status.fc_is_armed,
-                    status.gateway_link_ok);
-            }
-
-            e07_a_event_active = false;
-            e07_a_fc_stale_seen = false;
-            e07_a_failsafe_seen = false;
-            e07_a_stale_detect_tick = 0;
-
-            if (e07_a_trial_count ==
-                E07_A_TARGET_COUNT)
-            {
-                printf(
-                    "[E07-A] COMPLETE "
-                    "executed=%lu "
-                    "passed=%lu "
-                    "failed=%lu\n",
-                    (unsigned long)e07_a_trial_count,
-                    (unsigned long)e07_a_pass_count,
-                    (unsigned long)e07_a_fail_count);
-            }
-        }
-
-#endif
 #if DEBUG_E07_B_FC_STREAM_SUPPRESSION_TEST
 
         /*
