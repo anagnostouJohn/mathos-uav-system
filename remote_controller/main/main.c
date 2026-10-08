@@ -28,7 +28,7 @@
 ////////////////////////////////////////////////////////////////////////////////////
 #define COMMAND_STATUS_MESSAGE_CLEAR_MS 3000
 
-#define DEBUG_CRYPTO_TAMPER_TEST 1
+#define  DEBUG_CRYPTO_TAMPER_TEST 0
 #define CRYPTO_TAMPER_EVERY 2
 #define CRYPTO_TAMPER_TARGET_COUNT 10000U
 
