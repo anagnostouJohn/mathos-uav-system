@@ -9307,10 +9307,8 @@ if (encrypt_status == MATHOS_SECURE_STATUS_OK &&
                     if (encode_status == MATHOS_STATUS_OK)
                     {
 #if FEATURE_LINK_UART_TX
-bool e12a_intentionally_dropped_this_frame = false;
 
-
-                      {
+{
     link_send_ok =
         link_uart_send_frame(
             wire_frame,
@@ -9319,8 +9317,7 @@ bool e12a_intentionally_dropped_this_frame = false;
 
                         static uint32_t link_uart_ok_count = 0;
 
-                        if (link_send_ok &&
-                            !e12a_intentionally_dropped_this_frame)
+                 if (link_send_ok)
                         {
                             link_uart_ok_count++;
 
