@@ -138,11 +138,6 @@
     Planned repetitions: 30.
 */
 
-#define DEBUG_E07_B_FC_STREAM_SUPPRESSION_TEST 0
-#define E07_B_TARGET_COUNT 30U
-
-
-
 #define E12B_RX_TARGET_SEQUENCE 10000U
 static const bool e12b_rx_enabled = false;
 
