@@ -28,7 +28,6 @@
 ////////////////////////////////////////////////////////////////////////////////////
 #define COMMAND_STATUS_MESSAGE_CLEAR_MS 3000
 
-#define  DEBUG_CRYPTO_TAMPER_TEST 0
 
 
 #define BENCH_FAILSAFE_DISARM 1
@@ -499,11 +498,7 @@ static TickType_t e07_a_stale_detect_tick = 0;
 #define SECURITY_TIMING_PRINT_EVERY 100
 #define SECURITY_TIMING_WARN_US 1000
 
-#define DEBUG_WRONG_IDENTITY_TEST 0
 
-#define DEBUG_WRONG_DIRECTION_TEST 0
-#define WRONG_DIRECTION_TEST_EVERY 2U
-#define WRONG_DIRECTION_TEST_TARGET_COUNT 1000U
 
 #define DEBUG_WRONG_KEY_TEST 0
 #define WRONG_KEY_TEST_EVERY 2U
@@ -10413,25 +10408,6 @@ void radio_tx_task(void *pvParameters)
             if (security_status == SECURITY_STATUS_OK &&
                 mathos_from_local_secure_packet(&secure_packet, &wire_packet))
             {
-#if DEBUG_WRONG_IDENTITY_TEST
-                static uint32_t wrong_identity_frame_count = 0;
-                static uint32_t wrong_identity_sent_count = 0;
-
-                bool wrong_identity_this_frame = false;
-
-                wrong_identity_frame_count++;
-
-                if (wrong_identity_sent_count <
-                        WRONG_IDENTITY_TEST_TARGET_COUNT &&
-                    (wrong_identity_frame_count %
-                     WRONG_IDENTITY_TEST_EVERY) == 0U)
-                {
-                    wire_packet.controller_id =
-                        WRONG_IDENTITY_CONTROLLER_ID;
-
-                    wrong_identity_this_frame = true;
-                }
-#endif
 
 
 /*
@@ -10979,27 +10955,6 @@ bool e12a_drop_this_frame =
                                     "[SECURITY TEST] WRONG KEY TX_FAILED "
                                     "seq=%lu\n",
                                     (unsigned long)wire_packet.sequence);
-                            }
-                        }
-#endif
-#if DEBUG_WRONG_IDENTITY_TEST
-                        if (wrong_identity_this_frame)
-                        {
-                            wrong_identity_sent_count++;
-
-                            if (wrong_identity_sent_count == 1U ||
-                                (wrong_identity_sent_count % 100U) == 0U ||
-                                wrong_identity_sent_count ==
-                                    WRONG_IDENTITY_TEST_TARGET_COUNT)
-                            {
-                                printf(
-                                    "[SECURITY TEST] WRONG IDENTITY SENT "
-                                    "controller_id=%u count=%lu/%u seq=%lu result=%s\n",
-                                    (unsigned int)WRONG_IDENTITY_CONTROLLER_ID,
-                                    (unsigned long)wrong_identity_sent_count,
-                                    (unsigned int)WRONG_IDENTITY_TEST_TARGET_COUNT,
-                                    (unsigned long)wire_packet.sequence,
-                                    link_send_ok ? "TX_OK" : "TX_FAILED");
                             }
                         }
 #endif
