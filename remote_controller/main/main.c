@@ -29,8 +29,7 @@
 #define COMMAND_STATUS_MESSAGE_CLEAR_MS 3000
 
 #define  DEBUG_CRYPTO_TAMPER_TEST 0
-#define CRYPTO_TAMPER_EVERY 2
-#define CRYPTO_TAMPER_TARGET_COUNT 10000U
+
 
 #define BENCH_FAILSAFE_DISARM 1
 
@@ -346,11 +345,7 @@ static void gateway_status_handle_frame(
     const uint8_t *frame,
     size_t frame_len);
 
-#define CRYPTO_TAMPER_MODE_CIPHERTEXT 1
-#define CRYPTO_TAMPER_MODE_TAG 2
-#define CRYPTO_TAMPER_MODE_AAD 3
-#define CRYPTO_TAMPER_MODE \
-    CRYPTO_TAMPER_MODE_TAG
+
 //////////////////// UART
 //////////////////// MAVLINK
 #define MAVLINK2_STX 0xFD
