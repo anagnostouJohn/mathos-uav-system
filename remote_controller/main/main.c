@@ -132,22 +132,6 @@
 #define FEATURE_LINK_UART_TX 1
 
 
-/*
-    E05-A — archived RC -> Gateway replay across Gateway session change.
-
-    Procedure:
-      1. Archive one successfully transmitted valid RC operational frame.
-      2. Keep the RC running.
-      3. Reboot only the Gateway.
-      4. Wait for a new Gateway operational session.
-      5. Replay the archived old-session wire frame unchanged 30 times.
-
-    Expected result:
-      All archived frames are rejected by the Gateway.
-*/
-#define DEBUG_E05_A_ARCHIVED_REPLAY_TEST 0
-#define E05_A_ARCHIVED_REPLAY_TARGET_COUNT 30U
-
 #define DEBUG_GATEWAY_EXACT_DUPLICATE_RX_TEST 0
 #define GATEWAY_EXACT_DUPLICATE_RX_TARGET_COUNT 1000U
 
