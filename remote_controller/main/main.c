@@ -395,21 +395,6 @@ static void gateway_status_handle_frame(
 #define SECURITY_TIMING_WARN_US 1000
 
 
-
-#if DEBUG_E07_B_FC_STREAM_SUPPRESSION_TEST
-
-static uint32_t e07_b_trial_count = 0U;
-static uint32_t e07_b_pass_count = 0U;
-static uint32_t e07_b_fail_count = 0U;
-
-static bool e07_b_event_active = false;
-static bool e07_b_fc_stale_seen = false;
-static bool e07_b_failsafe_seen = false;
-
-static TickType_t e07_b_stale_detect_tick = 0;
-
-#endif
-
 //////////////////// SECURITY LAYER
 #if DEBUG_SERIAL
 #define DBG_PRINT(...) printf(__VA_ARGS__)
@@ -3971,38 +3956,7 @@ void system_health_task(void *pvParameters)
         int fc_heartbeat_fresh =
             gateway_fc_heartbeat_is_fresh();
 
-#if DEBUG_E07_B_FC_STREAM_SUPPRESSION_TEST
 
-        if (command_state == RC_ARMED &&
-            gateway_control_ok &&
-            !fc_heartbeat_fresh &&
-            !e07_b_event_active &&
-            e07_b_trial_count < E07_B_TARGET_COUNT)
-        {
-            e07_b_event_active = true;
-            e07_b_fc_stale_seen = true;
-            e07_b_stale_detect_tick =
-                xTaskGetTickCount();
-
-            printf(
-                "[E07-B] FC STREAM STALE WHILE LINK HEALTHY "
-                "trial=%lu/%u "
-                "gateway_link=%u "
-                "fc_fresh=%u "
-                "command=%s\n",
-                (unsigned long)(e07_b_trial_count + 1U),
-                (unsigned int)E07_B_TARGET_COUNT,
-                gateway_control_ok ? 1U : 0U,
-                fc_heartbeat_fresh ? 1U : 0U,
-                mathos_rc_state_to_string(command_state));
-        }
-
-#endif
-
-        /*
-            DRONE_LINK_BAD means the RC-to-gateway
-            control link itself is unavailable.
-        */
         if (!gateway_control_ok)
         {
             fault_set(FAULT_DRONE_LINK_BAD);
@@ -4061,35 +4015,7 @@ void system_health_task(void *pvParameters)
                 "FC heartbeat stale while ARMED\n");
         }
 
-#if DEBUG_E07_B_FC_STREAM_SUPPRESSION_TEST
 
-        if (e07_b_event_active &&
-            e07_b_fc_stale_seen &&
-            !e07_b_failsafe_seen &&
-            e07_b_trial_count < E07_B_TARGET_COUNT)
-        {
-            e07_b_failsafe_seen = true;
-
-            uint32_t since_stale_ms =
-                pdTICKS_TO_MS(
-                    xTaskGetTickCount() -
-                    e07_b_stale_detect_tick);
-
-            printf(
-                "[E07-B] RC FAILSAFE ENTERED "
-                "trial=%lu/%u "
-                "after_stale=%lu ms "
-                "gateway_link=%u "
-                "command=%s\n",
-                (unsigned long)(e07_b_trial_count + 1U),
-                (unsigned int)E07_B_TARGET_COUNT,
-                (unsigned long)since_stale_ms,
-                gateway_control_link_is_ok() ? 1U : 0U,
-                mathos_rc_state_to_string(
-                    drone_command_get()));
-        }
-
-#endif
 #endif
 #if FEATURE_DIRECT_MAVLINK_MODE
 
@@ -6171,114 +6097,7 @@ last_sequence = packet.sequence;
         validated_status_session_id = session_id;
         gateway_status_update(&status);
         gateway_status_apply_to_remote(&status);
-#if DEBUG_E07_B_FC_STREAM_SUPPRESSION_TEST
 
-        /*
-            Complete the E07-B trial only after the restored
-            Gateway status reports a fresh FC heartbeat again.
-
-            PASS requires:
-              - RC command remains FAILSAFE;
-              - FC heartbeat freshness restored;
-              - FC heartbeat confirms DISARMED;
-              - Gateway control link remained healthy.
-        */
-        if (e07_b_event_active &&
-            e07_b_fc_stale_seen &&
-            e07_b_failsafe_seen &&
-            status.fc_heartbeat_fresh == 1 &&
-            e07_b_trial_count < E07_B_TARGET_COUNT)
-        {
-            TickType_t now_tick =
-                xTaskGetTickCount();
-
-            uint32_t since_stale_ms =
-                pdTICKS_TO_MS(
-                    now_tick -
-                    e07_b_stale_detect_tick);
-
-            rc_state_t current_command =
-                drone_command_get();
-
-            bool trial_pass =
-                (current_command == RC_FAILSAFE &&
-                 status.fc_heartbeat_fresh == 1 &&
-                 status.fc_is_armed == 0 &&
-                 status.gateway_link_ok == 1);
-
-            e07_b_trial_count++;
-
-            if (trial_pass)
-            {
-                e07_b_pass_count++;
-
-                printf(
-                    "[E07-B] TRIAL PASS "
-                    "trial=%lu/%u "
-                    "passes=%lu fails=%lu "
-                    "command=%s "
-                    "fc_fresh=%u "
-                    "fc_armed=%u "
-                    "gateway_link=%u "
-                    "since_stale=%lu ms\n",
-                    (unsigned long)e07_b_trial_count,
-                    (unsigned int)E07_B_TARGET_COUNT,
-                    (unsigned long)e07_b_pass_count,
-                    (unsigned long)e07_b_fail_count,
-                    mathos_rc_state_to_string(
-                        current_command),
-                    status.fc_heartbeat_fresh,
-                    status.fc_is_armed,
-                    status.gateway_link_ok,
-                    (unsigned long)since_stale_ms);
-            }
-            else
-            {
-                e07_b_fail_count++;
-
-                printf(
-                    "[E07-B] TRIAL FAIL "
-                    "trial=%lu/%u "
-                    "passes=%lu fails=%lu "
-                    "command=%s "
-                    "fc_fresh=%u "
-                    "fc_armed=%u "
-                    "gateway_link=%u\n",
-                    (unsigned long)e07_b_trial_count,
-                    (unsigned int)E07_B_TARGET_COUNT,
-                    (unsigned long)e07_b_pass_count,
-                    (unsigned long)e07_b_fail_count,
-                    mathos_rc_state_to_string(
-                        current_command),
-                    status.fc_heartbeat_fresh,
-                    status.fc_is_armed,
-                    status.gateway_link_ok);
-            }
-
-            /*
-                Reset experiment instrumentation only.
-                Keep the real RC command/state machine untouched.
-            */
-            e07_b_event_active = false;
-            e07_b_fc_stale_seen = false;
-            e07_b_failsafe_seen = false;
-            e07_b_stale_detect_tick = 0;
-
-            if (e07_b_trial_count ==
-                E07_B_TARGET_COUNT)
-            {
-                printf(
-                    "[E07-B] COMPLETE "
-                    "executed=%lu "
-                    "passed=%lu "
-                    "failed=%lu\n",
-                    (unsigned long)e07_b_trial_count,
-                    (unsigned long)e07_b_pass_count,
-                    (unsigned long)e07_b_fail_count);
-            }
-        }
-
-#endif
 
         ok_count++;
 e12b_rx_record_accepted(
