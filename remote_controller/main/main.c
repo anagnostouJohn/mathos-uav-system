@@ -873,21 +873,7 @@ static TickType_t e06_c_stale_detect_tick = 0;
 
 #endif
 
-#if DEBUG_E06_B_GATEWAY_DOWNLINK_INTERRUPTION_TEST
 
-static uint32_t e06_b_trial_count = 0U;
-static uint32_t e06_b_pass_count = 0U;
-static uint32_t e06_b_fail_count = 0U;
-
-static bool e06_b_interruption_active = false;
-static bool e06_b_status_stale_seen = false;
-static bool e06_b_failsafe_seen = false;
-static bool e06_b_restoration_seen = false;
-
-static TickType_t e06_b_last_gateway_status_tick = 0;
-static TickType_t e06_b_stale_detect_tick = 0;
-
-#endif
 
 static const uint8_t font_5x7[37][7] = {
     // A
@@ -4107,48 +4093,6 @@ void system_health_task(void *pvParameters)
 
 #endif
 
-#if DEBUG_E06_B_GATEWAY_DOWNLINK_INTERRUPTION_TEST
-
-        int e06_b_status_valid;
-        TickType_t e06_b_status_last_update;
-
-        taskENTER_CRITICAL(&gateway_status_mux);
-        e06_b_status_valid = gateway_status_valid;
-        e06_b_status_last_update = gateway_status_last_update_tick;
-        taskEXIT_CRITICAL(&gateway_status_mux);
-
-        if (command_state == RC_ARMED &&
-            e06_b_status_valid &&
-            !e06_b_interruption_active &&
-            e06_b_trial_count < E06_B_TARGET_COUNT)
-        {
-            TickType_t status_age_ticks =
-                now - e06_b_status_last_update;
-
-            uint32_t status_age_ms =
-                pdTICKS_TO_MS(status_age_ticks);
-
-            if (status_age_ms > GATEWAY_STATUS_FRESH_MS)
-            {
-                e06_b_interruption_active = true;
-                e06_b_status_stale_seen = true;
-                e06_b_last_gateway_status_tick =
-                    e06_b_status_last_update;
-                e06_b_stale_detect_tick = now;
-
-                printf(
-                    "[E06-B] DOWNLINK STALE "
-                    "trial=%lu/%u "
-                    "status_age=%lu ms "
-                    "command=%s\n",
-                    (unsigned long)(e06_b_trial_count + 1U),
-                    (unsigned int)E06_B_TARGET_COUNT,
-                    (unsigned long)status_age_ms,
-                    mathos_rc_state_to_string(command_state));
-            }
-        }
-
-#endif
 #if DEBUG_E06_C_BIDIRECTIONAL_INTERRUPTION_TEST
 
         int e06_c_status_valid;
@@ -4236,36 +4180,7 @@ void system_health_task(void *pvParameters)
             printf(
                 "[HEALTH] FAILSAFE: "
                 "gateway control link bad while ARMED\n");
-#if DEBUG_E06_B_GATEWAY_DOWNLINK_INTERRUPTION_TEST
 
-            if (e06_b_interruption_active &&
-                e06_b_status_stale_seen &&
-                !e06_b_failsafe_seen &&
-                e06_b_trial_count < E06_B_TARGET_COUNT)
-            {
-                e06_b_failsafe_seen = true;
-
-                TickType_t now_tick =
-                    xTaskGetTickCount();
-
-                uint32_t since_stale_ms =
-                    pdTICKS_TO_MS(
-                        now_tick -
-                        e06_b_stale_detect_tick);
-
-                printf(
-                    "[E06-B] RC FAILSAFE ENTERED "
-                    "trial=%lu/%u "
-                    "after_stale=%lu ms "
-                    "command=%s\n",
-                    (unsigned long)(e06_b_trial_count + 1U),
-                    (unsigned int)E06_B_TARGET_COUNT,
-                    (unsigned long)since_stale_ms,
-                    mathos_rc_state_to_string(
-                        drone_command_get()));
-            }
-
-#endif
 #if DEBUG_E06_C_BIDIRECTIONAL_INTERRUPTION_TEST
 
             if (e06_c_interruption_active &&
@@ -6655,92 +6570,7 @@ last_sequence = packet.sequence;
         }
 
 #endif
-#if DEBUG_E06_B_GATEWAY_DOWNLINK_INTERRUPTION_TEST
 
-        if (e06_b_interruption_active &&
-            e06_b_status_stale_seen &&
-            e06_b_failsafe_seen &&
-            !e06_b_restoration_seen &&
-            e06_b_trial_count < E06_B_TARGET_COUNT)
-        {
-            e06_b_restoration_seen = true;
-
-            TickType_t now_tick = xTaskGetTickCount();
-
-            uint32_t since_stale_ms =
-                pdTICKS_TO_MS(
-                    now_tick -
-                    e06_b_stale_detect_tick);
-
-            rc_state_t current_command =
-                drone_command_get();
-
-            bool trial_pass =
-                (current_command == RC_FAILSAFE &&
-                 status.fc_is_armed == 0);
-
-            e06_b_trial_count++;
-
-            if (trial_pass)
-            {
-                e06_b_pass_count++;
-
-                printf(
-                    "[E06-B] TRIAL PASS "
-                    "trial=%lu/%u "
-                    "passes=%lu "
-                    "fails=%lu "
-                    "command=%s "
-                    "fc_armed=%u "
-                    "since_stale=%lu ms\n",
-                    (unsigned long)e06_b_trial_count,
-                    (unsigned int)E06_B_TARGET_COUNT,
-                    (unsigned long)e06_b_pass_count,
-                    (unsigned long)e06_b_fail_count,
-                    mathos_rc_state_to_string(current_command),
-                    status.fc_is_armed,
-                    (unsigned long)since_stale_ms);
-            }
-            else
-            {
-                e06_b_fail_count++;
-
-                printf(
-                    "[E06-B] TRIAL FAIL "
-                    "trial=%lu/%u "
-                    "passes=%lu "
-                    "fails=%lu "
-                    "command=%s "
-                    "fc_armed=%u\n",
-                    (unsigned long)e06_b_trial_count,
-                    (unsigned int)E06_B_TARGET_COUNT,
-                    (unsigned long)e06_b_pass_count,
-                    (unsigned long)e06_b_fail_count,
-                    mathos_rc_state_to_string(current_command),
-                    status.fc_is_armed);
-            }
-
-            e06_b_interruption_active = false;
-            e06_b_status_stale_seen = false;
-            e06_b_failsafe_seen = false;
-            e06_b_restoration_seen = false;
-            e06_b_last_gateway_status_tick = 0;
-            e06_b_stale_detect_tick = 0;
-
-            if (e06_b_trial_count == E06_B_TARGET_COUNT)
-            {
-                printf(
-                    "[E06-B] COMPLETE "
-                    "executed=%lu "
-                    "passed=%lu "
-                    "failed=%lu\n",
-                    (unsigned long)e06_b_trial_count,
-                    (unsigned long)e06_b_pass_count,
-                    (unsigned long)e06_b_fail_count);
-            }
-        }
-
-#endif
 #if DEBUG_E06_C_BIDIRECTIONAL_INTERRUPTION_TEST
 
         if (e06_c_interruption_active &&
