@@ -460,11 +460,6 @@ static TickType_t e07_a_stale_detect_tick = 0;
 
 
 
-
-#if DEBUG_GATEWAY_WRONG_KEY_RX_TEST
-static uint32_t gateway_wrong_key_reject_count = 0U;
-#endif
-
 #if DEBUG_E07_B_FC_STREAM_SUPPRESSION_TEST
 
 static uint32_t e07_b_trial_count = 0U;
@@ -5713,38 +5708,7 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
         bad_count++;
         gateway_auth_fail_count++;
 
-#if DEBUG_GATEWAY_WRONG_KEY_RX_TEST
 
-        if (packet.payload_type ==
-                SECURITY_PAYLOAD_TYPE_GATEWAY_STATUS &&
-            crypto_status ==
-                MATHOS_SECURE_STATUS_AUTH_FAILED)
-        {
-            gateway_wrong_key_reject_count++;
-
-            if (gateway_wrong_key_reject_count == 1U ||
-                (gateway_wrong_key_reject_count %
-                 100U) == 0U ||
-                gateway_wrong_key_reject_count ==
-                    GATEWAY_WRONG_KEY_RX_TARGET_COUNT)
-            {
-                printf(
-                    "[SECURITY TEST] "
-                    "GATEWAY WRONG KEY REJECTED "
-                    "count=%lu/%u "
-                    "status=%s "
-                    "bad_count=%lu\n",
-                    (unsigned long)
-                        gateway_wrong_key_reject_count,
-                    (unsigned int)
-                        GATEWAY_WRONG_KEY_RX_TARGET_COUNT,
-                    mathos_secure_status_to_string(
-                        crypto_status),
-                    (unsigned long)bad_count);
-            }
-        }
-
-#endif
 #if DEBUG_GATEWAY_WRONG_DIRECTION_RX_TEST
 
         if (packet.payload_type ==
@@ -6186,16 +6150,6 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
 
 #endif
 
-#if DEBUG_GATEWAY_WRONG_KEY_RX_TEST
-
-        gateway_wrong_key_reject_count = 0U;
-
-        printf(
-            "[SECURITY TEST] "
-            "Gateway wrong-key RX counter reset "
-            "for operational session\n");
-
-#endif
 
 #if DEBUG_GATEWAY_WRONG_IDENTITY_RX_TEST
 
