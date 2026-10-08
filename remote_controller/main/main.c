@@ -127,21 +127,7 @@
 #define RC_PAIRING_REQUEST_MAX_AGE_MS 5000U
 
 #define FEATURE_LINK_UART_TX 1
-/*
-    E06-B — Gateway -> RC communication interruption
-    and restoration.
 
-    RC -> Gateway remains operational.
-
-    Expected:
-      1. Gateway status freshness expires at the RC.
-      2. RC enters FAILSAFE while previously ARMED.
-      3. FAILSAFE state continues over the healthy uplink.
-      4. Reconnection does not automatically restore ARMED authority.
-
-    Planned repetitions: 30.
-*/
-#define DEBUG_E06_B_GATEWAY_DOWNLINK_INTERRUPTION_TEST 0
 
 /*
     E07-A — FC HEARTBEAT suppression observed from RC.
@@ -173,7 +159,6 @@
 #define DEBUG_E06_C_BIDIRECTIONAL_INTERRUPTION_TEST 0
 #define E06_C_TARGET_COUNT 30U
 
-#define E06_B_TARGET_COUNT 30U
 
 
 /*
