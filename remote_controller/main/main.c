@@ -750,10 +750,6 @@ static uint8_t mavlink_tx_seq = 0;
 static uint32_t security_tx_sequence = 1;
 static security_timing_stats_t security_timing_stats = {0};
 
-#if DEBUG_E10D_FIRST_PACKET_FAILSAFE_TEST
-static bool e10d_first_operational_packet_pending = true;
-#endif
-
 #if DEBUG_E10F_RECOVERY_GAP_TEST
 static bool e10f_gap_started = false;
 static bool e10f_gap_active = false;
@@ -9116,22 +9112,6 @@ void radio_tx_task(void *pvParameters)
             .reserved = {0, 0, 0},
         };
 
-#if DEBUG_E10D_FIRST_PACKET_FAILSAFE_TEST
-
-        if (e10d_first_operational_packet_pending)
-        {
-            packet.state = RC_FAILSAFE;
-
-            printf(
-                "[E10-D] FORCING FIRST OPERATIONAL PACKET "
-                "packet_id=%lu state=FAILSAFE "
-                "real_command=%s\n",
-                (unsigned long)packet.packet_id,
-                mathos_rc_state_to_string(command_state));
-        }
-
-#endif
-
 #if DEBUG_RC_PACKET_TX
         static uint32_t rc_tx_print_counter = 0;
         static rc_state_t last_print_state = (rc_state_t)-1;
@@ -9655,23 +9635,6 @@ bool e12a_drop_this_frame =
 
 #endif
 
-#if DEBUG_E10D_FIRST_PACKET_FAILSAFE_TEST
-
-                        if (link_send_ok &&
-                            e10d_first_operational_packet_pending)
-                        {
-                            e10d_first_operational_packet_pending = false;
-
-                            printf(
-                                "[E10-D] FIRST OPERATIONAL PACKET TX_OK "
-                                "packet_id=%lu state=%s "
-                                "real_command=%s\n",
-                                (unsigned long)packet.packet_id,
-                                mathos_rc_state_to_string(packet.state),
-                                mathos_rc_state_to_string(command_state));
-                        }
-
-#endif
 
                         static uint32_t link_uart_ok_count = 0;
 
