@@ -333,16 +333,7 @@ static void gateway_status_handle_frame(
 #define TEST_PROVISION_CALIBRATION_ONCE 0
 #define FEATURE_TREAT_GATEWAY_DRY_RUN_AS_CONFIRMED 0
 
-#define DEBUG_E10D_FIRST_PACKET_FAILSAFE_TEST 0
-/*
- * E10-F — Recovery hold interrupted by RC freshness timeout.
- *
- * Bench-only experiment:
- * after operational packet 2 has been successfully transmitted,
- * intentionally suppress RC operational-frame transmission for
- * 500 ms. The Gateway runtime RC freshness limit is * 3500 ms for E10-G., so
- * this must invalidate the current recovery hold.
- */
+
 #define DEBUG_E10F_RECOVERY_GAP_TEST 0
 #define E10F_RECOVERY_GAP_MS 3500U
 
