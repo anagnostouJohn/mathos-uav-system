@@ -129,120 +129,6 @@
 #define FEATURE_LINK_UART_TX 1
 
 
-/*
-    E07-A — FC HEARTBEAT suppression observed from RC.
-
-    RC <-> Gateway communication must remain healthy while
-    Gateway reports FC heartbeat freshness loss.
-
-    Planned repetitions: 30.
-*/
-
-#define E12B_RX_TARGET_SEQUENCE 10000U
-static const bool e12b_rx_enabled = false;
-
-static uint32_t e12b_rx_accepted = 0U;
-static uint32_t e12b_rx_missing = 0U;
-static uint32_t e12b_rx_bad_baseline = 0U;
-static uint32_t e12b_rx_replay_baseline = 0U;
-static bool e12b_rx_complete = false;
-
-static void e12b_rx_reset(
-    uint32_t bad_now,
-    uint32_t replay_now)
-{
-        if (!e12b_rx_enabled)
-    {
-        e12b_rx_complete = true;
-        return;
-    }
-    e12b_rx_accepted = 0U;
-    e12b_rx_missing = 0U;
-
-    e12b_rx_bad_baseline = bad_now;
-    e12b_rx_replay_baseline = replay_now;
-
-    e12b_rx_complete = false;
-
-    printf(
-        "[E12-B RX] WINDOW RESET "
-        "target=%u "
-        "bad_baseline=%lu "
-        "replay_baseline=%lu\n",
-        (unsigned int)E12B_RX_TARGET_SEQUENCE,
-        (unsigned long)e12b_rx_bad_baseline,
-        (unsigned long)e12b_rx_replay_baseline);
-}
-
-static void e12b_rx_record_accepted(
-    uint32_t sequence,
-    uint32_t previous_sequence,
-    uint32_t bad_now,
-    uint32_t replay_now)
-{
-        if (!e12b_rx_enabled)
-    {
-        return;
-    }
-    if (e12b_rx_complete)
-    {
-        return;
-    }
-
-    /*
-     * Frame belongs to the fixed E12-B sender window.
-     */
-    if (sequence <= E12B_RX_TARGET_SEQUENCE)
-    {
-        if (sequence > previous_sequence + 1U)
-        {
-            e12b_rx_missing +=
-                sequence - previous_sequence - 1U;
-        }
-
-        e12b_rx_accepted++;
-
-        if (sequence < E12B_RX_TARGET_SEQUENCE)
-        {
-            return;
-        }
-    }
-    else
-    {
-        /*
-         * The final offered frame may itself have been dropped.
-         * In that case the first normal post-campaign frame closes
-         * the receiver window without being counted as accepted.
-         */
-        if (previous_sequence <
-            E12B_RX_TARGET_SEQUENCE)
-        {
-            e12b_rx_missing +=
-                E12B_RX_TARGET_SEQUENCE -
-                previous_sequence;
-        }
-    }
-
-    e12b_rx_complete = true;
-
-    printf(
-        "[E12-B RX] CAMPAIGN COMPLETE "
-        "target=%u "
-        "accepted=%lu "
-        "missing=%lu "
-        "bad_delta=%lu "
-        "replay_delta=%lu "
-        "last_campaign_seq=%u\n",
-        (unsigned int)E12B_RX_TARGET_SEQUENCE,
-        (unsigned long)e12b_rx_accepted,
-        (unsigned long)e12b_rx_missing,
-        (unsigned long)(
-            bad_now - e12b_rx_bad_baseline),
-        (unsigned long)(
-            replay_now - e12b_rx_replay_baseline),
-        (unsigned int)E12B_RX_TARGET_SEQUENCE);
-}
-
 static void gateway_status_handle_frame(
     const uint8_t *frame,
     size_t frame_len);
@@ -5831,10 +5717,6 @@ has_session = 1;
             session_id;
 
         last_sequence = 0;
-e12b_rx_reset(
-    bad_count,
-    replay_count);
-
 
         gateway_session_remember(
             session_id);
