@@ -132,9 +132,6 @@
 #define FEATURE_LINK_UART_TX 1
 
 
-#define DEBUG_OLD_SEQUENCE_TEST 0
-#define OLD_SEQUENCE_TEST_TARGET_COUNT 1000U
-
 /*
     E05-A — archived RC -> Gateway replay across Gateway session change.
 
@@ -490,13 +487,7 @@ static TickType_t e07_a_stale_detect_tick = 0;
 #define SECURITY_TIMING_WARN_US 1000
 
 
-#if DEBUG_OLD_SEQUENCE_TEST
-static uint8_t old_sequence_saved_frame[MATHOS_WIRE_MAX_FRAME_LEN];
-static size_t old_sequence_saved_frame_len = 0;
-static uint32_t old_sequence_saved_seq = 0;
-static bool old_sequence_saved_valid = false;
-static uint32_t old_sequence_sent_count = 0;
-#endif
+
 
 #if DEBUG_GATEWAY_WRONG_KEY_RX_TEST
 static uint32_t gateway_wrong_key_reject_count = 0U;
@@ -10885,86 +10876,6 @@ bool e12a_drop_this_frame =
 #endif
 
 
-
-#if DEBUG_OLD_SEQUENCE_TEST
-                        if (link_send_ok)
-                        {
-                            /*
-                                If we already saved the previous valid frame,
-                                first allow the newly transmitted current frame
-                                to advance the Gateway's last_sequence.
-
-                                Then replay the previous frame unchanged.
-
-                                Example:
-                                    normal seq=2
-                                    replay seq=1
-
-                                Therefore:
-                                    replay_seq < last_sequence
-                            */
-                            if (old_sequence_saved_valid &&
-                                old_sequence_sent_count <
-                                    OLD_SEQUENCE_TEST_TARGET_COUNT)
-                            {
-                                vTaskDelay(pdMS_TO_TICKS(5));
-
-                                int old_sequence_ok =
-                                    link_uart_send_frame(
-                                        old_sequence_saved_frame,
-                                        old_sequence_saved_frame_len);
-
-                                if (old_sequence_ok)
-                                {
-                                    old_sequence_sent_count++;
-
-                                    if (old_sequence_sent_count == 1U ||
-                                        (old_sequence_sent_count % 100U) == 0U ||
-                                        old_sequence_sent_count ==
-                                            OLD_SEQUENCE_TEST_TARGET_COUNT)
-                                    {
-                                        printf(
-                                            "[SECURITY TEST] OLD SEQUENCE FRAME SENT "
-                                            "count=%lu/%u replay_seq=%lu current_seq=%lu "
-                                            "result=TX_OK\n",
-                                            (unsigned long)old_sequence_sent_count,
-                                            (unsigned int)OLD_SEQUENCE_TEST_TARGET_COUNT,
-                                            (unsigned long)old_sequence_saved_seq,
-                                            (unsigned long)wire_packet.sequence);
-                                    }
-                                }
-                                else
-                                {
-                                    printf(
-                                        "[SECURITY TEST] OLD SEQUENCE FRAME TX_FAILED "
-                                        "replay_seq=%lu current_seq=%lu\n",
-                                        (unsigned long)old_sequence_saved_seq,
-                                        (unsigned long)wire_packet.sequence);
-                                }
-                            }
-
-                            /*
-                                Save CURRENT successfully transmitted frame.
-                                It will become the old frame during the next cycle.
-                            */
-                            if (wire_frame_len <=
-                                sizeof(old_sequence_saved_frame))
-                            {
-                                memcpy(
-                                    old_sequence_saved_frame,
-                                    wire_frame,
-                                    wire_frame_len);
-
-                                old_sequence_saved_frame_len =
-                                    wire_frame_len;
-
-                                old_sequence_saved_seq =
-                                    wire_packet.sequence;
-
-                                old_sequence_saved_valid = true;
-                            }
-                        }
-#endif
 #if DEBUG_E05_A_ARCHIVED_REPLAY_TEST
                         /*
                             E05-A capture phase.
