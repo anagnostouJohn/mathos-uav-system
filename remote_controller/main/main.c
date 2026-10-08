@@ -104,7 +104,7 @@
 
 
 
-#define DEBUG_GATEWAY_WRONG_IDENTITY_RX_TEST 0
+
 
 #define CONTROL_UART_PORT UART_NUM_1
 #define CONTROL_UART_TX_PIN 8
@@ -127,12 +127,6 @@
 #define RC_PAIRING_REQUEST_MAX_AGE_MS 5000U
 
 #define FEATURE_LINK_UART_TX 1
-
-
-
-#define DEBUG_GATEWAY_WRONG_IDENTITY_RX_TEST 0
-#define GATEWAY_WRONG_IDENTITY_RX_TARGET_COUNT 1000U
-
 /*
     E06-B — Gateway -> RC communication interruption
     and restoration.
