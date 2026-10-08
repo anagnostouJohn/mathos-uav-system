@@ -333,24 +333,6 @@ static void gateway_status_handle_frame(
 #define TEST_PROVISION_CALIBRATION_ONCE 0
 #define FEATURE_TREAT_GATEWAY_DRY_RUN_AS_CONFIRMED 0
 
-/*
-    E10-C — New RC session begins with ARMED state.
-
-    Bench-only experiment:
-    the first successfully transmitted operational RC packet
-    after RC boot will report RC_ARMED while the RC's real
-    internal command state remains unchanged.
-*/
-#define DEBUG_E10C_FIRST_PACKET_ARMED_TEST 0
-
-/*
-    E10-D — New RC session begins with FAILSAFE state.
-
-    Bench-only experiment:
-    the first successfully transmitted operational RC packet
-    after RC boot will report RC_FAILSAFE while the RC's real
-    internal command state remains unchanged.
-*/
 #define DEBUG_E10D_FIRST_PACKET_FAILSAFE_TEST 0
 /*
  * E10-F — Recovery hold interrupted by RC freshness timeout.
