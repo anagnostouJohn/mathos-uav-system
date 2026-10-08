@@ -768,10 +768,6 @@ static uint8_t mavlink_tx_seq = 0;
 static uint32_t security_tx_sequence = 1;
 static security_timing_stats_t security_timing_stats = {0};
 
-#if DEBUG_E10C_FIRST_PACKET_ARMED_TEST
-static bool e10c_first_operational_packet_pending = true;
-#endif
-
 #if DEBUG_E10D_FIRST_PACKET_FAILSAFE_TEST
 static bool e10d_first_operational_packet_pending = true;
 #endif
@@ -9154,21 +9150,6 @@ void radio_tx_task(void *pvParameters)
 
 #endif
 
-#if DEBUG_E10C_FIRST_PACKET_ARMED_TEST
-
-        if (e10c_first_operational_packet_pending)
-        {
-            packet.state = RC_ARMED;
-
-            printf(
-                "[E10-C] FORCING FIRST OPERATIONAL PACKET "
-                "packet_id=%lu state=ARMED "
-                "real_command=%s\n",
-                (unsigned long)packet.packet_id,
-                mathos_rc_state_to_string(command_state));
-        }
-
-#endif
 #if DEBUG_RC_PACKET_TX
         static uint32_t rc_tx_print_counter = 0;
         static rc_state_t last_print_state = (rc_state_t)-1;
@@ -9688,23 +9669,6 @@ bool e12a_drop_this_frame =
                                 "after_packet_id=2 requested_ms=%u\n",
                                 (unsigned int)
                                     E10F_RECOVERY_GAP_MS);
-                        }
-
-#endif
-#if DEBUG_E10C_FIRST_PACKET_ARMED_TEST
-
-                        if (link_send_ok &&
-                            e10c_first_operational_packet_pending)
-                        {
-                            e10c_first_operational_packet_pending = false;
-
-                            printf(
-                                "[E10-C] FIRST OPERATIONAL PACKET TX_OK "
-                                "packet_id=%lu state=%s "
-                                "real_command=%s\n",
-                                (unsigned long)packet.packet_id,
-                                mathos_rc_state_to_string(packet.state),
-                                mathos_rc_state_to_string(command_state));
                         }
 
 #endif
