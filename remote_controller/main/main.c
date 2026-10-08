@@ -499,15 +499,6 @@ static TickType_t e07_a_stale_detect_tick = 0;
 #define SECURITY_TIMING_WARN_US 1000
 
 
-
-#define DEBUG_WRONG_KEY_TEST 0
-#define WRONG_KEY_TEST_EVERY 2U
-#define WRONG_KEY_TEST_TARGET_COUNT 1000U
-
-#define WRONG_IDENTITY_TEST_EVERY 2U
-#define WRONG_IDENTITY_TEST_TARGET_COUNT 1000U
-#define WRONG_IDENTITY_CONTROLLER_ID 0xEEU
-
 #if DEBUG_OLD_SEQUENCE_TEST
 static uint8_t old_sequence_saved_frame[MATHOS_WIRE_MAX_FRAME_LEN];
 static size_t old_sequence_saved_frame_len = 0;
@@ -10440,36 +10431,9 @@ static bool e13_rc_tx_aead_final_printed = false;
 int64_t e13_rc_tx_aead_start_us =
     esp_timer_get_time();
 
-#if DEBUG_WRONG_KEY_TEST
-                static uint32_t wrong_key_frame_count = 0;
-                static uint32_t wrong_key_sent_count = 0;
-
-                bool wrong_key_this_frame = false;
-
-                wrong_key_frame_count++;
-
-                if (wrong_key_sent_count <
-                        WRONG_KEY_TEST_TARGET_COUNT &&
-                    (wrong_key_frame_count %
-                     WRONG_KEY_TEST_EVERY) == 0U)
-                {
-                    wrong_key_this_frame = true;
-
-                    encrypt_status =
-                        mathos_secure_test_encrypt_session_packet_with_wrong_key(
-                            &wire_packet);
-                }
-                else
-                {
-                    encrypt_status =
-                        mathos_secure_encrypt_session_packet(
-                            &wire_packet);
-                }
-#else
-                encrypt_status =
-                    mathos_secure_encrypt_session_packet(
-                        &wire_packet);
-#endif
+encrypt_status =
+    mathos_secure_encrypt_session_packet(
+        &wire_packet);
 int64_t e13_rc_tx_aead_us =
     esp_timer_get_time() -
     e13_rc_tx_aead_start_us;
@@ -10929,35 +10893,6 @@ bool e12a_drop_this_frame =
 
 #endif
 
-#if DEBUG_WRONG_KEY_TEST
-                        if (wrong_key_this_frame)
-                        {
-                            if (link_send_ok)
-                            {
-                                wrong_key_sent_count++;
-
-                                if (wrong_key_sent_count == 1U ||
-                                    (wrong_key_sent_count % 100U) == 0U ||
-                                    wrong_key_sent_count ==
-                                        WRONG_KEY_TEST_TARGET_COUNT)
-                                {
-                                    printf(
-                                        "[SECURITY TEST] WRONG KEY SENT "
-                                        "count=%lu/%u seq=%lu result=TX_OK\n",
-                                        (unsigned long)wrong_key_sent_count,
-                                        (unsigned int)WRONG_KEY_TEST_TARGET_COUNT,
-                                        (unsigned long)wire_packet.sequence);
-                                }
-                            }
-                            else
-                            {
-                                printf(
-                                    "[SECURITY TEST] WRONG KEY TX_FAILED "
-                                    "seq=%lu\n",
-                                    (unsigned long)wire_packet.sequence);
-                            }
-                        }
-#endif
 
 
 #if DEBUG_OLD_SEQUENCE_TEST
