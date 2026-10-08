@@ -741,16 +741,6 @@ static uint8_t mavlink_tx_seq = 0;
 static uint32_t security_tx_sequence = 1;
 static security_timing_stats_t security_timing_stats = {0};
 
-#if DEBUG_E10F_RECOVERY_GAP_TEST
-static bool e10f_gap_started = false;
-static bool e10f_gap_active = false;
-static bool e10f_gap_completed = false;
-static int64_t e10f_gap_start_us = 0;
-#endif
-
-
-
-
 
 static const uint8_t font_5x7[37][7] = {
     // A
@@ -9323,48 +9313,6 @@ if (encrypt_status == MATHOS_SECURE_STATUS_OK &&
 #if FEATURE_LINK_UART_TX
 bool e12a_intentionally_dropped_this_frame = false;
 
-#if DEBUG_E10F_RECOVERY_GAP_TEST
-
-                        bool e10f_suppress_operational_tx = false;
-
-                        if (e10f_gap_active)
-                        {
-                            int64_t e10f_gap_elapsed_ms =
-                                (esp_timer_get_time() -
-                                 e10f_gap_start_us) /
-                                1000;
-
-                            if (e10f_gap_elapsed_ms <
-                                (int64_t)E10F_RECOVERY_GAP_MS)
-                            {
-                                /*
-                                 * Deliberately do not transmit this
-                                 * operational frame. We report success
-                                 * locally so the normal RC fault logic is
-                                 * not triggered by the bench experiment.
-                                 */
-                                e10f_suppress_operational_tx = true;
-                            }
-                            else
-                            {
-                                e10f_gap_active = false;
-                                e10f_gap_completed = true;
-
-                                printf(
-                                    "[E10-F] OPERATIONAL TX RESUMED "
-                                    "gap_ms=%lld next_packet_id=%lu\n",
-                                    (long long)e10f_gap_elapsed_ms,
-                                    (unsigned long)packet.packet_id);
-                            }
-                        }
-
-                        if (e10f_suppress_operational_tx)
-                        {
-                            link_send_ok = 1;
-                        }
-                        else
-#endif
-                            // bool e12a_intentionally_dropped_this_frame = false;
 
                         {
                             /*
@@ -9596,35 +9544,6 @@ bool e12a_drop_this_frame =
                                         wire_frame_len);
                             }
                         }
-
-#if DEBUG_E10F_RECOVERY_GAP_TEST
-
-                        /*
-                         * Packet 1 is the E10-C injected ARMED packet.
-                         * Packet 2 is the normal DISARMED packet that
-                         * starts the Gateway recovery hold.
-                         *
-                         * Only after packet 2 has really gone onto UART
-                         * do we begin the 500 ms interruption.
-                         */
-                        if (link_send_ok &&
-                            !e10f_suppress_operational_tx &&
-                            !e10f_gap_started &&
-                            packet.packet_id == 2U)
-                        {
-                            e10f_gap_started = true;
-                            e10f_gap_active = true;
-                            e10f_gap_start_us =
-                                esp_timer_get_time();
-
-                            printf(
-                                "[E10-F] RECOVERY GAP START "
-                                "after_packet_id=2 requested_ms=%u\n",
-                                (unsigned int)
-                                    E10F_RECOVERY_GAP_MS);
-                        }
-
-#endif
 
 
                         static uint32_t link_uart_ok_count = 0;
