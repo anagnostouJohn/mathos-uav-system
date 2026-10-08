@@ -233,7 +233,7 @@ static void gateway_status_handle_frame(
 
 #define SECURITY_SKELETON_DIAGNOSTIC FEATURE_SECURITY_SKELETON
 
-#define SECURITY_LINK_ID_LOCAL_TEST 0
+
 
 #define LINK_RX_BUFFER_SIZE 128
 #define GATEWAY_STATUS_FRESH_MS 1000
@@ -2901,35 +2901,6 @@ static int mathos_from_local_secure_packet(
     return 1;
 }
 
-static int mathos_to_local_secure_packet(
-    const mathos_secure_packet_t *src,
-    secure_packet_t *dst)
-{
-    if (src == NULL || dst == NULL)
-    {
-        return 0;
-    }
-
-    if (src->payload_len > SECURITY_PAYLOAD_MAX_LEN)
-    {
-        return 0;
-    }
-
-    memset(dst, 0, sizeof(secure_packet_t));
-
-    dst->sequence = src->sequence;
-    dst->timestamp_ms = src->timestamp_ms;
-
-    dst->controller_id = src->controller_id;
-    dst->link_id = src->link_id;
-    dst->payload_type = src->payload_type;
-    dst->payload_len = src->payload_len;
-
-    memcpy(dst->payload, src->payload, src->payload_len);
-    memcpy(dst->auth_tag, src->auth_tag, SECURITY_AUTH_TAG_LEN);
-
-    return 1;
-}
 void enter_failsafe(const char *reason)
 {
     rc_state_t command_state = drone_command_get();
