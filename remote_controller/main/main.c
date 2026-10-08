@@ -5454,10 +5454,6 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
     static uint32_t gateway_wrong_identity_reject_count = 0U;
 #endif
 
-
-#if DEBUG_GATEWAY_OLD_SEQUENCE_RX_TEST
-    static uint32_t old_sequence_reject_count = 0;
-#endif
     int new_gateway_session = 0;
 
     if (frame == NULL || frame_len == 0)
@@ -6423,16 +6419,7 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
         last_session_id =
             session_id;
 
-#if DEBUG_GATEWAY_OLD_SEQUENCE_RX_TEST
 
-        old_sequence_reject_count = 0;
-
-        printf(
-            "[SECURITY TEST] "
-            "Gateway old-sequence RX counter reset "
-            "for initial session\n");
-
-#endif
 
 last_sequence = 0;
 
@@ -6506,16 +6493,7 @@ e12b_rx_reset(
     bad_count,
     replay_count);
 
-#if DEBUG_GATEWAY_OLD_SEQUENCE_RX_TEST
 
-        old_sequence_reject_count = 0;
-
-        printf(
-            "[SECURITY TEST] "
-            "Gateway old-sequence RX counter reset "
-            "for new session\n");
-
-#endif
         gateway_session_remember(
             session_id);
 
@@ -6547,38 +6525,6 @@ status or telemetry from the previous session.
         replay_count++;
 
 
-#if DEBUG_GATEWAY_OLD_SEQUENCE_RX_TEST
-
-        if (packet.sequence < last_sequence)
-        {
-            old_sequence_reject_count++;
-
-            if (old_sequence_reject_count == 1U ||
-                (old_sequence_reject_count % 100U) == 0U ||
-                old_sequence_reject_count ==
-                    GATEWAY_OLD_SEQUENCE_RX_TARGET_COUNT)
-            {
-                printf(
-                    "[SECURITY TEST] "
-                    "GATEWAY OLD SEQUENCE REJECTED "
-                    "count=%lu/%u "
-                    "session=0x%08lx "
-                    "replay_seq=%lu last=%lu "
-                    "replay_count=%lu\n",
-                    (unsigned long)
-                        old_sequence_reject_count,
-                    (unsigned int)
-                        GATEWAY_OLD_SEQUENCE_RX_TARGET_COUNT,
-                    (unsigned long)session_id,
-                    (unsigned long)packet.sequence,
-                    (unsigned long)last_sequence,
-                    (unsigned long)replay_count);
-            }
-
-            return;
-        }
-
-#endif
         printf(
             "[GATEWAY RX] REPLAY/OLD "
             "session=0x%08lx seq=%lu last=%lu "
