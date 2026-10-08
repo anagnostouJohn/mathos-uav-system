@@ -5432,9 +5432,6 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
     static uint32_t ok_count = 0;
     static uint32_t bad_count = 0;
     static uint32_t replay_count = 0;
-#if DEBUG_GATEWAY_WRONG_DIRECTION_RX_TEST
-    static uint32_t gateway_wrong_direction_reject_count = 0U;
-#endif
 
 #if DEBUG_GATEWAY_WRONG_IDENTITY_RX_TEST
     static uint32_t gateway_wrong_identity_reject_count = 0U;
@@ -5707,39 +5704,6 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
         bad_count++;
         gateway_auth_fail_count++;
 
-
-#if DEBUG_GATEWAY_WRONG_DIRECTION_RX_TEST
-
-        if (packet.payload_type ==
-                SECURITY_PAYLOAD_TYPE_GATEWAY_STATUS &&
-            crypto_status ==
-                MATHOS_SECURE_STATUS_AUTH_FAILED)
-        {
-            gateway_wrong_direction_reject_count++;
-
-            if (gateway_wrong_direction_reject_count == 1U ||
-                (gateway_wrong_direction_reject_count %
-                 100U) == 0U ||
-                gateway_wrong_direction_reject_count ==
-                    GATEWAY_WRONG_DIRECTION_RX_TARGET_COUNT)
-            {
-                printf(
-                    "[SECURITY TEST] "
-                    "GATEWAY WRONG DIRECTION REJECTED "
-                    "count=%lu/%u "
-                    "status=%s "
-                    "bad_count=%lu\n",
-                    (unsigned long)
-                        gateway_wrong_direction_reject_count,
-                    (unsigned int)
-                        GATEWAY_WRONG_DIRECTION_RX_TARGET_COUNT,
-                    mathos_secure_status_to_string(
-                        crypto_status),
-                    (unsigned long)bad_count);
-            }
-        }
-
-#endif
         if (gateway_auth_fail_count == 1U ||
             (gateway_auth_fail_count % 100U) == 0U)
         {
@@ -6138,16 +6102,6 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
         }
 
         rc_operational_session_ready = 1;
-#if DEBUG_GATEWAY_WRONG_DIRECTION_RX_TEST
-
-        gateway_wrong_direction_reject_count = 0U;
-
-        printf(
-            "[SECURITY TEST] "
-            "Gateway wrong-direction RX counter reset "
-            "for operational session\n");
-
-#endif
 
 
 #if DEBUG_GATEWAY_WRONG_IDENTITY_RX_TEST
