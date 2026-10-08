@@ -142,35 +142,7 @@
 #define E07_B_TARGET_COUNT 30U
 #define E07_A_TARGET_COUNT 30U
 
-/*
-    E06-C — Bidirectional RC <-> Gateway communication
-    interruption and restoration.
 
-    Expected:
-      1. RC loses fresh Gateway status and enters FAILSAFE.
-      2. Gateway independently loses fresh RC packets.
-      3. Gateway withdraws manual override.
-      4. Gateway applies the configured bench safety policy.
-      5. FC becomes DISARMED.
-      6. Restoring both directions does not restore ARMED authority.
-
-    Planned repetitions: 30.
-*/
-#define DEBUG_E06_C_BIDIRECTIONAL_INTERRUPTION_TEST 0
-#define E06_C_TARGET_COUNT 30U
-
-
-
-/*
- * E12-B receiver-side accounting.
- *
- * Gateway operational STATUS and TELEMETRY frames share one
- * monotonically increasing sequence space.
- *
- * The Gateway campaign offers exactly 10000 operational frames.
- * Missing sequence numbers inside that window therefore represent
- * frames that were not observed by the RC.
- */
 #define E12B_RX_TARGET_SEQUENCE 10000U
 static const bool e12b_rx_enabled = false;
 
