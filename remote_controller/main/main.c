@@ -843,20 +843,7 @@ static bool e10f_gap_completed = false;
 static int64_t e10f_gap_start_us = 0;
 #endif
 
-#if DEBUG_E06_C_BIDIRECTIONAL_INTERRUPTION_TEST
 
-static uint32_t e06_c_trial_count = 0U;
-static uint32_t e06_c_pass_count = 0U;
-static uint32_t e06_c_fail_count = 0U;
-
-static bool e06_c_interruption_active = false;
-static bool e06_c_status_stale_seen = false;
-static bool e06_c_failsafe_seen = false;
-static bool e06_c_restoration_seen = false;
-
-static TickType_t e06_c_stale_detect_tick = 0;
-
-#endif
 
 
 
@@ -4078,46 +4065,6 @@ void system_health_task(void *pvParameters)
 
 #endif
 
-#if DEBUG_E06_C_BIDIRECTIONAL_INTERRUPTION_TEST
-
-        int e06_c_status_valid;
-        TickType_t e06_c_status_last_update;
-
-        taskENTER_CRITICAL(&gateway_status_mux);
-        e06_c_status_valid = gateway_status_valid;
-        e06_c_status_last_update = gateway_status_last_update_tick;
-        taskEXIT_CRITICAL(&gateway_status_mux);
-
-        if (command_state == RC_ARMED &&
-            e06_c_status_valid &&
-            !e06_c_interruption_active &&
-            e06_c_trial_count < E06_C_TARGET_COUNT)
-        {
-            TickType_t status_age_ticks =
-                now - e06_c_status_last_update;
-
-            uint32_t status_age_ms =
-                pdTICKS_TO_MS(status_age_ticks);
-
-            if (status_age_ms > GATEWAY_STATUS_FRESH_MS)
-            {
-                e06_c_interruption_active = true;
-                e06_c_status_stale_seen = true;
-                e06_c_stale_detect_tick = now;
-
-                printf(
-                    "[E06-C] DOWNLINK STALE "
-                    "trial=%lu/%u "
-                    "status_age=%lu ms "
-                    "command=%s\n",
-                    (unsigned long)(e06_c_trial_count + 1U),
-                    (unsigned int)E06_C_TARGET_COUNT,
-                    (unsigned long)status_age_ms,
-                    mathos_rc_state_to_string(command_state));
-            }
-        }
-
-#endif
         /*
             DRONE_LINK_BAD means the RC-to-gateway
             control link itself is unavailable.
@@ -4166,36 +4113,6 @@ void system_health_task(void *pvParameters)
                 "[HEALTH] FAILSAFE: "
                 "gateway control link bad while ARMED\n");
 
-#if DEBUG_E06_C_BIDIRECTIONAL_INTERRUPTION_TEST
-
-            if (e06_c_interruption_active &&
-                e06_c_status_stale_seen &&
-                !e06_c_failsafe_seen &&
-                e06_c_trial_count < E06_C_TARGET_COUNT)
-            {
-                e06_c_failsafe_seen = true;
-
-                TickType_t now_tick =
-                    xTaskGetTickCount();
-
-                uint32_t since_stale_ms =
-                    pdTICKS_TO_MS(
-                        now_tick -
-                        e06_c_stale_detect_tick);
-
-                printf(
-                    "[E06-C] RC FAILSAFE ENTERED "
-                    "trial=%lu/%u "
-                    "after_stale=%lu ms "
-                    "command=%s\n",
-                    (unsigned long)(e06_c_trial_count + 1U),
-                    (unsigned int)E06_C_TARGET_COUNT,
-                    (unsigned long)since_stale_ms,
-                    mathos_rc_state_to_string(
-                        drone_command_get()));
-            }
-
-#endif
         }
         else if (command_state == RC_ARMED &&
                  !fc_heartbeat_fresh)
@@ -6556,106 +6473,6 @@ last_sequence = packet.sequence;
 
 #endif
 
-#if DEBUG_E06_C_BIDIRECTIONAL_INTERRUPTION_TEST
-
-        if (e06_c_interruption_active &&
-            e06_c_status_stale_seen &&
-            e06_c_failsafe_seen &&
-            !e06_c_restoration_seen &&
-            e06_c_trial_count < E06_C_TARGET_COUNT)
-        {
-            e06_c_restoration_seen = true;
-
-            TickType_t now_tick =
-                xTaskGetTickCount();
-
-            uint32_t since_stale_ms =
-                pdTICKS_TO_MS(
-                    now_tick -
-                    e06_c_stale_detect_tick);
-
-            rc_state_t current_command =
-                drone_command_get();
-
-            /*
-                PASS requires:
-                  - RC is still FAILSAFE after communication returns.
-                  - Gateway reports FC heartbeat-confirmed DISARMED.
-
-                Reconnection must never recreate ARMED authority.
-            */
-            bool trial_pass =
-                (current_command == RC_FAILSAFE &&
-                 status.fc_is_armed == 0);
-
-            e06_c_trial_count++;
-
-            if (trial_pass)
-            {
-                e06_c_pass_count++;
-
-                printf(
-                    "[E06-C] TRIAL PASS "
-                    "trial=%lu/%u "
-                    "passes=%lu "
-                    "fails=%lu "
-                    "command=%s "
-                    "fc_armed=%u "
-                    "since_stale=%lu ms\n",
-                    (unsigned long)e06_c_trial_count,
-                    (unsigned int)E06_C_TARGET_COUNT,
-                    (unsigned long)e06_c_pass_count,
-                    (unsigned long)e06_c_fail_count,
-                    mathos_rc_state_to_string(
-                        current_command),
-                    status.fc_is_armed,
-                    (unsigned long)since_stale_ms);
-            }
-            else
-            {
-                e06_c_fail_count++;
-
-                printf(
-                    "[E06-C] TRIAL FAIL "
-                    "trial=%lu/%u "
-                    "passes=%lu "
-                    "fails=%lu "
-                    "command=%s "
-                    "fc_armed=%u\n",
-                    (unsigned long)e06_c_trial_count,
-                    (unsigned int)E06_C_TARGET_COUNT,
-                    (unsigned long)e06_c_pass_count,
-                    (unsigned long)e06_c_fail_count,
-                    mathos_rc_state_to_string(
-                        current_command),
-                    status.fc_is_armed);
-            }
-
-            /*
-                Reset E06-C instrumentation only.
-                Do not change the real RC safety state.
-            */
-            e06_c_interruption_active = false;
-            e06_c_status_stale_seen = false;
-            e06_c_failsafe_seen = false;
-            e06_c_restoration_seen = false;
-            e06_c_stale_detect_tick = 0;
-
-            if (e06_c_trial_count ==
-                E06_C_TARGET_COUNT)
-            {
-                printf(
-                    "[E06-C] COMPLETE "
-                    "executed=%lu "
-                    "passed=%lu "
-                    "failed=%lu\n",
-                    (unsigned long)e06_c_trial_count,
-                    (unsigned long)e06_c_pass_count,
-                    (unsigned long)e06_c_fail_count);
-            }
-        }
-
-#endif
         ok_count++;
 e12b_rx_record_accepted(
     packet.sequence,
