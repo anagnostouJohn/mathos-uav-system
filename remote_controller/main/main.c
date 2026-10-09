@@ -216,7 +216,6 @@ static void gateway_status_handle_frame(
 #define JOYSTICK_CALIBRATION_VERSION 1U
 #define JOYSTICK_NVS_NAMESPACE "joystick"
 #define JOYSTICK_NVS_KEY "calibration"
-#define TEST_PROVISION_CALIBRATION_ONCE 0
 #define FEATURE_TREAT_GATEWAY_DRY_RUN_AS_CONFIRMED 0
 
 #if FEATURE_DIRECT_MAVLINK_MODE && FEATURE_SECURE_GATEWAY_MODE
@@ -304,23 +303,6 @@ typedef enum
     COMMAND_STATUS_TIMEOUT
 } command_status_t;
 
-/*
-    ArduPilot EKF_STATUS_REPORT flags used by the remote.
-
-    ATTITUDE means the EKF has a usable attitude estimate.
-    UNINITIALIZED means the EKF has not completed initialization.
-*/
-#define REMOTE_EKF_FLAG_ATTITUDE (1U << 0)
-#define REMOTE_EKF_FLAG_UNINITIALIZED (1U << 10)
-
-typedef enum
-{
-    EKF_HEALTH_NO_DATA = 0,
-    EKF_HEALTH_STALE,
-    EKF_HEALTH_INITIALIZING,
-    EKF_HEALTH_OK,
-    EKF_HEALTH_BAD
-} ekf_health_t;
 
 typedef enum
 {
@@ -1180,44 +1162,7 @@ static int joystick_calibration_save_to_nvs(
     return 1;
 }
 
-static void joystick_calibration_test_provision_once(void)
-{
-#if TEST_PROVISION_CALIBRATION_ONCE
 
-    /*
-        A nonzero counter means a valid calibration
-        was already loaded from NVS.
-    */
-    if (joystick_calibration_counter != 0)
-    {
-        printf(
-            "[JOYSTICK CAL TEST] Saved calibration "
-            "already exists counter=%lu\n",
-            (unsigned long)
-                joystick_calibration_counter);
-
-        return;
-    }
-
-    printf(
-        "[JOYSTICK CAL TEST] Provisioning current "
-        "firmware defaults into NVS\n");
-
-    if (!joystick_calibration_save_to_nvs(
-            &roll_calibration,
-            &pitch_calibration))
-    {
-        printf(
-            "[JOYSTICK CAL TEST] Provisioning FAILED\n");
-
-        return;
-    }
-
-    printf(
-        "[JOYSTICK CAL TEST] Provisioning PASSED\n");
-
-#endif
-}
 
 void heartbeat_init_all(void)
 {
@@ -2980,10 +2925,7 @@ int arm_permission_enabled(void)
     return gpio_get_level(ARM_PERMISSION_SWITCH_PIN) == 0;
 }
 
-static int maintenance_switch_enabled(void)
-{
-    return gpio_get_level(MAINTENANCE_SWITCH_PIN) == 0;
-}
+
 
 static void boot_mode_switches_init(void)
 {
@@ -10586,7 +10528,7 @@ the queued pairing callback in a later step.
             rc_fleet_selected_record.key_generation);
 
     joystick_calibration_load_from_nvs();
-    joystick_calibration_test_provision_once();
+
 
     button_semaphore_arm =
         xSemaphoreCreateBinary();
