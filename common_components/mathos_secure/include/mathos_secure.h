@@ -50,6 +50,21 @@ void mathos_secure_clear_key(void);
 
 
 /*
+    Migrate the persistent transmit-session counter between
+    NVS partitions without ever moving the counter backward.
+
+    If the destination already contains a value greater than
+    or equal to the source, the destination is preserved.
+
+    This makes the operation safe to repeat after the secure
+    partition has become authoritative.
+*/
+mathos_secure_status_t mathos_secure_migrate_session_counter(
+    const char *source_partition_name,
+    const char *destination_partition_name,
+    uint32_t *verified_session_out);
+
+/*
     Reserve a persistent nonzero transmit session ID.
 
     The value is incremented and committed to NVS before

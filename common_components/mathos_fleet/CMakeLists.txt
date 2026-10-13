@@ -7,5 +7,9 @@ idf_component_register(
 
     REQUIRES
         nvs_flash
+        nvs_sec_provider
+        efuse
+        esp_security
+        esp_partition
         mathos_identity
 )

@@ -6,8 +6,38 @@
 #include "nvs_flash.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include "esp_efuse.h"
+#include "esp_hmac.h"
+#include "esp_partition.h"
+#include "nvs_sec_provider.h"
 
+#define MATHOS_FLEET_SELECTED_UID_KEY "selected_uid"
+
+#define MATHOS_FLEET_LEGACY_PARTITION_NAME "fleet"
+#define MATHOS_FLEET_SECURE_PARTITION_NAME "fleet_sec"
+#define MATHOS_FLEET_MIGRATION_NAMESPACE "migration"
+#define MATHOS_FLEET_MIGRATION_VERSION_KEY "version"
+#define MATHOS_FLEET_MIGRATION_VERSION 1U
+static bool mathos_fleet_secure_storage_ready = false;
 static const char *TAG = "MATHOS_FLEET";
+static void fleet_clear_sensitive_memory(
+    void *buffer,
+    size_t buffer_size)
+{
+    if (buffer == NULL)
+    {
+        return;
+    }
+
+    volatile uint8_t *bytes =
+        (volatile uint8_t *)buffer;
+
+    while (buffer_size > 0U)
+    {
+        *bytes++ = 0U;
+        buffer_size--;
+    }
+}
 
 /*
     Compare credential bytes without returning early
@@ -65,6 +95,1014 @@ static esp_err_t fleet_make_slot_key(
     {
         return ESP_FAIL;
     }
+
+    return ESP_OK;
+}
+esp_err_t mathos_fleet_secure_migration_is_complete(
+    bool *complete_out)
+{
+    if (complete_out == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *complete_out = false;
+
+    if (!mathos_fleet_secure_storage_ready)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    nvs_handle_t handle;
+
+    esp_err_t err =
+        nvs_open_from_partition(
+            MATHOS_FLEET_SECURE_PARTITION_NAME,
+            MATHOS_FLEET_MIGRATION_NAMESPACE,
+            NVS_READONLY,
+            &handle);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        return ESP_OK;
+    }
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    uint32_t version = 0U;
+
+    err =
+        nvs_get_u32(
+            handle,
+            MATHOS_FLEET_MIGRATION_VERSION_KEY,
+            &version);
+
+    nvs_close(handle);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        return ESP_OK;
+    }
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    if (version != MATHOS_FLEET_MIGRATION_VERSION)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    *complete_out = true;
+
+    return ESP_OK;
+}
+
+esp_err_t mathos_fleet_secure_migration_mark_complete(void)
+{
+    if (!mathos_fleet_secure_storage_ready)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    nvs_handle_t handle;
+
+    esp_err_t err =
+        nvs_open_from_partition(
+            MATHOS_FLEET_SECURE_PARTITION_NAME,
+            MATHOS_FLEET_MIGRATION_NAMESPACE,
+            NVS_READWRITE,
+            &handle);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err =
+        nvs_set_u32(
+            handle,
+            MATHOS_FLEET_MIGRATION_VERSION_KEY,
+            MATHOS_FLEET_MIGRATION_VERSION);
+
+    if (err == ESP_OK)
+    {
+        err = nvs_commit(handle);
+    }
+
+    if (err != ESP_OK)
+    {
+        nvs_close(handle);
+        return err;
+    }
+
+    uint32_t verified_version = 0U;
+
+    err =
+        nvs_get_u32(
+            handle,
+            MATHOS_FLEET_MIGRATION_VERSION_KEY,
+            &verified_version);
+
+    nvs_close(handle);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    if (verified_version !=
+        MATHOS_FLEET_MIGRATION_VERSION)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return ESP_OK;
+}
+
+
+static esp_err_t fleet_write_record_exact_to_partition(
+    const char *partition_name,
+    uint16_t slot,
+    const mathos_fleet_record_t *record)
+{
+    if (partition_name == NULL ||
+        record == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!mathos_fleet_record_is_valid(record))
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char key[8];
+
+    esp_err_t err =
+        fleet_make_slot_key(
+            slot,
+            key,
+            sizeof(key));
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    uint8_t encoded[MATHOS_FLEET_RECORD_WIRE_LEN];
+
+    memset(
+        encoded,
+        0,
+        sizeof(encoded));
+
+    err =
+        mathos_fleet_record_encode(
+            record,
+            encoded,
+            sizeof(encoded));
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    nvs_handle_t handle;
+
+    err =
+        nvs_open_from_partition(
+            partition_name,
+            MATHOS_FLEET_NAMESPACE,
+            NVS_READWRITE,
+            &handle);
+
+    if (err != ESP_OK)
+    {
+        fleet_clear_sensitive_memory(
+            encoded,
+            sizeof(encoded));
+
+        return err;
+    }
+
+    err =
+        nvs_set_blob(
+            handle,
+            key,
+            encoded,
+            sizeof(encoded));
+
+    if (err == ESP_OK)
+    {
+        err =
+            nvs_commit(handle);
+    }
+
+    nvs_close(handle);
+
+    fleet_clear_sensitive_memory(
+        encoded,
+        sizeof(encoded));
+
+    return err;
+}
+
+static esp_err_t fleet_read_record_exact_from_partition(
+    const char *partition_name,
+    uint16_t slot,
+    mathos_fleet_record_t *record_out)
+{
+    if (partition_name == NULL ||
+        record_out == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(
+        record_out,
+        0,
+        sizeof(*record_out));
+
+    char key[8];
+
+    esp_err_t err =
+        fleet_make_slot_key(
+            slot,
+            key,
+            sizeof(key));
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    nvs_handle_t handle;
+
+    err =
+        nvs_open_from_partition(
+            partition_name,
+            MATHOS_FLEET_NAMESPACE,
+            NVS_READONLY,
+            &handle);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    size_t stored_size = 0U;
+
+    err =
+        nvs_get_blob(
+            handle,
+            key,
+            NULL,
+            &stored_size);
+
+    if (err != ESP_OK)
+    {
+        nvs_close(handle);
+        return err;
+    }
+
+    if (stored_size !=
+        MATHOS_FLEET_RECORD_WIRE_LEN)
+    {
+        nvs_close(handle);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    uint8_t encoded[MATHOS_FLEET_RECORD_WIRE_LEN];
+
+    memset(
+        encoded,
+        0,
+        sizeof(encoded));
+
+    err =
+        nvs_get_blob(
+            handle,
+            key,
+            encoded,
+            &stored_size);
+
+    nvs_close(handle);
+
+    if (err != ESP_OK)
+    {
+        fleet_clear_sensitive_memory(
+            encoded,
+            sizeof(encoded));
+
+        return err;
+    }
+
+    mathos_fleet_record_t candidate;
+
+    memset(
+        &candidate,
+        0,
+        sizeof(candidate));
+
+    err =
+        mathos_fleet_record_decode(
+            encoded,
+            stored_size,
+            &candidate);
+
+    fleet_clear_sensitive_memory(
+        encoded,
+        sizeof(encoded));
+
+    if (err != ESP_OK)
+    {
+        fleet_clear_sensitive_memory(
+            &candidate,
+            sizeof(candidate));
+
+        return err;
+    }
+
+    *record_out =
+        candidate;
+
+    fleet_clear_sensitive_memory(
+        &candidate,
+        sizeof(candidate));
+
+    return ESP_OK;
+}
+static int fleet_records_match_canonical(
+    const mathos_fleet_record_t *left,
+    const mathos_fleet_record_t *right)
+{
+    if (left == NULL ||
+        right == NULL)
+    {
+        return 0;
+    }
+
+    uint8_t left_encoded[MATHOS_FLEET_RECORD_WIRE_LEN];
+    uint8_t right_encoded[MATHOS_FLEET_RECORD_WIRE_LEN];
+
+    memset(
+        left_encoded,
+        0,
+        sizeof(left_encoded));
+
+    memset(
+        right_encoded,
+        0,
+        sizeof(right_encoded));
+
+    esp_err_t left_err =
+        mathos_fleet_record_encode(
+            left,
+            left_encoded,
+            sizeof(left_encoded));
+
+    esp_err_t right_err =
+        mathos_fleet_record_encode(
+            right,
+            right_encoded,
+            sizeof(right_encoded));
+
+    int match =
+        left_err == ESP_OK &&
+        right_err == ESP_OK &&
+        memcmp(
+            left_encoded,
+            right_encoded,
+            sizeof(left_encoded)) == 0;
+
+    fleet_clear_sensitive_memory(
+        left_encoded,
+        sizeof(left_encoded));
+
+    fleet_clear_sensitive_memory(
+        right_encoded,
+        sizeof(right_encoded));
+
+    return match;
+}
+
+static esp_err_t fleet_migrate_slot_exact_to_secure(
+    uint16_t slot)
+{
+    mathos_fleet_record_t source_record;
+    mathos_fleet_record_t secure_record;
+
+    memset(
+        &source_record,
+        0,
+        sizeof(source_record));
+
+    memset(
+        &secure_record,
+        0,
+        sizeof(secure_record));
+esp_err_t err =
+    fleet_read_record_exact_from_partition(
+        MATHOS_FLEET_LEGACY_PARTITION_NAME,
+        slot,
+        &source_record);
+
+    if (err != ESP_OK)
+    {
+        goto cleanup;
+    }
+
+    /*
+        The secure slot may already exist after a previous
+        interrupted or repeated migration attempt.
+
+        Accept it only if it is canonically identical.
+    */
+    err =
+        fleet_read_record_exact_from_partition(
+            MATHOS_FLEET_SECURE_PARTITION_NAME,
+            slot,
+            &secure_record);
+
+    if (err == ESP_OK)
+    {
+        if (!fleet_records_match_canonical(
+                &source_record,
+                &secure_record))
+        {
+            err =
+                ESP_ERR_INVALID_STATE;
+        }
+
+        goto cleanup;
+    }
+
+    if (err != ESP_ERR_NVS_NOT_FOUND)
+    {
+        goto cleanup;
+    }
+
+    memset(
+        &secure_record,
+        0,
+        sizeof(secure_record));
+
+    /*
+        Destination is empty.
+
+        Write the exact source record without changing
+        record_counter or CRC.
+    */
+    err =
+        fleet_write_record_exact_to_partition(
+            MATHOS_FLEET_SECURE_PARTITION_NAME,
+            slot,
+            &source_record);
+
+    if (err != ESP_OK)
+    {
+        goto cleanup;
+    }
+
+    /*
+        Mandatory read-back proof.
+    */
+    err =
+        fleet_read_record_exact_from_partition(
+            MATHOS_FLEET_SECURE_PARTITION_NAME,
+            slot,
+            &secure_record);
+
+    if (err != ESP_OK)
+    {
+        goto cleanup;
+    }
+
+    if (!fleet_records_match_canonical(
+            &source_record,
+            &secure_record))
+    {
+        err =
+            ESP_FAIL;
+
+        goto cleanup;
+    }
+
+    err =
+        ESP_OK;
+
+cleanup:
+
+    fleet_clear_sensitive_memory(
+        &source_record,
+        sizeof(source_record));
+
+    fleet_clear_sensitive_memory(
+        &secure_record,
+        sizeof(secure_record));
+
+    return err;
+}
+
+static esp_err_t fleet_migrate_all_records_to_secure(
+    uint16_t *verified_count_out)
+{
+    if (verified_count_out == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *verified_count_out = 0U;
+
+    for (uint16_t slot = 0U;
+         slot < MATHOS_FLEET_MAX_AIRCRAFT;
+         slot++)
+    {
+        esp_err_t err =
+            fleet_migrate_slot_exact_to_secure(
+                slot);
+
+        /*
+            Source slot is empty.
+
+            The secure destination must also be empty.
+            An unexpected destination record means the
+            two Fleet stores are not equivalent.
+        */
+        if (err == ESP_ERR_NVS_NOT_FOUND)
+        {
+            mathos_fleet_record_t unexpected_record;
+
+            memset(
+                &unexpected_record,
+                0,
+                sizeof(unexpected_record));
+
+            esp_err_t secure_err =
+                fleet_read_record_exact_from_partition(
+                    MATHOS_FLEET_SECURE_PARTITION_NAME,
+                    slot,
+                    &unexpected_record);
+
+            fleet_clear_sensitive_memory(
+                &unexpected_record,
+                sizeof(unexpected_record));
+
+            if (secure_err ==
+                ESP_ERR_NVS_NOT_FOUND)
+            {
+                continue;
+            }
+
+            if (secure_err == ESP_OK)
+            {
+                ESP_LOGE(
+                    TAG,
+                    "Secure Fleet migration FAILED: "
+                    "unexpected destination record slot=%u",
+                    (unsigned int)slot);
+
+                return ESP_ERR_INVALID_STATE;
+            }
+
+            ESP_LOGE(
+                TAG,
+                "Secure Fleet migration FAILED: "
+                "destination inspection slot=%u error=%s",
+                (unsigned int)slot,
+                esp_err_to_name(secure_err));
+
+            return secure_err;
+        }
+
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(
+                TAG,
+                "Secure Fleet migration FAILED "
+                "slot=%u error=%s",
+                (unsigned int)slot,
+                esp_err_to_name(err));
+
+            return err;
+        }
+
+        (*verified_count_out)++;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "Secure Fleet record migration verified "
+        "records=%u capacity=%u",
+        (unsigned int)*verified_count_out,
+        (unsigned int)MATHOS_FLEET_MAX_AIRCRAFT);
+
+    return ESP_OK;
+}
+
+static esp_err_t fleet_selected_uid_read_from_partition(
+    const char *partition_name,
+    mathos_device_uid_t *gateway_uid_out)
+{
+    if (partition_name == NULL ||
+        gateway_uid_out == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(
+        gateway_uid_out,
+        0,
+        sizeof(*gateway_uid_out));
+
+    nvs_handle_t handle;
+
+    esp_err_t err =
+        nvs_open_from_partition(
+            partition_name,
+            MATHOS_FLEET_NAMESPACE,
+            NVS_READONLY,
+            &handle);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    size_t stored_size =
+        sizeof(gateway_uid_out->bytes);
+
+    err =
+        nvs_get_blob(
+            handle,
+            MATHOS_FLEET_SELECTED_UID_KEY,
+            gateway_uid_out->bytes,
+            &stored_size);
+
+    nvs_close(handle);
+
+    if (err != ESP_OK)
+    {
+        memset(
+            gateway_uid_out,
+            0,
+            sizeof(*gateway_uid_out));
+
+        return err;
+    }
+
+    if (stored_size !=
+        sizeof(gateway_uid_out->bytes))
+    {
+        memset(
+            gateway_uid_out,
+            0,
+            sizeof(*gateway_uid_out));
+
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    if (!mathos_device_uid_is_valid(
+            gateway_uid_out))
+    {
+        memset(
+            gateway_uid_out,
+            0,
+            sizeof(*gateway_uid_out));
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t fleet_selected_uid_write_to_partition(
+    const char *partition_name,
+    const mathos_device_uid_t *gateway_uid)
+{
+    if (partition_name == NULL ||
+        gateway_uid == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!mathos_device_uid_is_valid(
+            gateway_uid))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t handle;
+
+    esp_err_t err =
+        nvs_open_from_partition(
+            partition_name,
+            MATHOS_FLEET_NAMESPACE,
+            NVS_READWRITE,
+            &handle);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err =
+        nvs_set_blob(
+            handle,
+            MATHOS_FLEET_SELECTED_UID_KEY,
+            gateway_uid->bytes,
+            sizeof(gateway_uid->bytes));
+
+    if (err == ESP_OK)
+    {
+        err =
+            nvs_commit(handle);
+    }
+
+    nvs_close(handle);
+
+    return err;
+}
+
+static esp_err_t fleet_migrate_selected_uid_to_secure(void)
+{
+    mathos_device_uid_t source_uid;
+    mathos_device_uid_t secure_uid;
+
+    memset(
+        &source_uid,
+        0,
+        sizeof(source_uid));
+
+    memset(
+        &secure_uid,
+        0,
+        sizeof(secure_uid));
+
+    esp_err_t source_err =
+        fleet_selected_uid_read_from_partition(
+            MATHOS_FLEET_LEGACY_PARTITION_NAME,
+            &source_uid);
+
+    /*
+        No legacy selection is valid.
+
+        The secure destination must also contain no
+        selection metadata.
+    */
+    if (source_err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        esp_err_t secure_err =
+            fleet_selected_uid_read_from_partition(
+                MATHOS_FLEET_SECURE_PARTITION_NAME,
+                &secure_uid);
+
+        memset(
+            &source_uid,
+            0,
+            sizeof(source_uid));
+
+        memset(
+            &secure_uid,
+            0,
+            sizeof(secure_uid));
+
+        if (secure_err == ESP_ERR_NVS_NOT_FOUND)
+        {
+            return ESP_OK;
+        }
+
+        if (secure_err == ESP_OK)
+        {
+            ESP_LOGE(
+                TAG,
+                "Secure Fleet migration FAILED: "
+                "unexpected selected UID in destination");
+
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        return secure_err;
+    }
+
+    if (source_err != ESP_OK)
+    {
+        return source_err;
+    }
+
+    esp_err_t secure_err =
+        fleet_selected_uid_read_from_partition(
+            MATHOS_FLEET_SECURE_PARTITION_NAME,
+            &secure_uid);
+
+    /*
+        Destination already contains a selection.
+
+        Accept only an exact UID match.
+    */
+    if (secure_err == ESP_OK)
+    {
+        int same_uid =
+            memcmp(
+                source_uid.bytes,
+                secure_uid.bytes,
+                MATHOS_DEVICE_UID_LEN) == 0;
+
+        memset(
+            &source_uid,
+            0,
+            sizeof(source_uid));
+
+        memset(
+            &secure_uid,
+            0,
+            sizeof(secure_uid));
+
+        if (!same_uid)
+        {
+            ESP_LOGE(
+                TAG,
+                "Secure Fleet migration FAILED: "
+                "selected UID mismatch");
+
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        return ESP_OK;
+    }
+
+    if (secure_err != ESP_ERR_NVS_NOT_FOUND)
+    {
+        memset(
+            &source_uid,
+            0,
+            sizeof(source_uid));
+
+        return secure_err;
+    }
+
+    /*
+        Secure destination has no selection yet.
+
+        Copy the legacy selection.
+    */
+    esp_err_t err =
+        fleet_selected_uid_write_to_partition(
+            MATHOS_FLEET_SECURE_PARTITION_NAME,
+            &source_uid);
+
+    if (err != ESP_OK)
+    {
+        memset(
+            &source_uid,
+            0,
+            sizeof(source_uid));
+
+        return err;
+    }
+
+    /*
+        Mandatory read-back verification.
+    */
+    err =
+        fleet_selected_uid_read_from_partition(
+            MATHOS_FLEET_SECURE_PARTITION_NAME,
+            &secure_uid);
+
+    if (err == ESP_OK)
+    {
+        if (memcmp(
+                source_uid.bytes,
+                secure_uid.bytes,
+                MATHOS_DEVICE_UID_LEN) != 0)
+        {
+            err =
+                ESP_FAIL;
+        }
+    }
+
+    memset(
+        &source_uid,
+        0,
+        sizeof(source_uid));
+
+    memset(
+        &secure_uid,
+        0,
+        sizeof(secure_uid));
+
+    return err;
+}
+
+esp_err_t mathos_fleet_migrate_legacy_to_secure(
+    uint16_t *verified_count_out)
+{
+    if (verified_count_out == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *verified_count_out = 0U;
+
+    if (!mathos_fleet_secure_storage_ready)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint16_t verified_records = 0U;
+
+    esp_err_t err =
+        fleet_migrate_all_records_to_secure(
+            &verified_records);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Secure Fleet migration FAILED "
+            "during record migration: %s",
+            esp_err_to_name(err));
+
+        return err;
+    }
+
+    err =
+        fleet_migrate_selected_uid_to_secure();
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Secure Fleet migration FAILED "
+            "during selected UID migration: %s",
+            esp_err_to_name(err));
+
+        return err;
+    }
+
+    /*
+        Final idempotent verification pass.
+
+        Existing secure records must still match the
+        authoritative legacy Fleet exactly.
+    */
+    uint16_t final_verified_records = 0U;
+
+    err =
+        fleet_migrate_all_records_to_secure(
+            &final_verified_records);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Secure Fleet migration FAILED "
+            "during final verification: %s",
+            esp_err_to_name(err));
+
+        return err;
+    }
+
+    if (final_verified_records !=
+        verified_records)
+    {
+        ESP_LOGE(
+            TAG,
+            "Secure Fleet migration FAILED "
+            "record-count mismatch first=%u final=%u",
+            (unsigned int)verified_records,
+            (unsigned int)final_verified_records);
+
+        return ESP_FAIL;
+    }
+
+    err =
+        fleet_migrate_selected_uid_to_secure();
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Secure Fleet migration FAILED "
+            "during final selection verification: %s",
+            esp_err_to_name(err));
+
+        return err;
+    }
+
+    *verified_count_out =
+        final_verified_records;
+
+    ESP_LOGI(
+        TAG,
+        "Secure Fleet migration VERIFIED "
+        "records=%u",
+        (unsigned int)final_verified_records);
 
     return ESP_OK;
 }
@@ -1329,6 +2367,196 @@ esp_err_t mathos_fleet_find_by_uid(
 
     return ESP_OK;
 }
+
+esp_err_t mathos_fleet_selected_uid_set(
+    const mathos_device_uid_t *gateway_uid)
+{
+    if (gateway_uid == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint16_t slot = 0xFFFFU;
+
+    mathos_fleet_record_t record;
+
+    memset(
+        &record,
+        0,
+        sizeof(record));
+
+    esp_err_t err =
+        mathos_fleet_find_by_uid(
+            gateway_uid,
+            &slot,
+            &record);
+
+    if (err != ESP_OK)
+    {
+        memset(
+            &record,
+            0,
+            sizeof(record));
+
+        return err;
+    }
+
+    if (record.state !=
+        MATHOS_FLEET_STATE_ACTIVE)
+    {
+        memset(
+            &record,
+            0,
+            sizeof(record));
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    memset(
+        &record,
+        0,
+        sizeof(record));
+
+    nvs_handle_t handle;
+
+    err =
+        nvs_open_from_partition(
+            MATHOS_FLEET_PARTITION_NAME,
+            MATHOS_FLEET_NAMESPACE,
+            NVS_READWRITE,
+            &handle);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err =
+        nvs_set_blob(
+            handle,
+            MATHOS_FLEET_SELECTED_UID_KEY,
+            gateway_uid->bytes,
+            sizeof(gateway_uid->bytes));
+
+    if (err == ESP_OK)
+    {
+        err =
+            nvs_commit(
+                handle);
+    }
+
+    nvs_close(
+        handle);
+
+    return err;
+}
+
+esp_err_t mathos_fleet_selected_uid_get(
+    mathos_device_uid_t *gateway_uid_out)
+{
+    if (gateway_uid_out == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(
+        gateway_uid_out,
+        0,
+        sizeof(*gateway_uid_out));
+
+    nvs_handle_t handle;
+
+    esp_err_t err =
+        nvs_open_from_partition(
+            MATHOS_FLEET_PARTITION_NAME,
+            MATHOS_FLEET_NAMESPACE,
+            NVS_READONLY,
+            &handle);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    size_t stored_size =
+        sizeof(gateway_uid_out->bytes);
+
+    err =
+        nvs_get_blob(
+            handle,
+            MATHOS_FLEET_SELECTED_UID_KEY,
+            gateway_uid_out->bytes,
+            &stored_size);
+
+    nvs_close(
+        handle);
+
+    if (err != ESP_OK)
+    {
+        memset(
+            gateway_uid_out,
+            0,
+            sizeof(*gateway_uid_out));
+
+        return err;
+    }
+
+    if (stored_size !=
+        sizeof(gateway_uid_out->bytes))
+    {
+        memset(
+            gateway_uid_out,
+            0,
+            sizeof(*gateway_uid_out));
+
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t mathos_fleet_selected_uid_clear(void)
+{
+    nvs_handle_t handle;
+
+    esp_err_t err =
+        nvs_open_from_partition(
+            MATHOS_FLEET_PARTITION_NAME,
+            MATHOS_FLEET_NAMESPACE,
+            NVS_READWRITE,
+            &handle);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err =
+        nvs_erase_key(
+            handle,
+            MATHOS_FLEET_SELECTED_UID_KEY);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        nvs_close(
+            handle);
+
+        return ESP_OK;
+    }
+
+    if (err == ESP_OK)
+    {
+        err =
+            nvs_commit(
+                handle);
+    }
+
+    nvs_close(
+        handle);
+
+    return err;
+}
+
 esp_err_t mathos_fleet_duplicate_uid_lookup_self_test(void)
 {
     mathos_device_uid_t test_uid =
@@ -2160,6 +3388,124 @@ esp_err_t mathos_fleet_boot_validate(
         return err;
     }
 
+    /*
+    Multiple ACTIVE aircraft require an explicit
+    persisted operator selection.
+
+    The generic operation-status helper deliberately
+    remains selection-agnostic.
+*/
+    if (*status_out ==
+        MATHOS_FLEET_OPERATION_SELECTION_REQUIRED)
+    {
+        mathos_device_uid_t selected_uid;
+
+        memset(
+            &selected_uid,
+            0,
+            sizeof(selected_uid));
+
+        esp_err_t selected_err =
+            mathos_fleet_selected_uid_get(
+                &selected_uid);
+
+        if (selected_err ==
+            ESP_ERR_NVS_NOT_FOUND)
+        {
+            ESP_LOGW(
+                TAG,
+                "Fleet boot selection required: "
+                "no persisted aircraft selection");
+        }
+        else if (selected_err != ESP_OK)
+        {
+            ESP_LOGE(
+                TAG,
+                "Fleet boot selection read failed "
+                "error=%s",
+                esp_err_to_name(selected_err));
+
+            return selected_err;
+        }
+        else
+        {
+            esp_err_t lookup_err =
+                mathos_fleet_find_by_uid(
+                    &selected_uid,
+                    slot_out,
+                    record_out);
+
+            memset(
+                &selected_uid,
+                0,
+                sizeof(selected_uid));
+
+            if (lookup_err ==
+                ESP_ERR_NOT_FOUND)
+            {
+                *slot_out =
+                    0xFFFFU;
+
+                memset(
+                    record_out,
+                    0,
+                    sizeof(*record_out));
+
+                ESP_LOGW(
+                    TAG,
+                    "Fleet boot selection required: "
+                    "persisted aircraft no longer exists");
+            }
+            else if (lookup_err != ESP_OK)
+            {
+                *slot_out =
+                    0xFFFFU;
+
+                memset(
+                    record_out,
+                    0,
+                    sizeof(*record_out));
+
+                ESP_LOGE(
+                    TAG,
+                    "Fleet boot selected-aircraft lookup failed "
+                    "error=%s",
+                    esp_err_to_name(lookup_err));
+
+                return lookup_err;
+            }
+            else if (record_out->state !=
+                     MATHOS_FLEET_STATE_ACTIVE)
+            {
+                *slot_out =
+                    0xFFFFU;
+
+                memset(
+                    record_out,
+                    0,
+                    sizeof(*record_out));
+
+                ESP_LOGW(
+                    TAG,
+                    "Fleet boot selection required: "
+                    "persisted aircraft is not ACTIVE");
+            }
+            else
+            {
+                *status_out =
+                    MATHOS_FLEET_OPERATION_READY;
+
+                ESP_LOGI(
+                    TAG,
+                    "Fleet boot persisted selection accepted "
+                    "slot=%u name=%s generation=%lu",
+                    (unsigned int)*slot_out,
+                    record_out->friendly_name,
+                    (unsigned long)
+                        record_out->key_generation);
+            }
+        }
+    }
     ESP_LOGI(
         TAG,
         "Fleet boot validation PASSED status=%s",
@@ -4536,6 +5882,43 @@ esp_err_t mathos_fleet_revoke_aircraft(
 
     record.state =
         MATHOS_FLEET_STATE_REVOKED;
+    bool was_selected = false;
+
+    mathos_device_uid_t selected_uid;
+
+    memset(
+        &selected_uid,
+        0,
+        sizeof(selected_uid));
+
+    esp_err_t selected_err =
+        mathos_fleet_selected_uid_get(
+            &selected_uid);
+
+    if (selected_err == ESP_OK)
+    {
+        was_selected =
+            memcmp(
+                selected_uid.bytes,
+                gateway_uid->bytes,
+                sizeof(selected_uid.bytes)) == 0;
+    }
+    else if (selected_err !=
+             ESP_ERR_NVS_NOT_FOUND)
+    {
+        ESP_LOGE(
+            TAG,
+            "Fleet revoke selection read failed "
+            "error=%s",
+            esp_err_to_name(selected_err));
+
+        return selected_err;
+    }
+
+    memset(
+        &selected_uid,
+        0,
+        sizeof(selected_uid));
 
     /*
         save_slot() increments record_counter
@@ -4557,6 +5940,32 @@ esp_err_t mathos_fleet_revoke_aircraft(
         return err;
     }
 
+    if (was_selected)
+    {
+        err =
+            mathos_fleet_selected_uid_clear();
+
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(
+                TAG,
+                "Fleet revoke succeeded but "
+                "selected UID clear failed "
+                "slot=%u error=%s",
+                (unsigned int)slot,
+                esp_err_to_name(err));
+
+            return err;
+        }
+
+        ESP_LOGI(
+            TAG,
+            "Fleet selection cleared because "
+            "selected aircraft was revoked "
+            "slot=%u",
+            (unsigned int)slot);
+    }
+
     ESP_LOGW(
         TAG,
         "Aircraft REVOKED slot=%u name=%s",
@@ -4565,6 +5974,65 @@ esp_err_t mathos_fleet_revoke_aircraft(
 
     return ESP_OK;
 }
+
+esp_err_t mathos_fleet_delete_aircraft(
+    const mathos_device_uid_t *gateway_uid)
+{
+    if (gateway_uid == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint16_t slot = 0xFFFFU;
+
+    mathos_fleet_record_t record;
+
+    memset(
+        &record,
+        0,
+        sizeof(record));
+
+    esp_err_t err =
+        mathos_fleet_find_by_uid(
+            gateway_uid,
+            &slot,
+            &record);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    if (record.state !=
+        MATHOS_FLEET_STATE_REVOKED)
+    {
+        ESP_LOGW(
+            TAG,
+            "Fleet delete rejected slot=%u state=%s",
+            (unsigned int)slot,
+            mathos_fleet_state_to_string(
+                (mathos_fleet_state_t)record.state));
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    err =
+        mathos_fleet_record_delete_slot(
+            slot);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    ESP_LOGW(
+        TAG,
+        "Aircraft permanently deleted slot=%u",
+        (unsigned int)slot);
+
+    return ESP_OK;
+}
+
 esp_err_t mathos_fleet_restore_aircraft(
     const mathos_device_uid_t *gateway_uid)
 {
@@ -5551,31 +7019,259 @@ const char *mathos_fleet_state_to_string(
     }
 }
 
+static esp_err_t fleet_derive_secure_nvs_keys(
+    uint8_t hmac_key_id,
+    nvs_sec_cfg_t *keys)
+{
+    if (keys == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    static const uint8_t ekey_label[] =
+        "MATHOS/FLEET/NVS/XTS/EKEY/v1";
+
+    static const uint8_t tkey_label[] =
+        "MATHOS/FLEET/NVS/XTS/TKEY/v1";
+
+    memset(
+        keys,
+        0,
+        sizeof(*keys));
+
+    esp_err_t err =
+        esp_hmac_calculate(
+            (hmac_key_id_t)hmac_key_id,
+            ekey_label,
+            sizeof(ekey_label) - 1U,
+            (uint8_t *)keys->eky);
+
+    if (err != ESP_OK)
+    {
+        fleet_clear_sensitive_memory(
+            keys,
+            sizeof(*keys));
+
+        return err;
+    }
+
+    err =
+        esp_hmac_calculate(
+            (hmac_key_id_t)hmac_key_id,
+            tkey_label,
+            sizeof(tkey_label) - 1U,
+            (uint8_t *)keys->tky);
+
+    if (err != ESP_OK)
+    {
+        fleet_clear_sensitive_memory(
+            keys,
+            sizeof(*keys));
+
+        return err;
+    }
+
+    if (memcmp(
+            keys->eky,
+            keys->tky,
+            sizeof(keys->eky)) == 0)
+    {
+        fleet_clear_sensitive_memory(
+            keys,
+            sizeof(*keys));
+
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t mathos_fleet_secure_storage_init(
+    uint8_t hmac_key_id)
+{
+    /* This startup operation has one owner and is called once. */
+    if (mathos_fleet_secure_storage_ready)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+#if !CONFIG_IDF_TARGET_ESP32S3 || CONFIG_EFUSE_VIRTUAL
+    (void)hmac_key_id;
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    /* ESP32-S3 has six physical HMAC key slots: 0 through 5. */
+    if (hmac_key_id > (uint8_t)HMAC_KEY5)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const esp_partition_t *partition =
+        esp_partition_find_first(
+            ESP_PARTITION_TYPE_DATA,
+            ESP_PARTITION_SUBTYPE_DATA_NVS,
+            MATHOS_FLEET_SECURE_PARTITION_NAME);
+
+    if (partition == NULL)
+    {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    if (partition->size < 0x4000U ||
+        partition->encrypted ||
+        partition->readonly)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+        Secure init also returns success for an already initialized
+        partition. Reject that case before assuming encryption.
+        Default NVS must already be initialized before this call.
+    */
+    nvs_stats_t stats = {0};
+
+    esp_err_t err =
+        nvs_get_stats(
+            MATHOS_FLEET_SECURE_PARTITION_NAME,
+            &stats);
+
+    if (err == ESP_OK)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (err != ESP_ERR_NVS_NOT_INITIALIZED)
+    {
+        return err;
+    }
+
+    esp_efuse_block_t key_block =
+        (esp_efuse_block_t)(EFUSE_BLK_KEY0 + hmac_key_id);
+
+    if (esp_efuse_get_key_purpose(key_block) !=
+        ESP_EFUSE_KEY_PURPOSE_HMAC_UP)
+    {
+        ESP_LOGW(
+            TAG,
+            "Secure Fleet storage needs a provisioned HMAC key");
+
+        return ESP_ERR_NVS_SEC_HMAC_KEY_NOT_FOUND;
+    }
+
+    if (!esp_efuse_get_key_dis_read(key_block) ||
+        !esp_efuse_get_key_dis_write(key_block) ||
+        !esp_efuse_get_keypurpose_dis_write(key_block))
+    {
+        ESP_LOGE(
+            TAG,
+            "Secure Fleet HMAC key protection is incomplete");
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    nvs_sec_cfg_t keys = {0};
+
+    /*
+        Derive Fleet-specific AES-XTS keys from the permanent
+        hardware HMAC root using MATHOS domain-separated labels.
+    */
+    err =
+        fleet_derive_secure_nvs_keys(
+            hmac_key_id,
+            &keys);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Secure Fleet key derivation failed: %s",
+            esp_err_to_name(err));
+
+        goto cleanup;
+    }
+
+    err =
+        nvs_flash_secure_init_partition(
+            MATHOS_FLEET_SECURE_PARTITION_NAME,
+            &keys);
+
+cleanup:
+
+    fleet_clear_sensitive_memory(
+        &keys,
+        sizeof(keys));
+
+    if (err == ESP_OK)
+    {
+        mathos_fleet_secure_storage_ready = true;
+
+        ESP_LOGI(
+            TAG,
+            "Secure Fleet encrypted storage initialized");
+    }
+    else
+    {
+        ESP_LOGE(
+            TAG,
+            "Secure Fleet storage init failed: %s",
+            esp_err_to_name(err));
+    }
+
+    return err;
+#endif
+}
+
 esp_err_t mathos_fleet_init(void)
 {
     /*
-        Initialize only the dedicated "fleet" partition.
-
-        This is independent from the normal default NVS
-        partition already initialized by the RC.
+        The operational Fleet is now the encrypted
+        fleet_sec partition. It must already have been
+        securely initialized before this function runs.
     */
-    esp_err_t err =
+    if (!mathos_fleet_secure_storage_ready)
+    {
+        ESP_LOGE(
+            TAG,
+            "Secure Fleet storage is not ready");
+
+        return ESP_ERR_INVALID_STATE;
+    }
+/*
+    The legacy plaintext Fleet is needed only until
+    secure persistent-state migration has completed.
+
+    Once the encrypted migration marker is present,
+    normal startup must no longer initialize or depend
+    on the legacy Fleet partition.
+*/
+bool migration_complete = false;
+
+esp_err_t err =
+    mathos_fleet_secure_migration_is_complete(
+        &migration_complete);
+
+if (err != ESP_OK)
+{
+    ESP_LOGE(
+        TAG,
+        "Secure Fleet migration state read failed: %s",
+        esp_err_to_name(err));
+
+    return err;
+}
+
+if (!migration_complete)
+{
+    err =
         nvs_flash_init_partition(
-            MATHOS_FLEET_PARTITION_NAME);
+            MATHOS_FLEET_LEGACY_PARTITION_NAME);
 
-    /*
-        Never erase the Fleet partition automatically.
-
-        It contains aircraft identities, Pair Keys and
-        revocation state. Recovery must require an explicit
-        physical maintenance action.
-    */
     if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
         err == ESP_ERR_NVS_NEW_VERSION_FOUND)
     {
         ESP_LOGE(
             TAG,
-            "Fleet partition requires explicit recovery "
+            "Legacy Fleet partition requires explicit recovery "
             "error=%s. Automatic erase is forbidden.",
             esp_err_to_name(err));
 
@@ -5586,16 +7282,26 @@ esp_err_t mathos_fleet_init(void)
     {
         ESP_LOGE(
             TAG,
-            "Fleet partition initialization failed: %s",
+            "Legacy Fleet partition initialization failed: %s",
             esp_err_to_name(err));
 
         return err;
     }
 
-    /*
-        Smoke-test that the dedicated namespace can
-        actually be opened.
-    */
+    ESP_LOGI(
+        TAG,
+        "Legacy Fleet initialized for one-time migration");
+}
+else
+{
+    ESP_LOGI(
+        TAG,
+        "Legacy Fleet initialization skipped; "
+        "secure migration complete");
+}
+   
+
+
     nvs_handle_t handle;
 
     err =

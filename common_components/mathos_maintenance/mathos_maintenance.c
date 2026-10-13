@@ -41,8 +41,8 @@
 #define MATHOS_MAINTENANCE_NVS_KEY "config_v1"
 #define MATHOS_GATEWAY_NVS_KEY "gateway_v2"
 #define MATHOS_RC_PAIRING_NVS_KEY "rc_pair_v1"
-#define MATHOS_MAINTENANCE_PAGE_BUFFER_SIZE 16384
-#define MATHOS_MAINTENANCE_ROLE_SECTION_BUFFER_SIZE 8192
+#define MATHOS_MAINTENANCE_PAGE_BUFFER_SIZE 24576
+#define MATHOS_MAINTENANCE_ROLE_SECTION_BUFFER_SIZE 12288
 #define MATHOS_MAINTENANCE_FORM_BODY_MAX 2048
 /*
     Temporary bench-only pairing self-test.
@@ -64,10 +64,20 @@ static const char *TAG = "MATHOS_MAINT";
 
 static bool maintenance_softap_started = false;
 
+static mathos_maintenance_rc_fleet_delete_callback_t
+    maintenance_rc_fleet_delete_callback = NULL;
+static mathos_maintenance_rc_fleet_select_callback_t
+    maintenance_rc_fleet_select_callback = NULL;
 static httpd_handle_t maintenance_http_server = NULL;
 static esp_netif_t *maintenance_ap_netif = NULL;
 static mathos_maintenance_rc_pairing_callback_t
     maintenance_rc_pairing_callback = NULL;
+static mathos_maintenance_rc_fleet_revoke_callback_t
+    maintenance_rc_fleet_revoke_callback = NULL;
+static mathos_maintenance_rc_fleet_read_callback_t
+    maintenance_rc_fleet_read_callback = NULL;
+static mathos_maintenance_rc_fleet_restore_callback_t
+    maintenance_rc_fleet_restore_callback = NULL;
 /*
     Protect the display-only pairing status because it
     is written by both HTTP and pairing transport tasks.
@@ -83,6 +93,38 @@ static mathos_maintenance_rc_pairing_target_t
     maintenance_rc_pairing_target = {0};
 static mathos_maintenance_rc_pairing_status_t
 maintenance_get_rc_pairing_status(void);
+
+void mathos_maintenance_set_rc_fleet_delete_callback(
+    mathos_maintenance_rc_fleet_delete_callback_t callback)
+{
+    maintenance_rc_fleet_delete_callback =
+        callback;
+}
+
+void mathos_maintenance_set_rc_fleet_revoke_callback(
+    mathos_maintenance_rc_fleet_revoke_callback_t callback)
+{
+    maintenance_rc_fleet_revoke_callback =
+        callback;
+}
+
+void mathos_maintenance_set_rc_fleet_restore_callback(
+    mathos_maintenance_rc_fleet_restore_callback_t callback)
+{
+    maintenance_rc_fleet_restore_callback =
+        callback;
+}
+
+void mathos_maintenance_set_rc_fleet_select_callback(
+    mathos_maintenance_rc_fleet_select_callback_t callback)
+{
+    maintenance_rc_fleet_select_callback =
+        callback;
+}
+static esp_err_t maintenance_html_escape(
+    const char *source,
+    char *destination,
+    size_t destination_size);
 
 static mathos_maintenance_role_t maintenance_active_role =
     MATHOS_MAINTENANCE_ROLE_RC;
@@ -188,7 +230,7 @@ static esp_err_t maintenance_rc_pairing_post_handler(
 
     char pairing_passphrase_confirm[MATHOS_PAIRING_PASSPHRASE_MAX_LEN + 1U] = "";
 
-        char gateway_uid_text[MATHOS_DEVICE_UID_TEXT_LEN] = "";
+    char gateway_uid_text[MATHOS_DEVICE_UID_TEXT_LEN] = "";
 
     mathos_device_uid_t expected_gateway_uid = {0};
 
@@ -257,8 +299,7 @@ static esp_err_t maintenance_rc_pairing_post_handler(
         goto invalid_form;
     }
 
-
-        field_err = maintenance_form_get_value(
+    field_err = maintenance_form_get_value(
         body,
         "gateway_uid",
         gateway_uid_text,
@@ -394,7 +435,7 @@ invalid_form:
     return maintenance_send_text_response(
         request,
         "400 Bad Request",
-                "Invalid pairing form. Reload the RC page and check "
+        "Invalid pairing form. Reload the RC page and check "
         "the Gateway selection and matching passphrases.\n");
 
 request_timeout:
@@ -554,6 +595,714 @@ maintenance_rc_pairing_status_get_handler(
         request,
         response,
         HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t
+maintenance_rc_fleet_revoke_post_handler(
+    httpd_req_t *request)
+{
+    if (request == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (maintenance_active_role !=
+        MATHOS_MAINTENANCE_ROLE_RC)
+    {
+        return maintenance_send_text_response(
+            request,
+            "403 Forbidden",
+            "RC Fleet actions are unavailable on this device.\n");
+    }
+
+    if (maintenance_rc_fleet_revoke_callback == NULL)
+    {
+        return maintenance_send_text_response(
+            request,
+            "503 Service Unavailable",
+            "RC Fleet Store is not available.\n");
+    }
+
+    size_t content_length =
+        request->content_len;
+
+    if (content_length == 0U ||
+        content_length > 128U)
+    {
+        return maintenance_send_text_response(
+            request,
+            "400 Bad Request",
+            "Invalid Fleet revoke request.\n");
+    }
+
+    char *body =
+        calloc(
+            content_length + 1U,
+            1U);
+
+    if (body == NULL)
+    {
+        return maintenance_send_text_response(
+            request,
+            "500 Internal Server Error",
+            "Could not allocate Fleet request buffer.\n");
+    }
+
+    size_t total_received = 0U;
+    int timeout_count = 0;
+
+    while (total_received <
+           content_length)
+    {
+        int received =
+            httpd_req_recv(
+                request,
+                body + total_received,
+                content_length -
+                    total_received);
+
+        if (received ==
+            HTTPD_SOCK_ERR_TIMEOUT)
+        {
+            timeout_count++;
+
+            if (timeout_count > 2)
+            {
+                free(body);
+
+                return maintenance_send_text_response(
+                    request,
+                    "408 Request Timeout",
+                    "Fleet revoke request timed out.\n");
+            }
+
+            continue;
+        }
+
+        if (received <= 0)
+        {
+            free(body);
+
+            return maintenance_send_text_response(
+                request,
+                "400 Bad Request",
+                "Could not read Fleet revoke request.\n");
+        }
+
+        total_received +=
+            (size_t)received;
+    }
+
+    body[total_received] = '\0';
+
+    char gateway_uid_text[MATHOS_DEVICE_UID_TEXT_LEN] = "";
+
+    esp_err_t err =
+        maintenance_form_get_value(
+            body,
+            "gateway_uid",
+            gateway_uid_text,
+            sizeof(gateway_uid_text));
+
+    free(body);
+    body = NULL;
+
+    if (err != ESP_OK)
+    {
+        return maintenance_send_text_response(
+            request,
+            "400 Bad Request",
+            "Gateway UID is missing.\n");
+    }
+
+    mathos_device_uid_t gateway_uid;
+
+    memset(
+        &gateway_uid,
+        0,
+        sizeof(gateway_uid));
+
+    err =
+        mathos_device_uid_parse(
+            gateway_uid_text,
+            &gateway_uid);
+
+    if (err != ESP_OK)
+    {
+        return maintenance_send_text_response(
+            request,
+            "400 Bad Request",
+            "Gateway UID is invalid.\n");
+    }
+
+    err =
+        maintenance_rc_fleet_revoke_callback(
+            &gateway_uid);
+
+    if (err == ESP_OK)
+    {
+        return maintenance_send_text_response(
+            request,
+            "200 OK",
+            "Aircraft revoked.\n");
+    }
+
+    if (err == ESP_ERR_NOT_FOUND)
+    {
+        return maintenance_send_text_response(
+            request,
+            "404 Not Found",
+            "Aircraft was not found.\n");
+    }
+
+    if (err == ESP_ERR_INVALID_STATE)
+    {
+        return maintenance_send_text_response(
+            request,
+            "409 Conflict",
+            "Aircraft cannot be revoked from its current state.\n");
+    }
+
+    ESP_LOGE(
+        TAG,
+        "Fleet revoke request failed: %s",
+        esp_err_to_name(err));
+
+    return maintenance_send_text_response(
+        request,
+        "500 Internal Server Error",
+        "Fleet revoke operation failed.\n");
+}
+
+static esp_err_t
+maintenance_rc_fleet_restore_post_handler(
+    httpd_req_t *request)
+{
+    if (request == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (maintenance_active_role !=
+        MATHOS_MAINTENANCE_ROLE_RC)
+    {
+        return maintenance_send_text_response(
+            request,
+            "403 Forbidden",
+            "RC Fleet actions are unavailable on this device.\n");
+    }
+
+    if (maintenance_rc_fleet_restore_callback == NULL)
+    {
+        return maintenance_send_text_response(
+            request,
+            "503 Service Unavailable",
+            "RC Fleet Store is not available.\n");
+    }
+
+    size_t content_length =
+        request->content_len;
+
+    if (content_length == 0U ||
+        content_length > 128U)
+    {
+        return maintenance_send_text_response(
+            request,
+            "400 Bad Request",
+            "Invalid Fleet restore request.\n");
+    }
+
+    char *body =
+        calloc(
+            content_length + 1U,
+            1U);
+
+    if (body == NULL)
+    {
+        return maintenance_send_text_response(
+            request,
+            "500 Internal Server Error",
+            "Could not allocate Fleet request buffer.\n");
+    }
+
+    size_t total_received = 0U;
+    int timeout_count = 0;
+
+    while (total_received <
+           content_length)
+    {
+        int received =
+            httpd_req_recv(
+                request,
+                body + total_received,
+                content_length -
+                    total_received);
+
+        if (received ==
+            HTTPD_SOCK_ERR_TIMEOUT)
+        {
+            timeout_count++;
+
+            if (timeout_count > 2)
+            {
+                free(body);
+
+                return maintenance_send_text_response(
+                    request,
+                    "408 Request Timeout",
+                    "Fleet restore request timed out.\n");
+            }
+
+            continue;
+        }
+
+        if (received <= 0)
+        {
+            free(body);
+
+            return maintenance_send_text_response(
+                request,
+                "400 Bad Request",
+                "Could not read Fleet restore request.\n");
+        }
+
+        total_received +=
+            (size_t)received;
+    }
+
+    body[total_received] = '\0';
+
+    char gateway_uid_text[MATHOS_DEVICE_UID_TEXT_LEN] = "";
+
+    esp_err_t err =
+        maintenance_form_get_value(
+            body,
+            "gateway_uid",
+            gateway_uid_text,
+            sizeof(gateway_uid_text));
+
+    free(body);
+    body = NULL;
+
+    if (err != ESP_OK)
+    {
+        return maintenance_send_text_response(
+            request,
+            "400 Bad Request",
+            "Gateway UID is missing.\n");
+    }
+
+    mathos_device_uid_t gateway_uid;
+
+    memset(
+        &gateway_uid,
+        0,
+        sizeof(gateway_uid));
+
+    err =
+        mathos_device_uid_parse(
+            gateway_uid_text,
+            &gateway_uid);
+
+    if (err != ESP_OK)
+    {
+        return maintenance_send_text_response(
+            request,
+            "400 Bad Request",
+            "Gateway UID is invalid.\n");
+    }
+
+    err =
+        maintenance_rc_fleet_restore_callback(
+            &gateway_uid);
+
+    if (err == ESP_OK)
+    {
+        return maintenance_send_text_response(
+            request,
+            "200 OK",
+            "Aircraft restored.\n");
+    }
+
+    if (err == ESP_ERR_NOT_FOUND)
+    {
+        return maintenance_send_text_response(
+            request,
+            "404 Not Found",
+            "Aircraft was not found.\n");
+    }
+
+    if (err == ESP_ERR_INVALID_STATE)
+    {
+        return maintenance_send_text_response(
+            request,
+            "409 Conflict",
+            "Aircraft cannot be restored from its current state.\n");
+    }
+
+    ESP_LOGE(
+        TAG,
+        "Fleet restore request failed: %s",
+        esp_err_to_name(err));
+
+    return maintenance_send_text_response(
+        request,
+        "500 Internal Server Error",
+        "Fleet restore operation failed.\n");
+}
+
+static esp_err_t
+maintenance_rc_fleet_select_post_handler(
+    httpd_req_t *request)
+{
+    if (request == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (maintenance_active_role !=
+        MATHOS_MAINTENANCE_ROLE_RC)
+    {
+        return maintenance_send_text_response(
+            request,
+            "403 Forbidden",
+            "RC Fleet actions are unavailable on this device.\n");
+    }
+
+    if (maintenance_rc_fleet_select_callback == NULL)
+    {
+        return maintenance_send_text_response(
+            request,
+            "503 Service Unavailable",
+            "RC Fleet Store is not available.\n");
+    }
+
+    size_t content_length =
+        request->content_len;
+
+    if (content_length == 0U ||
+        content_length > 128U)
+    {
+        return maintenance_send_text_response(
+            request,
+            "400 Bad Request",
+            "Invalid Fleet restore request.\n");
+    }
+
+    char *body =
+        calloc(
+            content_length + 1U,
+            1U);
+
+    if (body == NULL)
+    {
+        return maintenance_send_text_response(
+            request,
+            "500 Internal Server Error",
+            "Could not allocate Fleet request buffer.\n");
+    }
+
+    size_t total_received = 0U;
+    int timeout_count = 0;
+
+    while (total_received <
+           content_length)
+    {
+        int received =
+            httpd_req_recv(
+                request,
+                body + total_received,
+                content_length -
+                    total_received);
+
+        if (received ==
+            HTTPD_SOCK_ERR_TIMEOUT)
+        {
+            timeout_count++;
+
+            if (timeout_count > 2)
+            {
+                free(body);
+
+                return maintenance_send_text_response(
+                    request,
+                    "408 Request Timeout",
+                    "Fleet restore request timed out.\n");
+            }
+
+            continue;
+        }
+
+        if (received <= 0)
+        {
+            free(body);
+
+            return maintenance_send_text_response(
+                request,
+                "400 Bad Request",
+                "Could not read Fleet restore request.\n");
+        }
+
+        total_received +=
+            (size_t)received;
+    }
+
+    body[total_received] = '\0';
+
+    char gateway_uid_text[MATHOS_DEVICE_UID_TEXT_LEN] = "";
+
+    esp_err_t err =
+        maintenance_form_get_value(
+            body,
+            "gateway_uid",
+            gateway_uid_text,
+            sizeof(gateway_uid_text));
+
+    free(body);
+    body = NULL;
+
+    if (err != ESP_OK)
+    {
+        return maintenance_send_text_response(
+            request,
+            "400 Bad Request",
+            "Gateway UID is missing.\n");
+    }
+
+    mathos_device_uid_t gateway_uid;
+
+    memset(
+        &gateway_uid,
+        0,
+        sizeof(gateway_uid));
+
+    err =
+        mathos_device_uid_parse(
+            gateway_uid_text,
+            &gateway_uid);
+
+    if (err != ESP_OK)
+    {
+        return maintenance_send_text_response(
+            request,
+            "400 Bad Request",
+            "Gateway UID is invalid.\n");
+    }
+
+    err =
+        maintenance_rc_fleet_select_callback(
+            &gateway_uid);
+
+    if (err == ESP_OK)
+    {
+        return maintenance_send_text_response(
+            request,
+            "200 OK",
+            "Aircraft selected.\n");
+    }
+
+    if (err == ESP_ERR_NOT_FOUND)
+    {
+        return maintenance_send_text_response(
+            request,
+            "404 Not Found",
+            "Aircraft was not found.\n");
+    }
+
+    if (err == ESP_ERR_INVALID_STATE)
+    {
+        return maintenance_send_text_response(
+            request,
+            "409 Conflict",
+            "Aircraft must be ACTIVE before selection.\n");
+    }
+
+    ESP_LOGE(
+        TAG,
+        "Fleet restore request failed: %s",
+        esp_err_to_name(err));
+
+    return maintenance_send_text_response(
+        request,
+        "500 Internal Server Error",
+        "Fleet restore operation failed.\n");
+}
+
+static esp_err_t
+maintenance_rc_fleet_delete_post_handler(
+    httpd_req_t *request)
+{
+    if (request == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (maintenance_active_role !=
+        MATHOS_MAINTENANCE_ROLE_RC)
+    {
+        return maintenance_send_text_response(
+            request,
+            "403 Forbidden",
+            "RC Fleet actions are unavailable on this device.\n");
+    }
+
+    if (maintenance_rc_fleet_delete_callback == NULL)
+    {
+        return maintenance_send_text_response(
+            request,
+            "503 Service Unavailable",
+            "RC Fleet Store is not available.\n");
+    }
+
+    size_t content_length =
+        request->content_len;
+
+    if (content_length == 0U ||
+        content_length > 128U)
+    {
+        return maintenance_send_text_response(
+            request,
+            "400 Bad Request",
+            "Invalid Fleet restore request.\n");
+    }
+
+    char *body =
+        calloc(
+            content_length + 1U,
+            1U);
+
+    if (body == NULL)
+    {
+        return maintenance_send_text_response(
+            request,
+            "500 Internal Server Error",
+            "Could not allocate Fleet request buffer.\n");
+    }
+
+    size_t total_received = 0U;
+    int timeout_count = 0;
+
+    while (total_received <
+           content_length)
+    {
+        int received =
+            httpd_req_recv(
+                request,
+                body + total_received,
+                content_length -
+                    total_received);
+
+        if (received ==
+            HTTPD_SOCK_ERR_TIMEOUT)
+        {
+            timeout_count++;
+
+            if (timeout_count > 2)
+            {
+                free(body);
+
+                return maintenance_send_text_response(
+                    request,
+                    "408 Request Timeout",
+                    "Fleet restore request timed out.\n");
+            }
+
+            continue;
+        }
+
+        if (received <= 0)
+        {
+            free(body);
+
+            return maintenance_send_text_response(
+                request,
+                "400 Bad Request",
+                "Could not read Fleet restore request.\n");
+        }
+
+        total_received +=
+            (size_t)received;
+    }
+
+    body[total_received] = '\0';
+
+    char gateway_uid_text[MATHOS_DEVICE_UID_TEXT_LEN] = "";
+
+    esp_err_t err =
+        maintenance_form_get_value(
+            body,
+            "gateway_uid",
+            gateway_uid_text,
+            sizeof(gateway_uid_text));
+
+    free(body);
+    body = NULL;
+
+    if (err != ESP_OK)
+    {
+        return maintenance_send_text_response(
+            request,
+            "400 Bad Request",
+            "Gateway UID is missing.\n");
+    }
+
+    mathos_device_uid_t gateway_uid;
+
+    memset(
+        &gateway_uid,
+        0,
+        sizeof(gateway_uid));
+
+    err =
+        mathos_device_uid_parse(
+            gateway_uid_text,
+            &gateway_uid);
+
+    if (err != ESP_OK)
+    {
+        return maintenance_send_text_response(
+            request,
+            "400 Bad Request",
+            "Gateway UID is invalid.\n");
+    }
+
+    err =
+        maintenance_rc_fleet_delete_callback(
+            &gateway_uid);
+
+    if (err == ESP_OK)
+    {
+        return maintenance_send_text_response(
+            request,
+            "200 OK",
+            "Aircraft deleted.\n");
+    }
+
+    if (err == ESP_ERR_NOT_FOUND)
+    {
+        return maintenance_send_text_response(
+            request,
+            "404 Not Found",
+            "Aircraft was not found.\n");
+    }
+
+    if (err == ESP_ERR_INVALID_STATE)
+    {
+        return maintenance_send_text_response(
+            request,
+            "409 Conflict",
+            "Aircraft must be revoked before deletion.\n");
+    }
+
+    ESP_LOGE(
+        TAG,
+        "Fleet restore request failed: %s",
+        esp_err_to_name(err));
+
+    return maintenance_send_text_response(
+        request,
+        "500 Internal Server Error",
+        "Fleet restore operation failed.\n");
 }
 
 static esp_err_t
@@ -742,6 +1491,336 @@ maintenance_send_rc_pairing_progress_page(
         HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t
+maintenance_rc_fleet_get_handler(
+    httpd_req_t *request)
+{
+    if (request == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (maintenance_active_role !=
+        MATHOS_MAINTENANCE_ROLE_RC)
+    {
+        return maintenance_send_text_response(
+            request,
+            "403 Forbidden",
+            "RC Fleet information is unavailable on this device.\n");
+    }
+
+    if (maintenance_rc_fleet_read_callback == NULL)
+    {
+        return maintenance_send_text_response(
+            request,
+            "503 Service Unavailable",
+            "RC Fleet Store is not available.\n");
+    }
+
+    esp_err_t err =
+        httpd_resp_set_status(
+            request,
+            "200 OK");
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err =
+        httpd_resp_set_type(
+            request,
+            "text/html; charset=utf-8");
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err =
+        httpd_resp_set_hdr(
+            request,
+            "Cache-Control",
+            "no-store");
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err =
+        httpd_resp_sendstr_chunk(
+            request,
+            "<div class=\"fleet-list\">");
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    uint16_t displayed = 0;
+
+    for (uint16_t slot = 0;
+         slot < MATHOS_MAINTENANCE_RC_FLEET_MAX_ENTRIES;
+         slot++)
+    {
+        mathos_maintenance_rc_fleet_entry_t entry;
+
+        memset(
+            &entry,
+            0,
+            sizeof(entry));
+
+        esp_err_t read_err =
+            maintenance_rc_fleet_read_callback(
+                slot,
+                &entry);
+
+        if (read_err == ESP_ERR_NOT_FOUND ||
+            read_err == ESP_ERR_NVS_NOT_FOUND)
+        {
+            continue;
+        }
+
+        if (read_err != ESP_OK)
+        {
+            ESP_LOGE(
+                TAG,
+                "Fleet display read failed "
+                "slot=%u error=%s",
+                (unsigned int)slot,
+                esp_err_to_name(read_err));
+
+            httpd_resp_sendstr_chunk(
+                request,
+                "<div class=\"warning\">"
+                "Fleet Store read error."
+                "</div>");
+
+            httpd_resp_sendstr_chunk(
+                request,
+                "</div>");
+
+            httpd_resp_send_chunk(
+                request,
+                NULL,
+                0);
+
+            return ESP_OK;
+        }
+
+        char uid_text[MATHOS_DEVICE_UID_TEXT_LEN] = "";
+
+        err =
+            mathos_device_uid_format(
+                &entry.gateway_uid,
+                uid_text,
+                sizeof(uid_text));
+
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+
+        char friendly_name_html[256] = "";
+        char state_html[64] = "";
+
+        err =
+            maintenance_html_escape(
+                entry.friendly_name,
+                friendly_name_html,
+                sizeof(friendly_name_html));
+
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+
+        err =
+            maintenance_html_escape(
+                entry.state_text,
+                state_html,
+                sizeof(state_html));
+
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+        char action_html[384] = "";
+        char selected_html[128] = "";
+        char state_badge_html[128] = "";
+
+        if (strcmp(
+                entry.state_text,
+                "ACTIVE") == 0)
+        {
+            snprintf(
+                state_badge_html,
+                sizeof(state_badge_html),
+                "<span class=\"fleet-state-active\">ACTIVE</span>");
+            if (entry.selected)
+            {
+                snprintf(
+                    action_html,
+                    sizeof(action_html),
+                    "<button class=\"save-button fleet-action-button fleet-revoke\" "
+                    "type=\"button\" "
+                    "data-action=\"revoke\" "
+                    "data-uid=\"%s\">"
+                    "Revoke"
+                    "</button>",
+                    uid_text);
+            }
+            else
+            {
+                snprintf(
+                    action_html,
+                    sizeof(action_html),
+                    "<button class=\"save-button fleet-action-button fleet-select\" "
+                    "type=\"button\" "
+                    "data-action=\"select\" "
+                    "data-uid=\"%s\">"
+                    "Select"
+                    "</button> "
+                    "<button class=\"save-button fleet-action-button fleet-revoke\" "
+                    "type=\"button\" "
+                    "data-action=\"revoke\" "
+                    "data-uid=\"%s\">"
+                    "Revoke"
+                    "</button>",
+                    uid_text,
+                    uid_text);
+            }
+        }
+
+        else if (strcmp(
+                     entry.state_text,
+                     "REVOKED") == 0)
+        {
+            snprintf(
+                state_badge_html,
+                sizeof(state_badge_html),
+                "<span class=\"fleet-state-revoked\">REVOKED</span>");
+
+            snprintf(
+                action_html,
+                sizeof(action_html),
+                "<button class=\"save-button fleet-action-button fleet-restore\" "
+                "type=\"button\" "
+                "data-action=\"restore\" "
+                "data-uid=\"%s\">"
+                "Restore"
+                "</button> "
+                "<button class=\"save-button fleet-action-button fleet-delete\" "
+                "type=\"button\" "
+                "data-action=\"delete\" "
+                "data-uid=\"%s\">"
+                "Delete"
+                "</button>",
+                uid_text,
+                uid_text);
+        }
+
+        if (entry.selected)
+        {
+            snprintf(
+                selected_html,
+                sizeof(selected_html),
+                "<span class=\"fleet-selected\">Selected</span>");
+        }
+        const char *aircraft_card_class =
+            entry.selected
+                ? "editor fleet-aircraft fleet-aircraft-selected"
+                : "editor fleet-aircraft";
+        char row[1024];
+
+        int written =
+            snprintf(
+                row,
+                sizeof(row),
+
+                "<section class=\"%s\">"
+
+                "<div class=\"fleet-aircraft-title\">%s</div>"
+
+                "<div class=\"label\">Slot</div>"
+                "<div class=\"value\">%u</div>"
+
+                "<div class=\"label\">Gateway UID</div>"
+                "<div class=\"value\">%s</div>"
+
+                "<div class=\"label\">Key generation</div>"
+                "<div class=\"value\">%lu</div>"
+
+                "<div class=\"label\">State</div>"
+                "<div class=\"value\">%s</div>"
+
+                "<div class=\"label\">Selection</div>"
+                "<div class=\"value\">%s</div>"
+
+                "<div class=\"label\">Action</div>"
+                "<div class=\"value\">%s</div>"
+                "</section>",
+                aircraft_card_class,
+                friendly_name_html,
+                (unsigned int)entry.slot,
+                uid_text,
+                (unsigned long)entry.key_generation,
+                state_badge_html,
+                selected_html,
+                action_html);
+
+        if (written < 0 ||
+            (size_t)written >= sizeof(row))
+        {
+            return ESP_ERR_INVALID_SIZE;
+        }
+
+        err =
+            httpd_resp_send_chunk(
+                request,
+                row,
+                written);
+
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+
+        displayed++;
+    }
+
+    if (displayed == 0)
+    {
+        err =
+            httpd_resp_sendstr_chunk(
+                request,
+                "<div class=\"warning\">"
+                "No authorized aircraft stored."
+                "</div>");
+
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+    }
+
+    err =
+        httpd_resp_sendstr_chunk(
+            request,
+            "</div>");
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    return httpd_resp_send_chunk(
+        request,
+        NULL,
+        0);
+}
+
 static esp_err_t maintenance_rc_config_post_handler(
     httpd_req_t *request);
 
@@ -868,7 +1947,7 @@ static uint32_t mathos_rc_enrollment_config_calculate_crc32(
 {
     _Static_assert(
         sizeof(mathos_rc_enrollment_config_t) == 80U &&
-        offsetof(mathos_rc_enrollment_config_t, crc32) == 76U,
+            offsetof(mathos_rc_enrollment_config_t, crc32) == 76U,
         "RC enrollment layout changed; review the record version");
 
     if (config == NULL)
@@ -2617,6 +3696,12 @@ void mathos_maintenance_set_rc_pairing_callback(
         callback;
 }
 
+void mathos_maintenance_set_rc_fleet_read_callback(
+    mathos_maintenance_rc_fleet_read_callback_t callback)
+{
+    maintenance_rc_fleet_read_callback =
+        callback;
+}
 
 void mathos_maintenance_set_rc_pairing_target(
     const mathos_device_uid_t *gateway_uid)
@@ -2661,7 +3746,6 @@ esp_err_t mathos_maintenance_get_rc_pairing_target(
 
     return ESP_OK;
 }
-
 
 void mathos_maintenance_set_rc_pairing_status(
     mathos_maintenance_rc_pairing_status_t status)
@@ -4312,7 +5396,7 @@ static esp_err_t mathos_pairing_result_auth_self_test(void)
                                               0x3D,
                                               0x30,
                                           },
-                                      };
+    };
 
     static const uint32_t expected_crc[2] = {
         0x9140B5D4U,
@@ -11134,6 +12218,140 @@ static esp_err_t maintenance_build_role_section(
             "</form>"
             "</section>"
 
+            "<section class=\"editor fleet-section\">"
+
+            "<div class=\"fleet-header\">"
+            "<div>"
+            "<h2>Authorized Aircraft</h2>"
+            "<div class=\"fleet-subtitle\">"
+            "Manage trusted aircraft and choose the aircraft assigned for operation."
+            "</div>"
+            "</div>"
+            "</div>"
+
+            "<div id=\"rc-fleet-list\">"
+            "<div class=\"value\">Loading Fleet Store...</div>"
+            "</div>"
+
+            "<div class=\"fleet-status\" id=\"rc-fleet-status\" "
+            "role=\"status\">"
+            "Reading authorized aircraft."
+            "</div>"
+
+            "<script>"
+            "document.addEventListener('DOMContentLoaded',function(){"
+
+            "const list=document.getElementById('rc-fleet-list');"
+            "const status=document.getElementById('rc-fleet-status');"
+            "let actionInProgress=false;"
+
+            "async function loadFleet(){"
+            "const controller=new AbortController();"
+            "const timeout=setTimeout(()=>controller.abort(),5000);"
+
+            "try{"
+            "const response=await fetch('/fleet/rc',{"
+            "cache:'no-store',signal:controller.signal});"
+
+            "if(!response.ok){"
+            "throw new Error('Fleet endpoint unavailable');"
+            "}"
+
+            "const html=await response.text();"
+            "list.innerHTML=html;"
+            "status.textContent='Fleet Store loaded.';"
+
+            "}catch(error){"
+            "list.innerHTML="
+            "'<div class=\"warning\">Unable to load Fleet Store.</div>';"
+            "status.textContent="
+            "'Check the RC Fleet Store and maintenance connection.';"
+
+            "}finally{"
+            "clearTimeout(timeout);"
+            "}"
+            "}"
+
+            "async function runFleetAction(button){"
+            "if(actionInProgress){return;}"
+
+            "const action=button.dataset.action;"
+            "const uid=button.dataset.uid;"
+
+            "if((action!=='revoke'&&"
+            "action!=='restore'&&"
+            "action!=='delete'&&"
+            "action!=='select')"
+            "||!/^([0-9A-F]{2}:){5}[0-9A-F]{2}$/.test(uid)){"
+            "status.textContent='Invalid Fleet action.';"
+            "return;"
+            "}"
+
+            "const confirmed=window.confirm("
+            "action==='delete'"
+            "? 'Permanently delete revoked aircraft '+uid+'? This cannot be undone.'"
+            ": 'Confirm '+action+' for aircraft '+uid+'?');"
+
+            "if(!confirmed){return;}"
+
+            "actionInProgress=true;"
+
+            "const buttons=list.querySelectorAll('.fleet-action-button');"
+            "buttons.forEach(function(item){item.disabled=true;});"
+
+            "status.textContent="
+            "action==='revoke'"
+            "? 'Revoking aircraft...'"
+            ": action==='restore'"
+            "? 'Restoring aircraft...'"
+            ": action==='select'"
+            "? 'Selecting aircraft...'"
+            ": 'Deleting aircraft...';"
+
+            "try{"
+            "const response=await fetch('/fleet/rc/'+action,{"
+            "method:'POST',"
+            "headers:{"
+            "'Content-Type':'application/x-www-form-urlencoded'"
+            "},"
+            "body:'gateway_uid='+encodeURIComponent(uid),"
+            "cache:'no-store'"
+            "});"
+
+            "const message=await response.text();"
+
+            "if(!response.ok){"
+            "throw new Error(message.trim()||'Fleet action failed');"
+            "}"
+
+            "status.textContent=message.trim();"
+
+            "await loadFleet();"
+
+            "}catch(error){"
+            "status.textContent="
+            "'Fleet action failed: '+error.message;"
+
+            "}finally{"
+            "actionInProgress=false;"
+            "}"
+            "}"
+
+            "list.addEventListener('click',function(event){"
+            "const button=event.target.closest('.fleet-action-button');"
+
+            "if(!button||!list.contains(button)){return;}"
+
+            "runFleetAction(button);"
+            "});"
+
+            "loadFleet();"
+
+            "},{once:true});"
+            "</script>"
+
+            "</section>"
+
             "<section class=\"editor\">"
             "<h2>Secure Gateway Pairing</h2>"
 
@@ -11141,7 +12359,6 @@ static esp_err_t maintenance_build_role_section(
             "The Gateway must already be in maintenance pairing mode "
             "and the RC must have received its pairing challenge."
             "</div>"
-
 
             "<div class=\"label\">Selected Gateway UID</div>"
             "<div class=\"value\" id=\"pairing-target-uid\">"
@@ -11840,6 +13057,136 @@ static esp_err_t maintenance_root_get_handler(httpd_req_t *request)
         "cursor:pointer;"
         "}"
 
+        ".fleet-aircraft{"
+        "margin-top:14px;"
+        "padding:18px;"
+        "border:1px solid #334155;"
+        "border-radius:10px;"
+        "background:#172033;"
+        "}"
+        ".fleet-aircraft-title{"
+        "margin-bottom:12px;"
+        "padding-bottom:10px;"
+        "border-bottom:1px solid #334155;"
+        "color:#f8fafc;"
+        "font-size:18px;"
+        "font-weight:bold;"
+        "line-height:1.3;"
+        "}"
+
+        ".fleet-section{"
+        "margin-top:20px;"
+        "}"
+
+        ".fleet-header{"
+        "display:flex;"
+        "justify-content:space-between;"
+        "align-items:flex-start;"
+        "gap:12px;"
+        "margin-bottom:14px;"
+        "}"
+
+        ".fleet-header h2{"
+        "margin:0;"
+        "}"
+
+        ".fleet-subtitle{"
+        "margin-top:5px;"
+        "font-size:13px;"
+        "color:#94a3b8;"
+        "line-height:1.4;"
+        "}"
+
+        ".fleet-status{"
+        "margin-top:14px;"
+        "padding:9px 11px;"
+        "border-radius:7px;"
+        "background:#1e293b;"
+        "color:#cbd5e1;"
+        "font-size:13px;"
+        "}"
+
+        ".fleet-aircraft-selected{"
+        "border-color:#2563eb;"
+        "box-shadow:0 0 0 1px #2563eb;"
+        "}"
+
+        ".fleet-aircraft .label{"
+        "margin-top:10px;"
+        "}"
+
+        ".fleet-aircraft .label:first-child{"
+        "margin-top:0;"
+        "}"
+
+        ".fleet-action-button{"
+        "width:auto;"
+        "margin-top:6px;"
+        "margin-right:6px;"
+        "padding:8px 14px;"
+        "font-size:14px;"
+        "}"
+
+        ".fleet-selected{"
+        "display:inline-block;"
+        "padding:4px 9px;"
+        "border-radius:999px;"
+        "background:#166534;"
+        "color:#ffffff;"
+        "font-size:12px;"
+        "font-weight:bold;"
+        "letter-spacing:.3px;"
+        "}"
+
+        ".fleet-state-active{"
+        "display:inline-block;"
+        "padding:4px 9px;"
+        "border-radius:999px;"
+        "background:#166534;"
+        "color:#ffffff;"
+        "font-size:12px;"
+        "font-weight:bold;"
+        "letter-spacing:.3px;"
+        "}"
+
+        ".fleet-state-revoked{"
+        "display:inline-block;"
+        "padding:4px 9px;"
+        "border-radius:999px;"
+        "background:#991b1b;"
+        "color:#ffffff;"
+        "font-size:12px;"
+        "font-weight:bold;"
+        "letter-spacing:.3px;"
+        "}"
+
+        ".fleet-revoke{"
+        "background:#d97706;"
+        "border-color:#d97706;"
+        "color:#fff;"
+        "}"
+
+        ".fleet-restore{"
+        "background:#15803d;"
+        "border-color:#15803d;"
+        "color:#fff;"
+        "}"
+
+        ".fleet-delete{"
+        "background:#b91c1c;"
+        "border-color:#b91c1c;"
+        "color:#fff;"
+        "}"
+        ".fleet-select{"
+        "background:#2563eb;"
+        "border-color:#2563eb;"
+        "color:#fff;"
+        "}"
+
+        ".fleet-select:hover{background:#1d4ed8;}"
+        ".fleet-revoke:hover{background:#b45309;}"
+        ".fleet-restore:hover{background:#166534;}"
+        ".fleet-delete:hover{background:#991b1b;}"
         ".warning{"
         "margin-top:12px;"
         "font-size:13px;"
@@ -11944,7 +13291,8 @@ static esp_err_t maintenance_http_server_start(
 
     config.server_port = 80;
     config.lru_purge_enable = true;
-
+    config.stack_size = 8192;
+    config.max_uri_handlers = 12;
     esp_err_t err =
         httpd_start(
             &maintenance_http_server,
@@ -12087,7 +13435,167 @@ RC_PROOF transmission.
         ESP_LOGI(
             TAG,
             "RC pairing status endpoint registered");
+
+        httpd_uri_t rc_fleet_select_uri = {
+            .uri = "/fleet/rc/select",
+            .method = HTTP_POST,
+            .handler =
+                maintenance_rc_fleet_select_post_handler,
+            .user_ctx = NULL,
+        };
+
+        err =
+            httpd_register_uri_handler(
+                maintenance_http_server,
+                &rc_fleet_select_uri);
+
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(
+                TAG,
+                "RC Fleet select URI registration failed: %s",
+                esp_err_to_name(err));
+
+            httpd_stop(
+                maintenance_http_server);
+
+            maintenance_http_server = NULL;
+
+            return err;
+        }
+
+        ESP_LOGI(
+            TAG,
+            "RC Fleet select endpoint registered");
+
+        httpd_uri_t rc_fleet_uri = {
+            .uri = "/fleet/rc",
+            .method = HTTP_GET,
+            .handler =
+                maintenance_rc_fleet_get_handler,
+            .user_ctx = NULL,
+        };
+
+        err =
+            httpd_register_uri_handler(
+                maintenance_http_server,
+                &rc_fleet_uri);
+
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(
+                TAG,
+                "RC Fleet URI registration failed: %s",
+                esp_err_to_name(err));
+
+            httpd_stop(
+                maintenance_http_server);
+
+            maintenance_http_server = NULL;
+
+            return err;
+        }
+
+        ESP_LOGI(
+            TAG,
+            "RC Fleet endpoint registered");
+
+        httpd_uri_t rc_fleet_revoke_uri = {
+            .uri = "/fleet/rc/revoke",
+            .method = HTTP_POST,
+            .handler =
+                maintenance_rc_fleet_revoke_post_handler,
+            .user_ctx = NULL,
+        };
+
+        err =
+            httpd_register_uri_handler(
+                maintenance_http_server,
+                &rc_fleet_revoke_uri);
+
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(
+                TAG,
+                "RC Fleet revoke URI registration failed: %s",
+                esp_err_to_name(err));
+
+            httpd_stop(
+                maintenance_http_server);
+
+            maintenance_http_server = NULL;
+
+            return err;
+        }
+
+        ESP_LOGI(
+            TAG,
+            "RC Fleet revoke endpoint registered");
+        httpd_uri_t rc_fleet_restore_uri = {
+            .uri = "/fleet/rc/restore",
+            .method = HTTP_POST,
+            .handler =
+                maintenance_rc_fleet_restore_post_handler,
+            .user_ctx = NULL,
+        };
+
+        err =
+            httpd_register_uri_handler(
+                maintenance_http_server,
+                &rc_fleet_restore_uri);
+
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(
+                TAG,
+                "RC Fleet restore URI registration failed: %s",
+                esp_err_to_name(err));
+
+            httpd_stop(
+                maintenance_http_server);
+
+            maintenance_http_server = NULL;
+
+            return err;
+        }
+
+        ESP_LOGI(
+            TAG,
+            "RC Fleet restore endpoint registered");
+
+        httpd_uri_t rc_fleet_delete_uri = {
+            .uri = "/fleet/rc/delete",
+            .method = HTTP_POST,
+            .handler =
+                maintenance_rc_fleet_delete_post_handler,
+            .user_ctx = NULL,
+        };
+
+        err =
+            httpd_register_uri_handler(
+                maintenance_http_server,
+                &rc_fleet_delete_uri);
+
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(
+                TAG,
+                "RC Fleet delete URI registration failed: %s",
+                esp_err_to_name(err));
+
+            httpd_stop(
+                maintenance_http_server);
+
+            maintenance_http_server = NULL;
+
+            return err;
+        }
+
+        ESP_LOGI(
+            TAG,
+            "RC Fleet delete endpoint registered");
     }
+
     else if (role ==
              MATHOS_MAINTENANCE_ROLE_GATEWAY)
     {
@@ -12342,8 +13850,32 @@ static void maintenance_clear_sensitive_memory(
         buffer_size--;
     }
 }
+static esp_err_t maintenance_rc_pairing_nvs_open(
+    const char *partition_name,
+    nvs_open_mode_t open_mode,
+    nvs_handle_t *handle)
+{
+    if (handle == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
 
-esp_err_t mathos_rc_pairing_config_save(
+    if (partition_name == NULL)
+    {
+        return nvs_open(
+            MATHOS_MAINTENANCE_NVS_NAMESPACE,
+            open_mode,
+            handle);
+    }
+
+    return nvs_open_from_partition(
+        partition_name,
+        MATHOS_MAINTENANCE_NVS_NAMESPACE,
+        open_mode,
+        handle);
+}
+static esp_err_t maintenance_rc_pairing_config_save_to_partition(
+    const char *partition_name,
     const mathos_rc_pairing_config_t *config)
 {
     if (config == NULL)
@@ -12423,8 +13955,8 @@ esp_err_t mathos_rc_pairing_config_save(
     nvs_handle_t handle;
 
     esp_err_t err =
-        nvs_open(
-            MATHOS_MAINTENANCE_NVS_NAMESPACE,
+        maintenance_rc_pairing_nvs_open(
+            partition_name,
             NVS_READWRITE,
             &handle);
 
@@ -12580,7 +14112,24 @@ cleanup:
     return result;
 }
 
-esp_err_t mathos_rc_pairing_config_load(
+esp_err_t mathos_rc_pairing_config_save(
+    const mathos_rc_pairing_config_t *config)
+{
+    return maintenance_rc_pairing_config_save_to_partition(
+        MATHOS_RC_ENROLLMENT_NVS_PARTITION,
+        config);
+}
+
+esp_err_t mathos_rc_pairing_config_save_enrollment(
+    const mathos_rc_pairing_config_t *config)
+{
+    return maintenance_rc_pairing_config_save_to_partition(
+        MATHOS_RC_ENROLLMENT_NVS_PARTITION,
+        config);
+}
+
+static esp_err_t maintenance_rc_pairing_config_load_from_partition(
+    const char *partition_name,
     mathos_rc_pairing_config_t *config,
     int *loaded_from_nvs)
 {
@@ -12604,11 +14153,11 @@ esp_err_t mathos_rc_pairing_config_load(
 
     nvs_handle_t handle;
 
-    esp_err_t err =
-        nvs_open(
-            MATHOS_MAINTENANCE_NVS_NAMESPACE,
-            NVS_READONLY,
-            &handle);
+esp_err_t err =
+    maintenance_rc_pairing_nvs_open(
+        partition_name,
+        NVS_READONLY,
+        &handle);
 
     /*
         A new RC may not have created the shared
@@ -12793,6 +14342,138 @@ esp_err_t mathos_rc_pairing_config_load(
 
     return ESP_OK;
 }
+esp_err_t mathos_rc_pairing_config_load(
+    mathos_rc_pairing_config_t *config,
+    int *loaded_from_nvs)
+{
+    return maintenance_rc_pairing_config_load_from_partition(
+        MATHOS_RC_ENROLLMENT_NVS_PARTITION,
+        config,
+        loaded_from_nvs);
+}
+
+esp_err_t mathos_rc_pairing_config_legacy_delete(void)
+{
+    nvs_handle_t handle;
+
+    esp_err_t err =
+        maintenance_rc_pairing_nvs_open(
+            NULL,
+            NVS_READWRITE,
+            &handle);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        return ESP_OK;
+    }
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err =
+        nvs_erase_key(
+            handle,
+            MATHOS_RC_PAIRING_NVS_KEY);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        nvs_close(handle);
+        return ESP_OK;
+    }
+
+    if (err != ESP_OK)
+    {
+        nvs_close(handle);
+        return err;
+    }
+
+    err =
+        nvs_commit(handle);
+
+    nvs_close(handle);
+
+    return err;
+}
+
+esp_err_t mathos_rc_pairing_config_load_enrollment(
+    mathos_rc_pairing_config_t *config,
+    int *loaded_from_nvs)
+{
+    return maintenance_rc_pairing_config_load_from_partition(
+        MATHOS_RC_ENROLLMENT_NVS_PARTITION,
+        config,
+        loaded_from_nvs);
+}
+esp_err_t mathos_rc_pairing_config_load_legacy(
+    mathos_rc_pairing_config_t *config,
+    int *loaded_from_nvs)
+{
+    return maintenance_rc_pairing_config_load_from_partition(
+        NULL,
+        config,
+        loaded_from_nvs);
+}
+esp_err_t mathos_rc_pairing_config_enrollment_exists(
+    int *exists)
+{
+    if (exists == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *exists = 0;
+
+    nvs_handle_t handle;
+
+    esp_err_t err =
+        maintenance_rc_pairing_nvs_open(
+            MATHOS_RC_ENROLLMENT_NVS_PARTITION,
+            NVS_READONLY,
+            &handle);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        return ESP_OK;
+    }
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    size_t stored_size = 0;
+
+    err =
+        nvs_get_blob(
+            handle,
+            MATHOS_RC_PAIRING_NVS_KEY,
+            NULL,
+            &stored_size);
+
+    nvs_close(handle);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        return ESP_OK;
+    }
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    if (stored_size != sizeof(mathos_rc_pairing_config_t))
+    {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    *exists = 1;
+
+    return ESP_OK;
+}
+
 
 esp_err_t mathos_maintenance_generate_pairing_salt(
     uint8_t salt[MATHOS_PAIRING_SALT_LEN])

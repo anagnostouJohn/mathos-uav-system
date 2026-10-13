@@ -24,11 +24,10 @@
 #include "mathos_maintenance.h"
 #include "mathos_identity.h"
 #include "mathos_fleet.h"
+#include "esp_hmac.h"
 
 ////////////////////////////////////////////////////////////////////////////////////
 #define COMMAND_STATUS_MESSAGE_CLEAR_MS 3000
-
-
 
 #define BENCH_FAILSAFE_DISARM 1
 
@@ -102,10 +101,6 @@
 
 //////////////////// UART
 
-
-
-
-
 #define CONTROL_UART_PORT UART_NUM_1
 #define CONTROL_UART_TX_PIN 8
 #define CONTROL_UART_RX_PIN 9
@@ -128,14 +123,13 @@
 
 #define FEATURE_LINK_UART_TX 1
 
-
 static void gateway_status_handle_frame(
     const uint8_t *frame,
     size_t frame_len);
 
-
 //////////////////// UART
 //////////////////// MAVLINK
+#define MATHOS_RC_STORAGE_HMAC_KEY_ID ((uint8_t)HMAC_KEY5)
 #define MAVLINK2_STX 0xFD
 
 #define MAVLINK_TARGET_COMP_ID 1
@@ -217,6 +211,15 @@ static void gateway_status_handle_frame(
 #define JOYSTICK_NVS_NAMESPACE "joystick"
 #define JOYSTICK_NVS_KEY "calibration"
 #define FEATURE_TREAT_GATEWAY_DRY_RUN_AS_CONFIRMED 0
+/*
+    Transitional session-counter location.
+
+    Keep the established monotonic RC session counter in
+    legacy Fleet storage until its secure migration has
+    been separately verified.
+*/
+#define MATHOS_RC_SESSION_LEGACY_PARTITION_NAME "fleet"
+#define MATHOS_RC_SESSION_PARTITION_NAME "fleet_sec"
 
 #if FEATURE_DIRECT_MAVLINK_MODE && FEATURE_SECURE_GATEWAY_MODE
 #error "Only one control mode can be enabled: DIRECT MAVLINK or SECURE GATEWAY"
@@ -232,8 +235,6 @@ static void gateway_status_handle_frame(
 
 #define SECURITY_SKELETON_DIAGNOSTIC FEATURE_SECURITY_SKELETON
 
-
-
 #define LINK_RX_BUFFER_SIZE 128
 #define GATEWAY_STATUS_FRESH_MS 1000
 #define GATEWAY_TELEMETRY_FRESH_MS 1000
@@ -242,7 +243,6 @@ static void gateway_status_handle_frame(
 #define SECURITY_TIMING_DIAGNOSTIC DEBUG_SECURITY_TIMING
 #define SECURITY_TIMING_PRINT_EVERY 100
 #define SECURITY_TIMING_WARN_US 1000
-
 
 //////////////////// SECURITY LAYER
 #if DEBUG_SERIAL
@@ -302,7 +302,6 @@ typedef enum
     COMMAND_STATUS_DENIED,
     COMMAND_STATUS_TIMEOUT
 } command_status_t;
-
 
 typedef enum
 {
@@ -604,7 +603,6 @@ static spi_device_handle_t lcd_spi = NULL;
 static uint8_t mavlink_tx_seq = 0;
 static uint32_t security_tx_sequence = 1;
 static security_timing_stats_t security_timing_stats = {0};
-
 
 static const uint8_t font_5x7[37][7] = {
     // A
@@ -1161,8 +1159,6 @@ static int joystick_calibration_save_to_nvs(
 
     return 1;
 }
-
-
 
 void heartbeat_init_all(void)
 {
@@ -2880,11 +2876,11 @@ void enter_failsafe(const char *reason)
     drone_command_set(RC_FAILSAFE, reason);
 
     if (command_status_get() == COMMAND_STATUS_ARMING)
-{
-    command_status_set(
-        COMMAND_STATUS_IDLE,
-        "failsafe cancelled pending ARM");
-}
+    {
+        command_status_set(
+            COMMAND_STATUS_IDLE,
+            "failsafe cancelled pending ARM");
+    }
 
     printf("[FAILSAFE] ENTERED reason=%s\n",
            reason ? reason : "none");
@@ -2924,8 +2920,6 @@ int arm_permission_enabled(void)
 {
     return gpio_get_level(ARM_PERMISSION_SWITCH_PIN) == 0;
 }
-
-
 
 static void boot_mode_switches_init(void)
 {
@@ -3701,7 +3695,6 @@ void system_health_task(void *pvParameters)
         int fc_heartbeat_fresh =
             gateway_fc_heartbeat_is_fresh();
 
-
         if (!gateway_control_ok)
         {
             fault_set(FAULT_DRONE_LINK_BAD);
@@ -3745,7 +3738,6 @@ void system_health_task(void *pvParameters)
             printf(
                 "[HEALTH] FAILSAFE: "
                 "gateway control link bad while ARMED\n");
-
         }
         else if (command_state == RC_ARMED &&
                  !fc_heartbeat_fresh)
@@ -3759,7 +3751,6 @@ void system_health_task(void *pvParameters)
                 "[HEALTH] FAILSAFE: "
                 "FC heartbeat stale while ARMED\n");
         }
-
 
 #endif
 #if FEATURE_DIRECT_MAVLINK_MODE
@@ -4818,8 +4809,6 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
     static uint32_t bad_count = 0;
     static uint32_t replay_count = 0;
 
-
-
     int new_gateway_session = 0;
 
     if (frame == NULL || frame_len == 0)
@@ -4885,10 +4874,9 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
 
             return;
         }
-                crypto_status =
+        crypto_status =
             mathos_secure_decrypt_session_packet(
                 &packet);
-
     }
     else
     {
@@ -4928,13 +4916,10 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
     {
         bad_count++;
 
-
-
         printf(
             "[GATEWAY RX] bad controller_id=%u expected=%u\n",
             packet.controller_id,
             rc_runtime_pairing_config.authorised_gateway_id);
-
 
         return;
     }
@@ -5282,8 +5267,6 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
 
         rc_operational_session_ready = 1;
 
-
-
         printf(
             "[SESSION] READY "
             "rc=%lu gateway=%lu\n",
@@ -5384,12 +5367,9 @@ static void gateway_status_handle_frame(const uint8_t *frame, size_t frame_len)
         last_session_id =
             session_id;
 
+        last_sequence = 0;
 
-
-last_sequence = 0;
-
-
-has_session = 1;
+        has_session = 1;
 
         gateway_session_remember(session_id);
 
@@ -5482,7 +5462,6 @@ status or telemetry from the previous session.
     {
         replay_count++;
 
-
         printf(
             "[GATEWAY RX] REPLAY/OLD "
             "session=0x%08lx seq=%lu last=%lu "
@@ -5495,9 +5474,7 @@ status or telemetry from the previous session.
         return;
     }
 
-
-
-last_sequence = packet.sequence;
+    last_sequence = packet.sequence;
     fault_clear(FAULT_PACKET_SEQUENCE);
     if (new_gateway_session &&
         (drone_command_get() == RC_ARMED ||
@@ -5656,7 +5633,6 @@ last_sequence = packet.sequence;
         gateway_status_update(&status);
         gateway_status_apply_to_remote(&status);
 
-
         ok_count++;
 
         static uint32_t print_counter = 0;
@@ -5784,12 +5760,10 @@ last_sequence = packet.sequence;
 
             return;
         }
-gateway_telemetry_handle_packet(
-    &packet);
+        gateway_telemetry_handle_packet(
+            &packet);
 
-ok_count++;
-
-
+        ok_count++;
     }
     else
     {
@@ -6204,13 +6178,161 @@ static void rc_pairing_clear_sensitive_memory(
         buffer_size--;
     }
 }
-
 /*
-    HTTP-facing callback.
+    Read one Fleet record for the RC maintenance page.
 
-    ESP_OK means the request was queued, NOT that
-    a proof was transmitted or pairing succeeded.
+    Only non-secret metadata leaves this function.
+    The complete Fleet record, including secret_blob,
+    is wiped before returning.
 */
+static esp_err_t rc_fleet_read_maintenance_entry(
+    uint16_t slot,
+    mathos_maintenance_rc_fleet_entry_t *entry_out)
+{
+    if (entry_out == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(
+        entry_out,
+        0,
+        sizeof(*entry_out));
+
+    if (slot >= MATHOS_FLEET_MAX_AIRCRAFT)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    mathos_fleet_record_t record;
+
+    memset(
+        &record,
+        0,
+        sizeof(record));
+
+    esp_err_t err =
+        mathos_fleet_record_load_slot(
+            slot,
+            &record);
+
+    if (err != ESP_OK)
+    {
+        rc_pairing_clear_sensitive_memory(
+            &record,
+            sizeof(record));
+
+        return err;
+    }
+
+    entry_out->slot =
+        slot;
+
+    entry_out->gateway_uid =
+        record.gateway_uid;
+
+    memcpy(
+        entry_out->friendly_name,
+        record.friendly_name,
+        sizeof(entry_out->friendly_name));
+
+    entry_out->friendly_name[sizeof(entry_out->friendly_name) - 1U] =
+        '\0';
+
+    entry_out->key_generation =
+        record.key_generation;
+
+    const char *state_text =
+        mathos_fleet_state_to_string(
+            (mathos_fleet_state_t)record.state);
+
+    snprintf(
+        entry_out->state_text,
+        sizeof(entry_out->state_text),
+        "%s",
+        state_text != NULL
+            ? state_text
+            : "UNKNOWN");
+
+    mathos_device_uid_t selected_uid;
+
+    memset(
+        &selected_uid,
+        0,
+        sizeof(selected_uid));
+
+    esp_err_t selected_err =
+        mathos_fleet_selected_uid_get(
+            &selected_uid);
+
+    entry_out->selected =
+        selected_err == ESP_OK &&
+        memcmp(
+            selected_uid.bytes,
+            record.gateway_uid.bytes,
+            sizeof(selected_uid.bytes)) == 0;
+
+    memset(
+        &selected_uid,
+        0,
+        sizeof(selected_uid));
+    /*
+        Do not leave the Pair Key / wrapped credential
+        copy on this stack after extracting metadata.
+    */
+    rc_pairing_clear_sensitive_memory(
+        &record,
+        sizeof(record));
+
+    return ESP_OK;
+}
+static esp_err_t rc_fleet_revoke_maintenance_aircraft(
+    const mathos_device_uid_t *gateway_uid)
+{
+    if (gateway_uid == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return mathos_fleet_revoke_aircraft(
+        gateway_uid);
+}
+
+static esp_err_t rc_fleet_restore_maintenance_aircraft(
+    const mathos_device_uid_t *gateway_uid)
+{
+    if (gateway_uid == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return mathos_fleet_restore_aircraft(
+        gateway_uid);
+}
+static esp_err_t rc_fleet_delete_maintenance_aircraft(
+    const mathos_device_uid_t *gateway_uid)
+{
+    if (gateway_uid == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return mathos_fleet_delete_aircraft(
+        gateway_uid);
+}
+
+static esp_err_t rc_fleet_select_maintenance_aircraft(
+    const mathos_device_uid_t *gateway_uid)
+{
+    if (gateway_uid == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return mathos_fleet_selected_uid_set(
+        gateway_uid);
+}
+
 static esp_err_t rc_pairing_enqueue_request(
     const char *passphrase,
     const mathos_device_uid_t *expected_gateway_uid)
@@ -8591,7 +8713,7 @@ void radio_tx_task(void *pvParameters)
             SESSION_CONFIRM has been authenticated and the
             directional session keys exist.
         */
-        if (!rc_operational_session_ready || 
+        if (!rc_operational_session_ready ||
             !mathos_secure_session_keys_are_set())
         {
             vTaskDelayUntil(
@@ -8738,9 +8860,8 @@ void radio_tx_task(void *pvParameters)
 
         if (security_wrap_rc_packet(&packet, &secure_packet, read_link_mode_switch()))
         {
-static uint32_t security_print_counter = 0;
-static uint32_t security_test_last_sequence = 0;
-
+            static uint32_t security_print_counter = 0;
+            static uint32_t security_test_last_sequence = 0;
 
             security_status =
                 security_verify_packet_basic(&secure_packet, &security_test_last_sequence);
@@ -8773,16 +8894,16 @@ static uint32_t security_test_last_sequence = 0;
                     {
 #if FEATURE_LINK_UART_TX
 
-{
-    link_send_ok =
-        link_uart_send_frame(
-            wire_frame,
-            wire_frame_len);
-}
+                        {
+                            link_send_ok =
+                                link_uart_send_frame(
+                                    wire_frame,
+                                    wire_frame_len);
+                        }
 
                         static uint32_t link_uart_ok_count = 0;
 
-                 if (link_send_ok)
+                        if (link_send_ok)
                         {
                             link_uart_ok_count++;
 
@@ -10114,14 +10235,146 @@ void app_main(void)
         boot_master_raw != 0 &&
         boot_maintenance_raw == 0;
 
+    /*
+        Prepare the dedicated encrypted enrollment partition.
+
+        At this stage the production pairing record still uses
+        the default NVS partition. A missing HMAC eFuse key is
+        therefore reported but is not yet fatal.
+    */
+    esp_err_t enrollment_storage_err =
+        mathos_rc_enrollment_storage_init(
+            MATHOS_RC_STORAGE_HMAC_KEY_ID);
+
+    if (enrollment_storage_err == ESP_OK)
+    {
+        printf(
+            "[SECURITY] encrypted enrollment storage READY\n");
+    }
+    else
+    {
+        printf(
+            "[SECURITY] FATAL: encrypted enrollment storage unavailable: %s\n",
+            esp_err_to_name(enrollment_storage_err));
+
+        printf(
+            "[SECURITY] RC startup BLOCKED\n");
+
+        return;
+    }
+
     esp_err_t pairing_load_err =
         mathos_rc_pairing_config_load(
             &rc_runtime_pairing_config,
             &rc_runtime_pairing_loaded_from_nvs);
+    esp_err_t fleet_secure_storage_err =
+        mathos_fleet_secure_storage_init(
+            MATHOS_RC_STORAGE_HMAC_KEY_ID);
 
+    if (fleet_secure_storage_err == ESP_OK)
+    {
+        printf(
+            "[SECURITY] encrypted Fleet storage READY\n");
+    }
+    else
+    {
+        printf(
+            "[SECURITY] encrypted Fleet storage unavailable: %s\n",
+            esp_err_to_name(fleet_secure_storage_err));
+    }
     esp_err_t fleet_err =
         mathos_fleet_init();
+    bool secure_migration_complete = false;
 
+    esp_err_t migration_state_err =
+        mathos_fleet_secure_migration_is_complete(
+            &secure_migration_complete);
+
+    if (migration_state_err != ESP_OK)
+    {
+        printf(
+            "[SECURITY] FATAL: secure migration state read failed: %s\n",
+            esp_err_to_name(migration_state_err));
+
+        printf(
+            "[SECURITY] RC startup BLOCKED\n");
+
+        return;
+    }
+
+    if (!secure_migration_complete)
+    {
+        uint16_t migrated_fleet_records = 0U;
+
+        esp_err_t fleet_migration_err =
+            mathos_fleet_migrate_legacy_to_secure(
+                &migrated_fleet_records);
+
+        if (fleet_migration_err != ESP_OK)
+        {
+            printf(
+                "[SECURITY] FATAL: secure Fleet migration failed: %s\n",
+                esp_err_to_name(fleet_migration_err));
+
+            printf(
+                "[SECURITY] RC startup BLOCKED\n");
+
+            return;
+        }
+
+        printf(
+            "[SECURITY] secure Fleet migration VERIFIED records=%u\n",
+            (unsigned int)migrated_fleet_records);
+
+        uint32_t migrated_rc_session = 0U;
+
+        mathos_secure_status_t rc_session_migration_status =
+            mathos_secure_migrate_session_counter(
+                MATHOS_RC_SESSION_LEGACY_PARTITION_NAME,
+                MATHOS_RC_SESSION_PARTITION_NAME,
+                &migrated_rc_session);
+
+        if (rc_session_migration_status !=
+            MATHOS_SECURE_STATUS_OK)
+        {
+            printf(
+                "[SECURITY] FATAL: RC session counter migration failed: %s\n",
+                mathos_secure_status_to_string(
+                    rc_session_migration_status));
+
+            printf(
+                "[SECURITY] RC startup BLOCKED\n");
+
+            return;
+        }
+
+        printf(
+            "[SECURITY] secure RC session counter migration VERIFIED value=%lu\n",
+            (unsigned long)migrated_rc_session);
+
+        esp_err_t migration_mark_err =
+            mathos_fleet_secure_migration_mark_complete();
+
+        if (migration_mark_err != ESP_OK)
+        {
+            printf(
+                "[SECURITY] FATAL: secure migration completion marker failed: %s\n",
+                esp_err_to_name(migration_mark_err));
+
+            printf(
+                "[SECURITY] RC startup BLOCKED\n");
+
+            return;
+        }
+
+        printf(
+            "[SECURITY] secure persistent-state migration COMPLETE\n");
+    }
+    else
+    {
+        printf(
+            "[SECURITY] secure persistent-state migration already complete\n");
+    }
     int fleet_store_available =
         fleet_err == ESP_OK;
 
@@ -10290,6 +10543,21 @@ the queued pairing callback in a later step.
         {
             mathos_maintenance_set_rc_pairing_callback(
                 rc_pairing_enqueue_request);
+
+            mathos_maintenance_set_rc_fleet_read_callback(
+                rc_fleet_read_maintenance_entry);
+
+            mathos_maintenance_set_rc_fleet_revoke_callback(
+                rc_fleet_revoke_maintenance_aircraft);
+
+            mathos_maintenance_set_rc_fleet_restore_callback(
+                rc_fleet_restore_maintenance_aircraft);
+
+            mathos_maintenance_set_rc_fleet_delete_callback(
+                rc_fleet_delete_maintenance_aircraft);
+
+            mathos_maintenance_set_rc_fleet_select_callback(
+                rc_fleet_select_maintenance_aircraft);
         }
         else
         {
@@ -10529,7 +10797,6 @@ the queued pairing callback in a later step.
 
     joystick_calibration_load_from_nvs();
 
-
     button_semaphore_arm =
         xSemaphoreCreateBinary();
 
@@ -10612,7 +10879,7 @@ the queued pairing callback in a later step.
     */
     mathos_secure_status_t tx_session_status =
         mathos_secure_reserve_session_id(
-            MATHOS_FLEET_PARTITION_NAME,
+            MATHOS_RC_SESSION_PARTITION_NAME,
             &mathos_session_id);
 
     if (tx_session_status !=

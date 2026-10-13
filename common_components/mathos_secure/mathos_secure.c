@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+
 #include "nvs.h"
 #include "mbedtls/chachapoly.h"
 #include "mbedtls/platform_util.h"
@@ -280,6 +281,199 @@ int mathos_secure_session_keys_are_set(void)
 {
     return mathos_session_keys_set;
 }
+
+
+mathos_secure_status_t mathos_secure_migrate_session_counter(
+    const char *source_partition_name,
+    const char *destination_partition_name,
+    uint32_t *verified_session_out)
+{
+    if (source_partition_name == NULL ||
+        destination_partition_name == NULL ||
+        source_partition_name[0] == '\0' ||
+        destination_partition_name[0] == '\0')
+    {
+        return MATHOS_SECURE_STATUS_BAD_ARGUMENT;
+    }
+
+    if (strcmp(
+            source_partition_name,
+            destination_partition_name) == 0)
+    {
+        return MATHOS_SECURE_STATUS_BAD_ARGUMENT;
+    }
+
+    if (verified_session_out != NULL)
+    {
+        *verified_session_out = 0U;
+    }
+
+    /*
+        Read the legacy/source counter.
+    */
+    nvs_handle_t source_handle;
+
+    esp_err_t err =
+        nvs_open_from_partition(
+            source_partition_name,
+            MATHOS_SECURE_SESSION_NAMESPACE,
+            NVS_READONLY,
+            &source_handle);
+
+    if (err != ESP_OK)
+    {
+        return MATHOS_SECURE_STATUS_STORAGE_FAILED;
+    }
+
+    uint32_t source_session = 0U;
+
+    esp_err_t source_err =
+        nvs_get_u32(
+            source_handle,
+            MATHOS_SECURE_SESSION_KEY,
+            &source_session);
+
+    nvs_close(source_handle);
+
+    if (source_err != ESP_OK &&
+        source_err != ESP_ERR_NVS_NOT_FOUND)
+    {
+        return MATHOS_SECURE_STATUS_STORAGE_FAILED;
+    }
+
+    /*
+        Read the destination counter.
+    */
+    nvs_handle_t destination_handle;
+
+    err =
+        nvs_open_from_partition(
+            destination_partition_name,
+            MATHOS_SECURE_SESSION_NAMESPACE,
+            NVS_READWRITE,
+            &destination_handle);
+
+    if (err != ESP_OK)
+    {
+        return MATHOS_SECURE_STATUS_STORAGE_FAILED;
+    }
+
+    uint32_t destination_session = 0U;
+
+    esp_err_t destination_err =
+        nvs_get_u32(
+            destination_handle,
+            MATHOS_SECURE_SESSION_KEY,
+            &destination_session);
+
+    if (destination_err != ESP_OK &&
+        destination_err != ESP_ERR_NVS_NOT_FOUND)
+    {
+        nvs_close(destination_handle);
+
+        return MATHOS_SECURE_STATUS_STORAGE_FAILED;
+    }
+
+    bool source_exists =
+        source_err == ESP_OK;
+
+    bool destination_exists =
+        destination_err == ESP_OK;
+
+    /*
+        At least one valid persistent counter must exist.
+    */
+    if (!source_exists &&
+        !destination_exists)
+    {
+        nvs_close(destination_handle);
+
+        return MATHOS_SECURE_STATUS_STORAGE_FAILED;
+    }
+
+    /*
+        Copy forward only.
+
+        Never reduce an already higher destination counter.
+    */
+    if (source_exists &&
+        (!destination_exists ||
+         destination_session < source_session))
+    {
+        err =
+            nvs_set_u32(
+                destination_handle,
+                MATHOS_SECURE_SESSION_KEY,
+                source_session);
+
+        if (err == ESP_OK)
+        {
+            err =
+                nvs_commit(
+                    destination_handle);
+        }
+
+        if (err != ESP_OK)
+        {
+            nvs_close(destination_handle);
+
+            return MATHOS_SECURE_STATUS_STORAGE_FAILED;
+        }
+
+        destination_session = 0U;
+
+        err =
+            nvs_get_u32(
+                destination_handle,
+                MATHOS_SECURE_SESSION_KEY,
+                &destination_session);
+
+        if (err != ESP_OK ||
+            destination_session != source_session)
+        {
+            nvs_close(destination_handle);
+
+            return MATHOS_SECURE_STATUS_STORAGE_FAILED;
+        }
+
+        destination_exists = true;
+    }
+
+    /*
+        If the legacy source has disappeared but the secure
+        destination exists, the secure value is already the
+        only valid authority.
+
+        Likewise, if the destination is ahead of the source,
+        never move it backward.
+    */
+    if (!destination_exists)
+    {
+        nvs_close(destination_handle);
+
+        return MATHOS_SECURE_STATUS_STORAGE_FAILED;
+    }
+
+    if (source_exists &&
+        destination_session < source_session)
+    {
+        nvs_close(destination_handle);
+
+        return MATHOS_SECURE_STATUS_STORAGE_FAILED;
+    }
+
+    if (verified_session_out != NULL)
+    {
+        *verified_session_out =
+            destination_session;
+    }
+
+    nvs_close(destination_handle);
+
+    return MATHOS_SECURE_STATUS_OK;
+}
+
+
 mathos_secure_status_t mathos_secure_reserve_session_id(
     const char *partition_name,
     uint32_t *session_id_out)
