@@ -1,0 +1,7 @@
+[35mcommon_components/mathos_maintenance/mathos_maintenance.c[m[36m:[m[32m14257[m[36m:[mstatic esp_err_t [1;31mmaintenance_rc_pairing_config_save_to_partition[m(
+[35mcommon_components/mathos_maintenance/mathos_maintenance.c[m[36m:[m[32m14498[m[36m:[m    return [1;31mmaintenance_rc_pairing_config_save_to_partition[m(
+[35mcommon_components/mathos_maintenance/mathos_maintenance.c[m[36m:[m[32m14506[m[36m:[m    return [1;31mmaintenance_rc_pairing_config_save_to_partition[m(
+[35mcommon_components/mathos_maintenance/mathos_maintenance.c[m[36m:[m[32m14725[m[36m:[mesp_err_t [1;31mmathos_rc_pairing_config_load[m(
+[35mcommon_components/mathos_maintenance/mathos_maintenance.c[m[36m:[m[32m14780[m[36m:[mesp_err_t [1;31mmathos_rc_pairing_config_load[m_enrollment(
+[35mcommon_components/mathos_maintenance/mathos_maintenance.c[m[36m:[m[32m14789[m[36m:[mesp_err_t [1;31mmathos_rc_pairing_config_load[m_legacy(
+[35mcommon_components/mathos_maintenance/mathos_maintenance.c[m[36m:[m[32m16607[m[36m:[m            [1;31mmathos_rc_pairing_config_load[m(

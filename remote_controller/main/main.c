@@ -244,6 +244,25 @@ static void gateway_status_handle_frame(
 #define SECURITY_TIMING_PRINT_EVERY 100
 #define SECURITY_TIMING_WARN_US 1000
 
+#define FEATURE_FLEET_PAIR_WRAP_MIGRATION 1
+
+/*
+    DEVELOPMENT ONLY.
+
+    While enabled, the RC uses a fixed operator PIN so the
+    real Fleet PIN/FMK security path can be developed and
+    tested without manual PIN entry after every reboot.
+
+    Production builds must set this to 0 and obtain the PIN
+    from the operator input interface.
+*/
+#define MATHOS_FLEET_DEV_HARDCODED_PIN_ENABLED 1
+
+#if MATHOS_FLEET_DEV_HARDCODED_PIN_ENABLED
+#define MATHOS_FLEET_DEV_OPERATOR_PIN "123456"
+#define MATHOS_FLEET_DEV_PIN_KDF_ITERATIONS 10000U
+#endif
+
 //////////////////// SECURITY LAYER
 #if DEBUG_SERIAL
 #define DBG_PRINT(...) printf(__VA_ARGS__)
@@ -6477,25 +6496,40 @@ static esp_err_t rc_pairing_send_commit_result_once(void)
     }
 
     /*
-        The runtime key must still match the authenticated
-        candidate and the current pairing attempt.
+        The persisted runtime metadata must describe the same
+        authenticated pairing candidate and current attempt.
+
+        The Pair Key itself remains only in the active pairing
+        session candidate during this phase.
     */
     if (!rc_runtime_pairing_loaded_from_nvs ||
-        !mathos_rc_pairing_config_is_valid(
-            &rc_runtime_pairing_config) ||
+
         rc_runtime_pairing_config.key_generation == 0U ||
+
+        rc_runtime_pairing_config.key_derivation_method !=
+            rc_pairing_session.rc_candidate
+                .key_derivation_method ||
+
+        rc_runtime_pairing_config.kdf_iteration_count !=
+            rc_pairing_session.rc_candidate
+                .kdf_iteration_count ||
+
+        memcmp(
+            rc_runtime_pairing_config.pairing_salt,
+            rc_pairing_session.rc_candidate.pairing_salt,
+            sizeof(rc_runtime_pairing_config.pairing_salt)) != 0 ||
+
         rc_runtime_pairing_config.key_generation !=
             rc_pairing_session.key_generation ||
+
         rc_runtime_pairing_config.key_generation !=
             rc_pairing_session.challenge.key_generation ||
+
         rc_runtime_pairing_config.rc_id !=
             rc_pairing_session.challenge.rc_id ||
+
         rc_runtime_pairing_config.authorised_gateway_id !=
-            rc_pairing_session.challenge.gateway_id ||
-        !rc_pairing_secret_matches(
-            rc_runtime_pairing_config.root_key,
-            rc_pairing_session.rc_candidate.root_key,
-            sizeof(rc_runtime_pairing_config.root_key)))
+            rc_pairing_session.challenge.gateway_id)
     {
         return ESP_ERR_INVALID_STATE;
     }
@@ -6508,7 +6542,7 @@ static esp_err_t rc_pairing_send_commit_result_once(void)
     size_t frame_len = 0;
 
     esp_err_t err = mathos_pairing_result_create(
-        rc_runtime_pairing_config.root_key,
+        rc_pairing_session.rc_candidate.root_key,
         &rc_pairing_session.challenge,
         rc_pairing_session.rc_nonce,
         MATHOS_PAIRING_RESULT_RC_COMMITTED,
@@ -6773,25 +6807,40 @@ static esp_err_t rc_pairing_verify_gateway_commit_result(
     }
 
     /*
-        Authenticate against the locally committed key and
-        the original challenge, not received metadata alone.
+        Authenticate against the metadata that was locally
+        committed and the original pairing attempt.
+
+        Cryptographic authentication uses the transient
+        authenticated pairing-session candidate Pair Key.
     */
     if (!rc_runtime_pairing_loaded_from_nvs ||
-        !mathos_rc_pairing_config_is_valid(
-            &rc_runtime_pairing_config) ||
+
         rc_runtime_pairing_config.key_generation == 0U ||
+
+        rc_runtime_pairing_config.key_derivation_method !=
+            rc_pairing_session.rc_candidate
+                .key_derivation_method ||
+
+        rc_runtime_pairing_config.kdf_iteration_count !=
+            rc_pairing_session.rc_candidate
+                .kdf_iteration_count ||
+
+        memcmp(
+            rc_runtime_pairing_config.pairing_salt,
+            rc_pairing_session.rc_candidate.pairing_salt,
+            sizeof(rc_runtime_pairing_config.pairing_salt)) != 0 ||
+
         rc_runtime_pairing_config.key_generation !=
             rc_pairing_session.key_generation ||
+
         rc_runtime_pairing_config.key_generation !=
             rc_pairing_session.challenge.key_generation ||
+
         rc_runtime_pairing_config.rc_id !=
             rc_pairing_session.challenge.rc_id ||
+
         rc_runtime_pairing_config.authorised_gateway_id !=
-            rc_pairing_session.challenge.gateway_id ||
-        !rc_pairing_secret_matches(
-            rc_runtime_pairing_config.root_key,
-            rc_pairing_session.rc_candidate.root_key,
-            sizeof(rc_runtime_pairing_config.root_key)))
+            rc_pairing_session.challenge.gateway_id)
     {
         return ESP_ERR_INVALID_STATE;
     }
@@ -6806,7 +6855,7 @@ static esp_err_t rc_pairing_verify_gateway_commit_result(
     if (err == ESP_OK)
     {
         err = mathos_pairing_result_verify(
-            rc_runtime_pairing_config.root_key,
+            rc_pairing_session.rc_candidate.root_key,
             &rc_pairing_session.challenge,
             rc_pairing_session.rc_nonce,
             &gateway_result,
@@ -6949,7 +6998,11 @@ rc_pairing_commit_verified_candidate(void)
         and regenerates CRC, so we intentionally do NOT
         compare the complete structs byte-for-byte here.
 
-        Compare the security-critical pairing fields.
+        Verify only the persistent pairing metadata.
+
+        The Pair Key remains authoritative in the authenticated
+        pairing-session candidate and is persisted separately
+        by Fleet Store in wrapped form.
     */
     int persisted_matches_candidate =
         loaded_config.rc_id ==
@@ -6970,11 +7023,6 @@ rc_pairing_commit_verified_candidate(void)
         loaded_config.kdf_iteration_count ==
             rc_pairing_session.rc_candidate
                 .kdf_iteration_count &&
-
-        memcmp(
-            loaded_config.root_key,
-            rc_pairing_session.rc_candidate.root_key,
-            sizeof(loaded_config.root_key)) == 0 &&
 
         memcmp(
             loaded_config.pairing_salt,
@@ -7048,6 +7096,52 @@ rc_pairing_commit_verified_candidate(void)
         return ESP_FAIL;
     }
 
+    /*
+        Fleet credentials must never be persisted as a raw
+        Pair Key.
+
+        The authenticated Pair Key remains in the active
+        pairing-session candidate in RAM.
+
+        Wrap that transient key for persistent Fleet storage
+        before committing the aircraft record.
+    */
+    uint8_t wrapped_pair_key_blob[MATHOS_FLEET_SECRET_BLOB_MAX_LEN];
+
+    memset(
+        wrapped_pair_key_blob,
+        0,
+        sizeof(wrapped_pair_key_blob));
+
+    uint16_t wrapped_pair_key_blob_len = 0U;
+
+    esp_err_t fleet_wrap_err =
+        mathos_fleet_wrap_pair_key(
+            &rc_pairing_session.challenge.gateway_uid,
+            loaded_config.key_generation,
+            rc_pairing_session.rc_candidate.root_key,
+            wrapped_pair_key_blob,
+            (uint16_t)sizeof(wrapped_pair_key_blob),
+            &wrapped_pair_key_blob_len);
+
+    if (fleet_wrap_err != ESP_OK)
+    {
+        printf(
+            "[PAIRING COMMIT] Fleet Pair Key wrap FAILED "
+            "error=%s\n",
+            esp_err_to_name(fleet_wrap_err));
+
+        rc_pairing_clear_sensitive_memory(
+            wrapped_pair_key_blob,
+            sizeof(wrapped_pair_key_blob));
+
+        rc_pairing_clear_sensitive_memory(
+            &loaded_config,
+            sizeof(loaded_config));
+
+        return fleet_wrap_err;
+    }
+
     mathos_fleet_pairing_store_result_t
         fleet_store_result =
             MATHOS_FLEET_PAIRING_STORE_NONE;
@@ -7060,11 +7154,19 @@ rc_pairing_commit_verified_candidate(void)
             &rc_pairing_session.challenge.gateway_uid,
             friendly_name,
             loaded_config.key_generation,
-            MATHOS_FLEET_SECRET_FORMAT_DEV_RAW_PAIR_KEY,
-            loaded_config.root_key,
-            (uint16_t)sizeof(loaded_config.root_key),
+            MATHOS_FLEET_SECRET_FORMAT_WRAPPED_PAIR_KEY_V1,
+            wrapped_pair_key_blob,
+            wrapped_pair_key_blob_len,
             &fleet_store_result,
             &fleet_slot);
+
+    /*
+        Fleet Store has copied or rejected the credential.
+        The temporary wrapped envelope is no longer needed.
+    */
+    rc_pairing_clear_sensitive_memory(
+        wrapped_pair_key_blob,
+        sizeof(wrapped_pair_key_blob));
 
     if (fleet_store_err != ESP_OK)
     {
@@ -7098,8 +7200,9 @@ rc_pairing_commit_verified_candidate(void)
     mathos_secure_status_t
         secure_key_status =
             mathos_secure_set_key(
-                loaded_config.root_key,
-                (uint32_t)sizeof(loaded_config.root_key));
+                rc_pairing_session.rc_candidate.root_key,
+                (uint32_t)sizeof(
+                    rc_pairing_session.rc_candidate.root_key));
 
     if (secure_key_status !=
             MATHOS_SECURE_STATUS_OK ||
@@ -10267,6 +10370,32 @@ void app_main(void)
         mathos_rc_pairing_config_load(
             &rc_runtime_pairing_config,
             &rc_runtime_pairing_loaded_from_nvs);
+
+    mathos_rc_pairing_enrollment_format_t
+        pairing_enrollment_format =
+            MATHOS_RC_PAIRING_ENROLLMENT_FORMAT_NONE;
+
+    esp_err_t pairing_format_err =
+        mathos_rc_pairing_config_enrollment_format(
+            &pairing_enrollment_format);
+
+    if (pairing_format_err != ESP_OK)
+    {
+        printf(
+            "[PAIRING] FATAL: enrollment format detection failed "
+            "error=%s\n",
+            esp_err_to_name(pairing_format_err));
+
+        printf(
+            "[SECURITY] RC startup BLOCKED\n");
+
+        return;
+    }
+
+    printf(
+        "[PAIRING] enrollment format=%u\n",
+        (unsigned int)pairing_enrollment_format);
+
     esp_err_t fleet_secure_storage_err =
         mathos_fleet_secure_storage_init(
             MATHOS_RC_STORAGE_HMAC_KEY_ID);
@@ -10275,6 +10404,24 @@ void app_main(void)
     {
         printf(
             "[SECURITY] encrypted Fleet storage READY\n");
+
+        esp_err_t pair_wrap_test_err =
+            mathos_fleet_pair_wrap_self_test();
+
+        if (pair_wrap_test_err != ESP_OK)
+        {
+            printf(
+                "[SECURITY] FATAL: Pair-key wrapping self-test failed: %s\n",
+                esp_err_to_name(pair_wrap_test_err));
+
+            printf(
+                "[SECURITY] RC startup BLOCKED\n");
+
+            return;
+        }
+
+        printf(
+            "[SECURITY] Pair-key wrapping self-test PASSED\n");
     }
     else
     {
@@ -10407,6 +10554,82 @@ void app_main(void)
         printf(
             "[FLEET] dedicated Fleet Store initialized\n");
     }
+
+    if (fleet_store_available)
+    {
+#if MATHOS_FLEET_DEV_HARDCODED_PIN_ENABLED
+
+        bool fmk_unlock_record_exists = false;
+
+        esp_err_t fmk_record_err =
+            mathos_fleet_fmk_unlock_record_exists(
+                &fmk_unlock_record_exists);
+
+        if (fmk_record_err != ESP_OK)
+        {
+            printf(
+                "[SECURITY] FATAL: FMK unlock record inspection failed: %s\n",
+                esp_err_to_name(fmk_record_err));
+
+            printf(
+                "[SECURITY] RC startup BLOCKED\n");
+
+            return;
+        }
+
+        if (!fmk_unlock_record_exists)
+        {
+            printf(
+                "[SECURITY] DEV: provisioning Fleet Master Key\n");
+
+            esp_err_t fmk_provision_err =
+                mathos_fleet_provision_master_key(
+                    MATHOS_FLEET_DEV_OPERATOR_PIN,
+                    MATHOS_FLEET_DEV_PIN_KDF_ITERATIONS);
+
+            if (fmk_provision_err != ESP_OK)
+            {
+                printf(
+                    "[SECURITY] FATAL: FMK provisioning failed: %s\n",
+                    esp_err_to_name(fmk_provision_err));
+
+                printf(
+                    "[SECURITY] RC startup BLOCKED\n");
+
+                return;
+            }
+
+            printf(
+                "[SECURITY] DEV: Fleet Master Key provisioned\n");
+        }
+        else
+        {
+            printf(
+                "[SECURITY] FMK unlock record present\n");
+        }
+
+        esp_err_t fmk_unlock_err =
+            mathos_fleet_unlock_master_key(
+                MATHOS_FLEET_DEV_OPERATOR_PIN);
+
+        if (fmk_unlock_err != ESP_OK)
+        {
+            printf(
+                "[SECURITY] FATAL: Fleet Master Key unlock failed: %s\n",
+                esp_err_to_name(fmk_unlock_err));
+
+            printf(
+                "[SECURITY] RC startup BLOCKED\n");
+
+            return;
+        }
+
+        printf(
+            "[SECURITY] DEV: Fleet Master Key UNLOCKED\n");
+
+#endif
+    }
+
     if (pairing_load_err != ESP_OK)
     {
         printf(
@@ -10702,13 +10925,104 @@ the queued pairing callback in a later step.
         (unsigned long)
             rc_runtime_pairing_config
                 .configuration_counter);
-    /*
-        Transitional consistency guard.
+#if FEATURE_FLEET_PAIR_WRAP_MIGRATION
 
-        Until Fleet Store becomes the only authoritative
-        credential source, both persistent records must
-        describe exactly the same pairing generation and key.
+    bool fleet_pair_key_migrated = false;
+
+    esp_err_t fleet_pair_key_migration_err =
+        mathos_fleet_migrate_pair_key_to_wrapped(
+            rc_fleet_selected_slot,
+            &fleet_pair_key_migrated);
+
+    if (fleet_pair_key_migration_err != ESP_OK)
+    {
+        mathos_secure_clear_key();
+
+        printf(
+            "[SECURITY] FATAL: Fleet Pair Key migration failed "
+            "error=%s\n",
+            esp_err_to_name(
+                fleet_pair_key_migration_err));
+
+        return;
+    }
+
+    if (fleet_pair_key_migrated)
+    {
+        /*
+            The persistent record changed from RAW to WRAPPED.
+            Reload it so this SAME boot exercises the wrapped
+            credential path below.
+        */
+        memset(
+            &rc_fleet_selected_record,
+            0,
+            sizeof(rc_fleet_selected_record));
+
+        esp_err_t fleet_reload_err =
+            mathos_fleet_record_load_slot(
+                rc_fleet_selected_slot,
+                &rc_fleet_selected_record);
+
+        if (fleet_reload_err != ESP_OK)
+        {
+            mathos_secure_clear_key();
+
+            printf(
+                "[SECURITY] FATAL: migrated Fleet record "
+                "reload failed error=%s\n",
+                esp_err_to_name(
+                    fleet_reload_err));
+
+            return;
+        }
+
+        if (rc_fleet_selected_record.secret_format !=
+            MATHOS_FLEET_SECRET_FORMAT_WRAPPED_PAIR_KEY_V1)
+        {
+            mathos_secure_clear_key();
+
+            printf(
+                "[SECURITY] FATAL: migrated Fleet record "
+                "is not WRAPPED_PAIR_KEY_V1\n");
+
+            return;
+        }
+
+        printf(
+            "[SECURITY] Fleet Pair Key migrated "
+            "RAW -> WRAPPED_PAIR_KEY_V1 "
+            "slot=%u generation=%lu\n",
+            (unsigned int)rc_fleet_selected_slot,
+            (unsigned long)
+                rc_fleet_selected_record.key_generation);
+    }
+    else
+    {
+        printf(
+            "[SECURITY] Fleet Pair Key already "
+            "WRAPPED_PAIR_KEY_V1 "
+            "slot=%u generation=%lu\n",
+            (unsigned int)rc_fleet_selected_slot,
+            (unsigned long)
+                rc_fleet_selected_record.key_generation);
+    }
+
+#endif
+    /*
+        Fleet Store is the persistent Pair-Key authority.
+
+        Enrollment persistence supplies only pairing metadata.
+        Require the active Fleet credential to describe the same
+        pairing generation, then obtain its Pair Key temporarily
+        in RAM.
+
+        For WRAPPED_PAIR_KEY_V1, successful unwrap authenticates
+        the stored credential before the plaintext key is installed
+        into the operational secure-link engine.
     */
+    uint8_t fleet_pair_key[sizeof(rc_runtime_pairing_config.root_key)] = {0};
+
     int fleet_pairing_consistent =
         rc_runtime_pairing_loaded_from_nvs &&
 
@@ -10719,22 +11033,78 @@ the queued pairing callback in a later step.
         rc_fleet_selected_record.state ==
             MATHOS_FLEET_STATE_ACTIVE &&
 
-        rc_fleet_selected_record.secret_format ==
-            MATHOS_FLEET_SECRET_FORMAT_DEV_RAW_PAIR_KEY &&
-
-        rc_fleet_selected_record.secret_blob_len ==
-            sizeof(rc_runtime_pairing_config.root_key) &&
-
         rc_fleet_selected_record.key_generation ==
-            rc_runtime_pairing_config.key_generation &&
+            rc_runtime_pairing_config.key_generation;
 
-        rc_pairing_secret_matches(
-            rc_fleet_selected_record.secret_blob,
-            rc_runtime_pairing_config.root_key,
-            sizeof(rc_runtime_pairing_config.root_key));
+    if (fleet_pairing_consistent)
+    {
+        if (rc_fleet_selected_record.secret_format ==
+                MATHOS_FLEET_SECRET_FORMAT_DEV_RAW_PAIR_KEY &&
+            rc_fleet_selected_record.secret_blob_len ==
+                sizeof(fleet_pair_key))
+        {
+            memcpy(
+                fleet_pair_key,
+                rc_fleet_selected_record.secret_blob,
+                sizeof(fleet_pair_key));
+        }
+        else if (rc_fleet_selected_record.secret_format ==
+                 MATHOS_FLEET_SECRET_FORMAT_WRAPPED_PAIR_KEY_V1)
+        {
+            esp_err_t unwrap_err =
+                mathos_fleet_unwrap_pair_key(
+                    &rc_fleet_selected_record,
+                    fleet_pair_key);
 
+            if (unwrap_err != ESP_OK)
+            {
+                printf(
+                    "[PAIRING] Fleet Pair Key unwrap FAILED "
+                    "error=%s\n",
+                    esp_err_to_name(unwrap_err));
+
+                fleet_pairing_consistent = 0;
+            }
+        }
+        else
+        {
+            fleet_pairing_consistent = 0;
+        }
+    }
+    /*
+        One-time legacy enrollment verification.
+
+        A LEGACY_FULL enrollment record still contains the
+        historical raw Pair Key. Before that record may ever be
+        retired, prove that it matches the authoritative Fleet
+        credential obtained above.
+
+        Metadata-only enrollment contains no Pair Key and therefore
+        must not perform this comparison.
+    */
+    if (fleet_pairing_consistent &&
+        pairing_enrollment_format ==
+            MATHOS_RC_PAIRING_ENROLLMENT_FORMAT_LEGACY_FULL)
+    {
+        fleet_pairing_consistent =
+            rc_pairing_secret_matches(
+                fleet_pair_key,
+                rc_runtime_pairing_config.root_key,
+                sizeof(fleet_pair_key));
+
+        if (!fleet_pairing_consistent)
+        {
+            printf(
+                "[PAIRING] LEGACY enrollment Pair Key "
+                "does not match Fleet credential\n");
+        }
+    }
     if (!fleet_pairing_consistent)
     {
+        rc_pairing_clear_sensitive_memory(
+            fleet_pair_key,
+            sizeof(fleet_pair_key));
+
         mathos_secure_clear_key();
 
         printf(
@@ -10743,30 +11113,213 @@ the queued pairing callback in a later step.
 
         return;
     }
+    /*
+        One-time enrollment migration.
 
+        Reaching this point with LEGACY_FULL means:
+            - the Fleet record is ACTIVE,
+            - generations agree,
+            - the Fleet credential was successfully obtained,
+            - the legacy enrollment Pair Key matched it.
+
+        It is therefore safe to replace the old full enrollment
+        record with metadata-only persistence.
+    */
+    if (pairing_enrollment_format ==
+        MATHOS_RC_PAIRING_ENROLLMENT_FORMAT_LEGACY_FULL)
+    {
+        printf(
+            "[PAIRING] legacy enrollment credential verified; "
+            "migrating to metadata-only storage\n");
+
+        esp_err_t enrollment_migration_err =
+            mathos_rc_pairing_config_save(
+                &rc_runtime_pairing_config);
+
+        if (enrollment_migration_err != ESP_OK)
+        {
+            rc_pairing_clear_sensitive_memory(
+                fleet_pair_key,
+                sizeof(fleet_pair_key));
+
+            mathos_secure_clear_key();
+
+            printf(
+                "[PAIRING] FATAL: enrollment metadata migration "
+                "write failed error=%s\n",
+                esp_err_to_name(
+                    enrollment_migration_err));
+
+            return;
+        }
+
+        mathos_rc_pairing_enrollment_format_t
+            migrated_format =
+                MATHOS_RC_PAIRING_ENROLLMENT_FORMAT_NONE;
+
+        esp_err_t migrated_format_err =
+            mathos_rc_pairing_config_enrollment_format(
+                &migrated_format);
+
+        if (migrated_format_err != ESP_OK ||
+            migrated_format !=
+                MATHOS_RC_PAIRING_ENROLLMENT_FORMAT_METADATA_ONLY)
+        {
+            rc_pairing_clear_sensitive_memory(
+                fleet_pair_key,
+                sizeof(fleet_pair_key));
+
+            mathos_secure_clear_key();
+
+            printf(
+                "[PAIRING] FATAL: enrollment metadata migration "
+                "verification failed error=%s format=%u\n",
+                esp_err_to_name(
+                    migrated_format_err),
+                (unsigned int)migrated_format);
+
+            return;
+        }
+        /*
+            Exercise the normal production loader against the record
+            that was just migrated.
+
+            A metadata-only record must reload successfully while
+            producing a runtime compatibility view with no Pair Key.
+        */
+        mathos_rc_pairing_config_t
+            migrated_config;
+
+        memset(
+            &migrated_config,
+            0,
+            sizeof(migrated_config));
+
+        int migrated_loaded_from_nvs = 0;
+
+        esp_err_t migrated_load_err =
+            mathos_rc_pairing_config_load(
+                &migrated_config,
+                &migrated_loaded_from_nvs);
+
+        if (migrated_load_err != ESP_OK ||
+            !migrated_loaded_from_nvs)
+        {
+            rc_pairing_clear_sensitive_memory(
+                &migrated_config,
+                sizeof(migrated_config));
+
+            rc_pairing_clear_sensitive_memory(
+                fleet_pair_key,
+                sizeof(fleet_pair_key));
+
+            mathos_secure_clear_key();
+
+            printf(
+                "[PAIRING] FATAL: migrated enrollment reload failed "
+                "error=%s loaded=%d\n",
+                esp_err_to_name(migrated_load_err),
+                migrated_loaded_from_nvs);
+
+            return;
+        }
+
+        int migrated_metadata_matches =
+            migrated_config.rc_id ==
+                rc_runtime_pairing_config.rc_id &&
+
+            migrated_config.authorised_gateway_id ==
+                rc_runtime_pairing_config.authorised_gateway_id &&
+
+            migrated_config.key_derivation_method ==
+                rc_runtime_pairing_config.key_derivation_method &&
+
+            migrated_config.key_generation ==
+                rc_runtime_pairing_config.key_generation &&
+
+            migrated_config.kdf_iteration_count ==
+                rc_runtime_pairing_config.kdf_iteration_count &&
+
+            memcmp(
+                migrated_config.pairing_salt,
+                rc_runtime_pairing_config.pairing_salt,
+                sizeof(migrated_config.pairing_salt)) == 0;
+
+        uint8_t zero_pair_key[MATHOS_GATEWAY_ROOT_KEY_LEN] = {0};
+
+        int migrated_root_key_is_empty =
+            memcmp(
+                migrated_config.root_key,
+                zero_pair_key,
+                sizeof(migrated_config.root_key)) == 0;
+
+        rc_pairing_clear_sensitive_memory(
+            zero_pair_key,
+            sizeof(zero_pair_key));
+
+        if (!migrated_metadata_matches ||
+            !migrated_root_key_is_empty)
+        {
+            rc_pairing_clear_sensitive_memory(
+                &migrated_config,
+                sizeof(migrated_config));
+
+            rc_pairing_clear_sensitive_memory(
+                fleet_pair_key,
+                sizeof(fleet_pair_key));
+
+            mathos_secure_clear_key();
+
+            printf(
+                "[PAIRING] FATAL: migrated enrollment reload "
+                "verification failed metadata=%d root_key_empty=%d\n",
+                migrated_metadata_matches,
+                migrated_root_key_is_empty);
+
+            return;
+        }
+
+        rc_pairing_clear_sensitive_memory(
+            &migrated_config,
+            sizeof(migrated_config));
+
+        printf(
+            "[PAIRING] metadata-only enrollment reload VERIFIED "
+            "root_key_persisted=0\n");
+        pairing_enrollment_format =
+            MATHOS_RC_PAIRING_ENROLLMENT_FORMAT_METADATA_ONLY;
+
+        printf(
+            "[PAIRING] enrollment migration VERIFIED "
+            "LEGACY_FULL -> METADATA_ONLY\n");
+    }
     printf(
         "[PAIRING] Fleet consistency PASSED "
         "slot=%u generation=%lu\n",
         (unsigned int)rc_fleet_selected_slot,
         (unsigned long)
             rc_fleet_selected_record.key_generation);
-    /*
-        The Fleet-selected aircraft is now the authoritative
-        source of the operational Pair Key.
 
-        The consistency guard above already proved that the
-        transitional RC pairing record matches it.
+    /*
+        Install the authenticated Pair Key obtained from
+        the Fleet credential.
+
+        For WRAPPED_PAIR_KEY_V1 this plaintext exists only
+        temporarily in RAM.
     */
     mathos_secure_status_t secure_key_status =
         mathos_secure_set_key(
-            rc_fleet_selected_record.secret_blob,
-            (uint32_t)
-                rc_fleet_selected_record.secret_blob_len);
+            fleet_pair_key,
+            (uint32_t)sizeof(fleet_pair_key));
 
     if (secure_key_status !=
             MATHOS_SECURE_STATUS_OK ||
         !mathos_secure_key_is_set())
     {
+        rc_pairing_clear_sensitive_memory(
+            fleet_pair_key,
+            sizeof(fleet_pair_key));
+
         printf(
             "[PAIRING] FATAL: failed to install "
             "Fleet operational security key "
@@ -10780,8 +11333,19 @@ the queued pairing callback in a later step.
     }
 
     /*
-        The legacy record is no longer the active key source.
-        Remove its duplicate plaintext key from runtime RAM.
+        Operational secure-link engine now owns its key copy.
+        Remove our temporary plaintext Fleet copy immediately.
+    */
+    rc_pairing_clear_sensitive_memory(
+        fleet_pair_key,
+        sizeof(fleet_pair_key));
+
+    /*
+        Defensive cleanup.
+
+        Legacy full enrollment records may still have populated
+        root_key during the transition. Metadata-only records
+        already contain zero here.
     */
     rc_pairing_clear_sensitive_memory(
         rc_runtime_pairing_config.root_key,

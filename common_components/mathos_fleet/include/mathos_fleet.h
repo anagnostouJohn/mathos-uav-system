@@ -83,7 +83,15 @@ extern "C"
 
         MATHOS_FLEET_SECRET_FORMAT_DEV_RAW_PAIR_KEY,
 
-        MATHOS_FLEET_SECRET_FORMAT_WRAPPED_PAIR_KEY_V1
+        MATHOS_FLEET_SECRET_FORMAT_WRAPPED_PAIR_KEY_V1,
+
+        /*
+            PIN-gated production credential.
+
+            The Pair Key is wrapped using a key derived from an
+            unlocked Fleet Master Key rather than directly from KEY5.
+        */
+        MATHOS_FLEET_SECRET_FORMAT_WRAPPED_PAIR_KEY_V2
 
     } mathos_fleet_secret_format_t;
 
@@ -113,7 +121,6 @@ extern "C"
                 Drone 17
         */
         char friendly_name[MATHOS_FLEET_FRIENDLY_NAME_LEN];
-
         /*
             Generation of this RC <-> Gateway
             permanent relationship key.
@@ -175,6 +182,14 @@ extern "C"
 */
     esp_err_t mathos_fleet_secure_migration_is_complete(
         bool *complete_out);
+    esp_err_t mathos_fleet_fmk_unlock_record_exists(
+        bool *exists_out);
+    esp_err_t mathos_fleet_unlock_master_key(
+        const char *pin);
+
+    esp_err_t mathos_fleet_provision_master_key(
+    const char *pin,
+    uint32_t iteration_count);
 
     esp_err_t mathos_fleet_secure_migration_mark_complete(void);
     esp_err_t mathos_fleet_delete_aircraft(
@@ -208,6 +223,22 @@ extern "C"
     esp_err_t mathos_fleet_secure_storage_init(
         uint8_t hmac_key_id);
 
+    esp_err_t mathos_fleet_migrate_pair_key_to_wrapped(
+        uint16_t slot,
+        bool *migrated_out);
+
+    esp_err_t mathos_fleet_pair_wrap_self_test(void);
+    esp_err_t mathos_fleet_unwrap_pair_key(
+        const mathos_fleet_record_t *record,
+        uint8_t out_pair_key[MATHOS_FLEET_PAIR_KEY_LEN]);
+
+    esp_err_t mathos_fleet_wrap_pair_key(
+        const mathos_device_uid_t *gateway_uid,
+        uint32_t key_generation,
+        const uint8_t pair_key[MATHOS_FLEET_PAIR_KEY_LEN],
+        uint8_t *out_wrapped_blob,
+        uint16_t out_wrapped_blob_capacity,
+        uint16_t *out_wrapped_blob_len);
     esp_err_t mathos_fleet_selected_uid_clear(void);
     /*
         Revoke an enrolled aircraft.

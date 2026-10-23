@@ -123,6 +123,40 @@ extern "C"
         uint32_t crc32;
     } mathos_rc_pairing_config_t;
 
+/*
+    Persistent RC pairing metadata.
+
+    The operational Pair Key is intentionally NOT stored
+    in this record. Fleet Store is the sole persistent
+    credential authority.
+
+    pairing_salt is public KDF metadata, not secret key
+    material, and is retained so the enrolled generation
+    remains fully described.
+*/
+typedef struct
+{
+    uint32_t magic;
+    uint16_t version;
+    uint16_t record_size;
+
+    uint8_t rc_id;
+    uint8_t authorised_gateway_id;
+    uint8_t key_derivation_method;
+    uint8_t reserved0;
+
+    uint32_t key_generation;
+    uint32_t kdf_iteration_count;
+
+    uint8_t pairing_salt[MATHOS_PAIRING_SALT_LEN];
+
+    uint8_t reserved1[4];
+
+    uint32_t configuration_counter;
+    uint32_t crc32;
+
+} mathos_rc_pairing_metadata_t;
+
     typedef struct
     {
         uint32_t magic;
@@ -970,25 +1004,41 @@ maintenance web interface.
     void mathos_maintenance_set_rc_pairing_status(
         mathos_maintenance_rc_pairing_status_t status);
 
+    /*
+    Persistent RC enrollment record format.
+
+    LEGACY_FULL contains the historical complete pairing
+    configuration, including root_key.
+
+    METADATA_ONLY contains no persistent Pair Key.
+*/
+    typedef enum
+    {
+        MATHOS_RC_PAIRING_ENROLLMENT_FORMAT_NONE = 0,
+        MATHOS_RC_PAIRING_ENROLLMENT_FORMAT_LEGACY_FULL,
+        MATHOS_RC_PAIRING_ENROLLMENT_FORMAT_METADATA_ONLY
+
+    } mathos_rc_pairing_enrollment_format_t;
+
+    /*
+        Identify the persistent enrollment record format without
+        loading or interpreting Pair Key material.
+    */
+    esp_err_t mathos_rc_pairing_config_enrollment_format(
+        mathos_rc_pairing_enrollment_format_t *format);
+
     esp_err_t mathos_rc_pairing_config_save(
         const mathos_rc_pairing_config_t *config);
-
-    esp_err_t mathos_rc_pairing_config_enrollment_exists(
-        int *exists);
 
     esp_err_t mathos_rc_pairing_config_load_legacy(
         mathos_rc_pairing_config_t *config,
         int *loaded_from_nvs);
 
-    esp_err_t mathos_rc_pairing_config_save_enrollment(
-        const mathos_rc_pairing_config_t *config);
 
     esp_err_t mathos_rc_pairing_config_load(
         mathos_rc_pairing_config_t *config,
         int *loaded_from_nvs);
-    esp_err_t mathos_rc_pairing_config_load_enrollment(
-        mathos_rc_pairing_config_t *config,
-        int *loaded_from_nvs);
+
     esp_err_t mathos_pairing_package_from_gateway_config(
         const mathos_gateway_config_t *gateway_config,
         const mathos_device_uid_t *gateway_uid,

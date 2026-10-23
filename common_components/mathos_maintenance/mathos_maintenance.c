@@ -1974,6 +1974,54 @@ static uint32_t mathos_rc_enrollment_config_calculate_crc32(
 
     return ~crc;
 }
+static uint32_t mathos_rc_pairing_metadata_calculate_crc32(
+    const mathos_rc_pairing_metadata_t *metadata)
+{
+    if (metadata == NULL)
+    {
+        return 0;
+    }
+
+    /*
+        Work on a copy so the CRC field is excluded
+        from its own calculation.
+    */
+    mathos_rc_pairing_metadata_t copy =
+        *metadata;
+
+    copy.crc32 = 0;
+
+    const uint8_t *data =
+        (const uint8_t *)&copy;
+
+    uint32_t crc =
+        0xFFFFFFFFU;
+
+    for (size_t i = 0;
+         i < sizeof(copy);
+         i++)
+    {
+        crc ^= data[i];
+
+        for (int bit = 0;
+             bit < 8;
+             bit++)
+        {
+            if (crc & 1U)
+            {
+                crc =
+                    (crc >> 1) ^
+                    0xEDB88320U;
+            }
+            else
+            {
+                crc >>= 1;
+            }
+        }
+    }
+
+    return ~crc;
+}
 
 esp_err_t mathos_rc_enrollment_config_set_defaults(
     mathos_rc_enrollment_config_t *config,
@@ -10553,6 +10601,106 @@ int mathos_rc_pairing_config_is_valid(
     return 1;
 }
 
+static int mathos_rc_pairing_metadata_is_valid(
+    const mathos_rc_pairing_metadata_t *metadata)
+{
+    if (metadata == NULL)
+    {
+        return 0;
+    }
+
+    if (metadata->magic != MATHOS_RC_PAIRING_CONFIG_MAGIC ||
+        metadata->version != MATHOS_RC_PAIRING_CONFIG_VERSION ||
+        metadata->record_size != sizeof(mathos_rc_pairing_metadata_t))
+    {
+        return 0;
+    }
+
+    if (metadata->rc_id == 0 ||
+        metadata->rc_id == UINT8_MAX ||
+        metadata->authorised_gateway_id == 0 ||
+        metadata->authorised_gateway_id == UINT8_MAX ||
+        metadata->rc_id == metadata->authorised_gateway_id)
+    {
+        return 0;
+    }
+
+    if (metadata->reserved0 != 0)
+    {
+        return 0;
+    }
+
+    for (size_t i = 0; i < sizeof(metadata->reserved1); i++)
+    {
+        if (metadata->reserved1[i] != 0)
+        {
+            return 0;
+        }
+    }
+
+    int pairing_salt_is_set = 0;
+
+    for (size_t i = 0; i < sizeof(metadata->pairing_salt); i++)
+    {
+        if (metadata->pairing_salt[i] != 0)
+        {
+            pairing_salt_is_set = 1;
+            break;
+        }
+    }
+
+    if (metadata->key_generation == 0)
+    {
+        if (pairing_salt_is_set ||
+            metadata->key_derivation_method !=
+                MATHOS_GATEWAY_KEY_DERIVATION_NONE ||
+            metadata->kdf_iteration_count != 0)
+        {
+            return 0;
+        }
+    }
+    else if (metadata->key_derivation_method ==
+             MATHOS_GATEWAY_KEY_DERIVATION_RAW_HEX)
+    {
+        if (pairing_salt_is_set ||
+            metadata->kdf_iteration_count != 0)
+        {
+            return 0;
+        }
+    }
+    else if (metadata->key_derivation_method ==
+             MATHOS_GATEWAY_KEY_DERIVATION_PBKDF2_SHA256)
+    {
+        if (!pairing_salt_is_set)
+        {
+            return 0;
+        }
+
+        if (metadata->kdf_iteration_count <
+                MATHOS_PAIRING_KDF_MIN_ITERATIONS ||
+            metadata->kdf_iteration_count >
+                MATHOS_PAIRING_KDF_MAX_ITERATIONS)
+        {
+            return 0;
+        }
+    }
+    else
+    {
+        return 0;
+    }
+
+    uint32_t expected_crc =
+        mathos_rc_pairing_metadata_calculate_crc32(
+            metadata);
+
+    if (metadata->crc32 != expected_crc)
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
 static int mathos_gateway_uart_baud_is_valid(
     uint32_t baud)
 {
@@ -13874,82 +14022,122 @@ static esp_err_t maintenance_rc_pairing_nvs_open(
         open_mode,
         handle);
 }
-static esp_err_t maintenance_rc_pairing_config_save_to_partition(
+static void maintenance_rc_pairing_metadata_from_config(
+    const mathos_rc_pairing_config_t *config,
+    mathos_rc_pairing_metadata_t *metadata);
+
+static void maintenance_rc_pairing_config_from_metadata(
+    const mathos_rc_pairing_metadata_t *metadata,
+    mathos_rc_pairing_config_t *config)
+{
+    if (metadata == NULL || config == NULL)
+    {
+        return;
+    }
+
+    /*
+        Build a runtime compatibility view from persistent
+        metadata.
+
+        The Pair Key is intentionally NOT restored here.
+        root_key therefore remains all zeroes.
+    */
+    memset(
+        config,
+        0,
+        sizeof(*config));
+
+    config->magic =
+        MATHOS_RC_PAIRING_CONFIG_MAGIC;
+
+    config->version =
+        MATHOS_RC_PAIRING_CONFIG_VERSION;
+
+    config->record_size =
+        sizeof(mathos_rc_pairing_config_t);
+
+    config->rc_id =
+        metadata->rc_id;
+
+    config->authorised_gateway_id =
+        metadata->authorised_gateway_id;
+
+    config->key_derivation_method =
+        metadata->key_derivation_method;
+
+    config->key_generation =
+        metadata->key_generation;
+
+    config->kdf_iteration_count =
+        metadata->kdf_iteration_count;
+
+    memcpy(
+        config->pairing_salt,
+        metadata->pairing_salt,
+        sizeof(config->pairing_salt));
+
+    config->configuration_counter =
+        metadata->configuration_counter;
+
+    /*
+        This structure is a runtime metadata view, not a
+        persisted full pairing record.
+
+        Do not fabricate a full-record CRC.
+    */
+    config->crc32 = 0U;
+}
+
+static esp_err_t maintenance_rc_pairing_metadata_save_to_partition(
     const char *partition_name,
     const mathos_rc_pairing_config_t *config)
 {
-    if (config == NULL)
+    if (partition_name == NULL ||
+        config == NULL)
     {
         return ESP_ERR_INVALID_ARG;
     }
 
     /*
-        Work on a local copy because the save operation
-        refreshes metadata, counter and CRC.
+        The input pairing configuration may contain the
+        plaintext Pair Key in RAM.
+
+        Convert only the non-secret enrollment metadata
+        into the persistent record.
     */
-    mathos_rc_pairing_config_t record =
-        *config;
+    mathos_rc_pairing_metadata_t record = {0};
+    mathos_rc_pairing_metadata_t verified = {0};
 
-    mathos_rc_pairing_config_t verified = {0};
-
-    esp_err_t result = ESP_OK;
+    maintenance_rc_pairing_metadata_from_config(
+        config,
+        &record);
 
     /*
-        Restore the fixed record metadata.
-    */
-    record.magic =
-        MATHOS_RC_PAIRING_CONFIG_MAGIC;
-
-    record.version =
-        MATHOS_RC_PAIRING_CONFIG_VERSION;
-
-    record.record_size =
-        sizeof(mathos_rc_pairing_config_t);
-
-    /*
-        Reserved version-1 fields must always remain zero.
-    */
-    record.reserved0 = 0;
-
-    memset(
-        record.reserved1,
-        0,
-        sizeof(record.reserved1));
-
-    /*
-        Increment the persistent configuration counter.
-
-        Counter zero is reserved for the initial
-        unsaved default record.
+        Counter zero remains reserved for an unsaved record.
     */
     record.configuration_counter =
         config->configuration_counter + 1U;
 
-    if (record.configuration_counter == 0)
+    if (record.configuration_counter == 0U)
     {
         record.configuration_counter = 1U;
     }
 
-    /*
-        Calculate the CRC only after every stored field
-        has reached its final value.
-    */
-    record.crc32 = 0;
+    record.crc32 = 0U;
 
     record.crc32 =
-        mathos_rc_pairing_config_calculate_crc32(
+        mathos_rc_pairing_metadata_calculate_crc32(
             &record);
 
-    if (!mathos_rc_pairing_config_is_valid(
+    if (!mathos_rc_pairing_metadata_is_valid(
             &record))
     {
         ESP_LOGE(
             TAG,
-            "RC pairing configuration save rejected: "
+            "RC pairing metadata save rejected: "
             "invalid fields");
 
-        result = ESP_ERR_INVALID_ARG;
-        goto cleanup;
+        return ESP_ERR_INVALID_ARG;
     }
 
     nvs_handle_t handle;
@@ -13964,11 +14152,10 @@ static esp_err_t maintenance_rc_pairing_config_save_to_partition(
     {
         ESP_LOGE(
             TAG,
-            "failed to open RC pairing NVS: %s",
+            "failed to open RC pairing metadata NVS: %s",
             esp_err_to_name(err));
 
-        result = err;
-        goto cleanup;
+        return err;
     }
 
     err =
@@ -13982,13 +14169,11 @@ static esp_err_t maintenance_rc_pairing_config_save_to_partition(
     {
         ESP_LOGE(
             TAG,
-            "failed to write RC pairing configuration: %s",
+            "failed to write RC pairing metadata: %s",
             esp_err_to_name(err));
 
         nvs_close(handle);
-
-        result = err;
-        goto cleanup;
+        return err;
     }
 
     err =
@@ -13999,18 +14184,15 @@ static esp_err_t maintenance_rc_pairing_config_save_to_partition(
     {
         ESP_LOGE(
             TAG,
-            "failed to commit RC pairing configuration: %s",
+            "failed to commit RC pairing metadata: %s",
             esp_err_to_name(err));
 
         nvs_close(handle);
-
-        result = err;
-        goto cleanup;
+        return err;
     }
 
     /*
-        Read the committed record back from NVS before
-        reporting success.
+        Verify the bytes that actually reached NVS.
     */
     size_t verified_size =
         sizeof(verified);
@@ -14028,36 +14210,32 @@ static esp_err_t maintenance_rc_pairing_config_save_to_partition(
     {
         ESP_LOGE(
             TAG,
-            "RC pairing configuration read-back failed: %s",
+            "RC pairing metadata read-back failed: %s",
             esp_err_to_name(err));
 
-        result = err;
-        goto cleanup;
+        return err;
     }
 
-    if (verified_size !=
-        sizeof(verified))
+    if (verified_size != sizeof(verified))
     {
         ESP_LOGE(
             TAG,
-            "RC pairing read-back size mismatch "
+            "RC pairing metadata read-back size mismatch "
             "stored=%u expected=%u",
             (unsigned int)verified_size,
             (unsigned int)sizeof(verified));
 
-        result = ESP_FAIL;
-        goto cleanup;
+        return ESP_FAIL;
     }
 
-    if (!mathos_rc_pairing_config_is_valid(
+    if (!mathos_rc_pairing_metadata_is_valid(
             &verified))
     {
         ESP_LOGE(
             TAG,
-            "RC pairing read-back validation failed");
+            "RC pairing metadata read-back validation failed");
 
-        result = ESP_FAIL;
-        goto cleanup;
+        return ESP_FAIL;
     }
 
     if (memcmp(
@@ -14067,66 +14245,85 @@ static esp_err_t maintenance_rc_pairing_config_save_to_partition(
     {
         ESP_LOGE(
             TAG,
-            "RC pairing read-back differs from "
-            "written record");
+            "RC pairing metadata read-back differs "
+            "from written record");
 
-        result = ESP_FAIL;
-        goto cleanup;
+        return ESP_FAIL;
     }
 
-    /*
-        Never log the root key or pairing salt.
-    */
     ESP_LOGI(
         TAG,
-        "RC pairing configuration saved and verified "
+        "RC pairing metadata saved and verified "
         "rc_id=%u gateway_id=%u "
-        "key_generation=%lu counter=%lu "
-        "key_provisioned=%u crc=0x%08lx",
+        "key_generation=%lu counter=%lu crc=0x%08lx",
         verified.rc_id,
         verified.authorised_gateway_id,
-        (unsigned long)
-            verified.key_generation,
-        (unsigned long)
-            verified.configuration_counter,
-        verified.key_generation != 0
-            ? 1U
-            : 0U,
-        (unsigned long)
-            verified.crc32);
+        (unsigned long)verified.key_generation,
+        (unsigned long)verified.configuration_counter,
+        (unsigned long)verified.crc32);
 
-cleanup:
-
-    /*
-        Both local structures may contain the root key,
-        so erase them before returning.
-    */
-    maintenance_clear_sensitive_memory(
-        &record,
-        sizeof(record));
-
-    maintenance_clear_sensitive_memory(
-        &verified,
-        sizeof(verified));
-
-    return result;
+    return ESP_OK;
 }
+
+static void maintenance_rc_pairing_metadata_from_config(
+    const mathos_rc_pairing_config_t *config,
+    mathos_rc_pairing_metadata_t *metadata)
+{
+    if (config == NULL || metadata == NULL)
+    {
+        return;
+    }
+
+    memset(
+        metadata,
+        0,
+        sizeof(*metadata));
+
+    metadata->magic =
+        MATHOS_RC_PAIRING_CONFIG_MAGIC;
+
+    metadata->version =
+        MATHOS_RC_PAIRING_CONFIG_VERSION;
+
+    metadata->record_size =
+        sizeof(mathos_rc_pairing_metadata_t);
+
+    metadata->rc_id =
+        config->rc_id;
+
+    metadata->authorised_gateway_id =
+        config->authorised_gateway_id;
+
+    metadata->key_derivation_method =
+        config->key_derivation_method;
+
+    metadata->key_generation =
+        config->key_generation;
+
+    metadata->kdf_iteration_count =
+        config->kdf_iteration_count;
+
+    memcpy(
+        metadata->pairing_salt,
+        config->pairing_salt,
+        sizeof(metadata->pairing_salt));
+
+    metadata->configuration_counter =
+        config->configuration_counter;
+
+    metadata->crc32 = 0U;
+}
+
 
 esp_err_t mathos_rc_pairing_config_save(
     const mathos_rc_pairing_config_t *config)
 {
-    return maintenance_rc_pairing_config_save_to_partition(
+    return maintenance_rc_pairing_metadata_save_to_partition(
         MATHOS_RC_ENROLLMENT_NVS_PARTITION,
         config);
 }
 
-esp_err_t mathos_rc_pairing_config_save_enrollment(
-    const mathos_rc_pairing_config_t *config)
-{
-    return maintenance_rc_pairing_config_save_to_partition(
-        MATHOS_RC_ENROLLMENT_NVS_PARTITION,
-        config);
-}
+
 
 static esp_err_t maintenance_rc_pairing_config_load_from_partition(
     const char *partition_name,
@@ -14153,11 +14350,11 @@ static esp_err_t maintenance_rc_pairing_config_load_from_partition(
 
     nvs_handle_t handle;
 
-esp_err_t err =
-    maintenance_rc_pairing_nvs_open(
-        partition_name,
-        NVS_READONLY,
-        &handle);
+    esp_err_t err =
+        maintenance_rc_pairing_nvs_open(
+            partition_name,
+            NVS_READONLY,
+            &handle);
 
     /*
         A new RC may not have created the shared
@@ -14220,6 +14417,107 @@ esp_err_t err =
         nvs_close(handle);
 
         return err;
+    }
+
+    /*
+        New metadata-only persistent format.
+
+        The operational Pair Key is not stored in this
+        enrollment record. Fleet Store is the persistent
+        credential authority.
+    */
+    if (stored_size ==
+        sizeof(mathos_rc_pairing_metadata_t))
+    {
+        mathos_rc_pairing_metadata_t metadata = {0};
+
+        size_t metadata_size =
+            sizeof(metadata);
+
+        err =
+            nvs_get_blob(
+                handle,
+                MATHOS_RC_PAIRING_NVS_KEY,
+                &metadata,
+                &metadata_size);
+
+        nvs_close(handle);
+
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(
+                TAG,
+                "failed to read RC pairing metadata: %s",
+                esp_err_to_name(err));
+
+            maintenance_clear_sensitive_memory(
+                &metadata,
+                sizeof(metadata));
+
+            return err;
+        }
+
+        if (metadata_size != sizeof(metadata))
+        {
+            ESP_LOGE(
+                TAG,
+                "RC pairing metadata read size mismatch "
+                "read=%u expected=%u",
+                (unsigned int)metadata_size,
+                (unsigned int)sizeof(metadata));
+
+            maintenance_clear_sensitive_memory(
+                &metadata,
+                sizeof(metadata));
+
+            return ESP_ERR_INVALID_SIZE;
+        }
+
+        if (!mathos_rc_pairing_metadata_is_valid(
+                &metadata))
+        {
+            ESP_LOGE(
+                TAG,
+                "saved RC pairing metadata is invalid; "
+                "using unpaired defaults");
+
+            maintenance_clear_sensitive_memory(
+                &metadata,
+                sizeof(metadata));
+
+            return ESP_FAIL;
+        }
+
+        /*
+            Build the compatibility runtime view.
+
+            root_key remains zero by design.
+        */
+        maintenance_rc_pairing_config_from_metadata(
+            &metadata,
+            config);
+
+        *loaded_from_nvs = 1;
+
+        ESP_LOGI(
+            TAG,
+            "RC pairing metadata loaded "
+            "rc_id=%u gateway_id=%u "
+            "key_generation=%lu "
+            "counter=%lu "
+            "root_key_persisted=0",
+            config->rc_id,
+            config->authorised_gateway_id,
+            (unsigned long)
+                config->key_generation,
+            (unsigned long)
+                config->configuration_counter);
+
+        maintenance_clear_sensitive_memory(
+            &metadata,
+            sizeof(metadata));
+
+        return ESP_OK;
     }
 
     if (stored_size !=
@@ -14397,15 +14695,7 @@ esp_err_t mathos_rc_pairing_config_legacy_delete(void)
     return err;
 }
 
-esp_err_t mathos_rc_pairing_config_load_enrollment(
-    mathos_rc_pairing_config_t *config,
-    int *loaded_from_nvs)
-{
-    return maintenance_rc_pairing_config_load_from_partition(
-        MATHOS_RC_ENROLLMENT_NVS_PARTITION,
-        config,
-        loaded_from_nvs);
-}
+
 esp_err_t mathos_rc_pairing_config_load_legacy(
     mathos_rc_pairing_config_t *config,
     int *loaded_from_nvs)
@@ -14415,15 +14705,17 @@ esp_err_t mathos_rc_pairing_config_load_legacy(
         config,
         loaded_from_nvs);
 }
-esp_err_t mathos_rc_pairing_config_enrollment_exists(
-    int *exists)
+
+esp_err_t mathos_rc_pairing_config_enrollment_format(
+    mathos_rc_pairing_enrollment_format_t *format)
 {
-    if (exists == NULL)
+    if (format == NULL)
     {
         return ESP_ERR_INVALID_ARG;
     }
 
-    *exists = 0;
+    *format =
+        MATHOS_RC_PAIRING_ENROLLMENT_FORMAT_NONE;
 
     nvs_handle_t handle;
 
@@ -14464,15 +14756,27 @@ esp_err_t mathos_rc_pairing_config_enrollment_exists(
         return err;
     }
 
-    if (stored_size != sizeof(mathos_rc_pairing_config_t))
+    if (stored_size ==
+        sizeof(mathos_rc_pairing_config_t))
     {
-        return ESP_ERR_INVALID_SIZE;
+        *format =
+            MATHOS_RC_PAIRING_ENROLLMENT_FORMAT_LEGACY_FULL;
+
+        return ESP_OK;
     }
 
-    *exists = 1;
+    if (stored_size ==
+        sizeof(mathos_rc_pairing_metadata_t))
+    {
+        *format =
+            MATHOS_RC_PAIRING_ENROLLMENT_FORMAT_METADATA_ONLY;
 
-    return ESP_OK;
+        return ESP_OK;
+    }
+
+    return ESP_ERR_INVALID_SIZE;
 }
+
 
 
 esp_err_t mathos_maintenance_generate_pairing_salt(

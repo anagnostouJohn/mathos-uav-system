@@ -10,7 +10,9 @@
 #include "esp_hmac.h"
 #include "esp_partition.h"
 #include "nvs_sec_provider.h"
-
+#include "esp_random.h"
+#include "mbedtls/gcm.h"
+#include "mbedtls/pkcs5.h"
 #define MATHOS_FLEET_SELECTED_UID_KEY "selected_uid"
 
 #define MATHOS_FLEET_LEGACY_PARTITION_NAME "fleet"
@@ -18,8 +20,127 @@
 #define MATHOS_FLEET_MIGRATION_NAMESPACE "migration"
 #define MATHOS_FLEET_MIGRATION_VERSION_KEY "version"
 #define MATHOS_FLEET_MIGRATION_VERSION 1U
+
+/*
+    Dedicated security metadata inside encrypted fleet_sec.
+
+    This namespace will contain the PIN/FMK unlock envelope.
+    The Fleet Master Key itself is never stored plaintext.
+*/
+#define MATHOS_FLEET_SECURITY_NAMESPACE "security"
+#define MATHOS_FLEET_FMK_UNLOCK_KEY "fmk_unlock_v1"
+
+#define MATHOS_FLEET_FMK_UNLOCK_MAGIC 0x4D464D4BU
+#define MATHOS_FLEET_FMK_UNLOCK_VERSION 1U
+
+#define MATHOS_FLEET_PIN_SALT_LEN 16U
+#define MATHOS_FLEET_FMK_WRAP_NONCE_LEN 12U
+#define MATHOS_FLEET_FMK_WRAP_TAG_LEN 16U
+#define MATHOS_FLEET_PIN_DERIVED_KEY_LEN 32U
+
+#define MATHOS_FLEET_PAIR_WRAP_KEY_LEN 32U
+#define MATHOS_FLEET_PAIR_WRAP_NONCE_LEN 12U
+#define MATHOS_FLEET_PAIR_WRAP_TAG_LEN 16U
+#define MATHOS_FLEET_MASTER_KEY_LEN 32U
+#define MATHOS_FLEET_FMK_UNLOCK_RECORD_WIRE_LEN 92U
+
+#define MATHOS_FLEET_PAIR_WRAP_BLOB_LEN \
+    (MATHOS_FLEET_PAIR_WRAP_NONCE_LEN + \
+     MATHOS_FLEET_PAIR_KEY_LEN +        \
+     MATHOS_FLEET_PAIR_WRAP_TAG_LEN)
+
+#define MATHOS_FLEET_FMK_WRAP_AAD_LEN                \
+    ((sizeof("MATHOS/FLEET/FMK/WRAP/AAD/v1") - 1U) + \
+     sizeof(uint32_t) +                              \
+     sizeof(uint16_t) +                              \
+     sizeof(uint16_t) +                              \
+     sizeof(uint32_t) +                              \
+     MATHOS_FLEET_PIN_SALT_LEN)
+
+#define MATHOS_FLEET_PIN_KDF_MIN_ITERATIONS 10000U
+#define MATHOS_FLEET_PIN_KDF_MAX_ITERATIONS 1000000U
+#define MATHOS_FLEET_OPERATOR_PIN_LEN 6U
+
 static bool mathos_fleet_secure_storage_ready = false;
+static uint8_t mathos_fleet_secure_storage_hmac_key_id = 0U;
+
+/*
+    Fleet Master Key state.
+
+    The FMK is never intended to be stored here persistently.
+    It exists only in RAM after successful operator unlock.
+
+    Locked state:
+        mathos_fleet_master_key_unlocked == false
+        mathos_fleet_master_key[] == all zero
+*/
+static bool mathos_fleet_master_key_unlocked = false;
+
+static uint8_t
+    mathos_fleet_master_key[MATHOS_FLEET_MASTER_KEY_LEN];
+
 static const char *TAG = "MATHOS_FLEET";
+
+typedef struct
+{
+    uint32_t magic;
+    uint16_t version;
+    uint16_t record_size;
+
+    /*
+        PBKDF2-HMAC-SHA256 iteration count used for the
+        operator PIN.
+    */
+    uint32_t kdf_iteration_count;
+
+    /*
+        Random per-device PIN salt.
+
+        The salt is not secret.
+    */
+    uint8_t pin_salt[MATHOS_FLEET_PIN_SALT_LEN];
+
+    /*
+        AES-256-GCM envelope protecting the random
+        Fleet Master Key.
+    */
+    uint8_t nonce[MATHOS_FLEET_FMK_WRAP_NONCE_LEN];
+
+    uint8_t encrypted_fmk[MATHOS_FLEET_MASTER_KEY_LEN];
+
+    uint8_t tag[MATHOS_FLEET_FMK_WRAP_TAG_LEN];
+
+    /*
+        Detects accidental persistent-record corruption.
+
+        Cryptographic authenticity will come from the
+        AES-GCM tag, not from this CRC.
+    */
+    uint32_t crc32;
+
+} mathos_fleet_fmk_unlock_record_t;
+
+static esp_err_t fleet_derive_fmk_kek(
+    const uint8_t pin_derived_key[
+        MATHOS_FLEET_PIN_DERIVED_KEY_LEN],
+    uint8_t out_kek[MATHOS_FLEET_MASTER_KEY_LEN]);
+
+static esp_err_t fleet_unwrap_fmk(
+    const uint8_t kek[MATHOS_FLEET_MASTER_KEY_LEN],
+    const mathos_fleet_fmk_unlock_record_t *record,
+    uint8_t out_fmk[MATHOS_FLEET_MASTER_KEY_LEN]);
+
+
+static esp_err_t fleet_fmk_unlock_record_load(
+    mathos_fleet_fmk_unlock_record_t *record);
+
+static esp_err_t fleet_fmk_unlock_record_save(
+    const mathos_fleet_fmk_unlock_record_t *record);
+
+static uint32_t fleet_fmk_unlock_record_calculate_crc32(
+    const mathos_fleet_fmk_unlock_record_t *record);
+
+
 static void fleet_clear_sensitive_memory(
     void *buffer,
     size_t buffer_size)
@@ -38,6 +159,375 @@ static void fleet_clear_sensitive_memory(
         buffer_size--;
     }
 }
+
+static void fleet_master_key_lock(void)
+{
+    fleet_clear_sensitive_memory(
+        mathos_fleet_master_key,
+        sizeof(mathos_fleet_master_key));
+
+    mathos_fleet_master_key_unlocked = false;
+}
+
+static esp_err_t fleet_derive_pin_key(
+    const char *pin,
+    const uint8_t salt[MATHOS_FLEET_PIN_SALT_LEN],
+    uint32_t iteration_count,
+    uint8_t out_key[MATHOS_FLEET_PIN_DERIVED_KEY_LEN])
+{
+    if (pin == NULL ||
+        salt == NULL ||
+        out_key == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    fleet_clear_sensitive_memory(
+        out_key,
+        MATHOS_FLEET_PIN_DERIVED_KEY_LEN);
+
+    if (iteration_count <
+            MATHOS_FLEET_PIN_KDF_MIN_ITERATIONS ||
+        iteration_count >
+            MATHOS_FLEET_PIN_KDF_MAX_ITERATIONS)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t pin_length =
+        strnlen(
+            pin,
+            MATHOS_FLEET_OPERATOR_PIN_LEN + 1U);
+
+    if (pin_length !=
+        MATHOS_FLEET_OPERATOR_PIN_LEN)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+        Version 1 operator PIN format:
+        exactly six ASCII decimal digits.
+    */
+    for (size_t i = 0U;
+         i < pin_length;
+         i++)
+    {
+        if (pin[i] < '0' ||
+            pin[i] > '9')
+        {
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+
+    int salt_contains_nonzero_byte = 0;
+
+    for (size_t i = 0U;
+         i < MATHOS_FLEET_PIN_SALT_LEN;
+         i++)
+    {
+        if (salt[i] != 0U)
+        {
+            salt_contains_nonzero_byte = 1;
+            break;
+        }
+    }
+
+    if (!salt_contains_nonzero_byte)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    int result =
+        mbedtls_pkcs5_pbkdf2_hmac_ext(
+            MBEDTLS_MD_SHA256,
+            (const unsigned char *)pin,
+            pin_length,
+            salt,
+            MATHOS_FLEET_PIN_SALT_LEN,
+            (unsigned int)iteration_count,
+            MATHOS_FLEET_PIN_DERIVED_KEY_LEN,
+            out_key);
+
+    if (result != 0)
+    {
+        fleet_clear_sensitive_memory(
+            out_key,
+            MATHOS_FLEET_PIN_DERIVED_KEY_LEN);
+
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+esp_err_t mathos_fleet_fmk_unlock_record_exists(
+    bool *exists_out)
+{
+    if (exists_out == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *exists_out = false;
+
+    if (!mathos_fleet_secure_storage_ready)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    mathos_fleet_fmk_unlock_record_t record;
+
+    memset(
+        &record,
+        0,
+        sizeof(record));
+
+    esp_err_t err =
+        fleet_fmk_unlock_record_load(
+            &record);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        fleet_clear_sensitive_memory(
+            &record,
+            sizeof(record));
+
+        return ESP_OK;
+    }
+
+    if (err != ESP_OK)
+    {
+        fleet_clear_sensitive_memory(
+            &record,
+            sizeof(record));
+
+        return err;
+    }
+
+    fleet_clear_sensitive_memory(
+        &record,
+        sizeof(record));
+
+    *exists_out = true;
+
+    return ESP_OK;
+}
+esp_err_t mathos_fleet_unlock_master_key(
+    const char *pin)
+{
+    if (pin == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!mathos_fleet_secure_storage_ready)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+        Fail closed.
+
+        Any unlock attempt begins by removing any previously
+        unlocked Fleet Master Key from RAM.
+    */
+    fleet_master_key_lock();
+
+    mathos_fleet_fmk_unlock_record_t record;
+
+    uint8_t pin_key[
+        MATHOS_FLEET_PIN_DERIVED_KEY_LEN];
+
+    uint8_t kek[
+        MATHOS_FLEET_MASTER_KEY_LEN];
+
+    uint8_t recovered_fmk[
+        MATHOS_FLEET_MASTER_KEY_LEN];
+
+    memset(
+        &record,
+        0,
+        sizeof(record));
+
+    memset(
+        pin_key,
+        0,
+        sizeof(pin_key));
+
+    memset(
+        kek,
+        0,
+        sizeof(kek));
+
+    memset(
+        recovered_fmk,
+        0,
+        sizeof(recovered_fmk));
+
+    esp_err_t err =
+        fleet_fmk_unlock_record_load(
+            &record);
+
+    if (err != ESP_OK)
+    {
+        goto cleanup;
+    }
+
+    err =
+        fleet_derive_pin_key(
+            pin,
+            record.pin_salt,
+            record.kdf_iteration_count,
+            pin_key);
+
+    if (err != ESP_OK)
+    {
+        goto cleanup;
+    }
+
+    err =
+        fleet_derive_fmk_kek(
+            pin_key,
+            kek);
+
+    if (err != ESP_OK)
+    {
+        goto cleanup;
+    }
+
+    err =
+        fleet_unwrap_fmk(
+            kek,
+            &record,
+            recovered_fmk);
+
+    if (err != ESP_OK)
+    {
+        goto cleanup;
+    }
+
+    /*
+        Publish the FMK only after the complete authenticated
+        unlock path has succeeded.
+    */
+    memcpy(
+        mathos_fleet_master_key,
+        recovered_fmk,
+        MATHOS_FLEET_MASTER_KEY_LEN);
+
+    mathos_fleet_master_key_unlocked = true;
+
+    err = ESP_OK;
+
+cleanup:
+
+    fleet_clear_sensitive_memory(
+        &record,
+        sizeof(record));
+
+    fleet_clear_sensitive_memory(
+        pin_key,
+        sizeof(pin_key));
+
+    fleet_clear_sensitive_memory(
+        kek,
+        sizeof(kek));
+
+    fleet_clear_sensitive_memory(
+        recovered_fmk,
+        sizeof(recovered_fmk));
+
+    if (err != ESP_OK)
+    {
+        fleet_master_key_lock();
+    }
+
+    return err;
+}
+static esp_err_t fleet_derive_fmk_kek(
+    const uint8_t pin_derived_key[MATHOS_FLEET_PIN_DERIVED_KEY_LEN],
+    uint8_t out_kek[MATHOS_FLEET_MASTER_KEY_LEN])
+{
+    if (pin_derived_key == NULL ||
+        out_kek == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!mathos_fleet_secure_storage_ready)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    fleet_clear_sensitive_memory(
+        out_kek,
+        MATHOS_FLEET_MASTER_KEY_LEN);
+
+    static const uint8_t label[] =
+        "MATHOS/FLEET/FMK/KEK/HMAC-SHA256/v1";
+
+    uint8_t input[sizeof(label) - 1U +
+                  MATHOS_FLEET_PIN_DERIVED_KEY_LEN];
+
+    size_t index = 0U;
+
+    memcpy(
+        &input[index],
+        label,
+        sizeof(label) - 1U);
+
+    index +=
+        sizeof(label) - 1U;
+
+    memcpy(
+        &input[index],
+        pin_derived_key,
+        MATHOS_FLEET_PIN_DERIVED_KEY_LEN);
+
+    index +=
+        MATHOS_FLEET_PIN_DERIVED_KEY_LEN;
+
+    if (index != sizeof(input))
+    {
+        fleet_clear_sensitive_memory(
+            input,
+            sizeof(input));
+
+        return ESP_FAIL;
+    }
+
+    esp_err_t err =
+        esp_hmac_calculate(
+            (hmac_key_id_t)
+                mathos_fleet_secure_storage_hmac_key_id,
+            input,
+            sizeof(input),
+            out_kek);
+
+    fleet_clear_sensitive_memory(
+        input,
+        sizeof(input));
+
+    if (err != ESP_OK)
+    {
+        fleet_clear_sensitive_memory(
+            out_kek,
+            MATHOS_FLEET_MASTER_KEY_LEN);
+
+        return err;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t fleet_unwrap_pair_key_v1(
+    const mathos_device_uid_t *gateway_uid,
+    uint32_t key_generation,
+    const uint8_t *wrapped_blob,
+    uint16_t wrapped_blob_len,
+    uint8_t out_pair_key[MATHOS_FLEET_PAIR_KEY_LEN]);
+static int fleet_fmk_unlock_record_is_valid(
+    const mathos_fleet_fmk_unlock_record_t *record);
 
 /*
     Compare credential bytes without returning early
@@ -223,7 +713,6 @@ esp_err_t mathos_fleet_secure_migration_mark_complete(void)
 
     return ESP_OK;
 }
-
 
 static esp_err_t fleet_write_record_exact_to_partition(
     const char *partition_name,
@@ -506,11 +995,11 @@ static esp_err_t fleet_migrate_slot_exact_to_secure(
         &secure_record,
         0,
         sizeof(secure_record));
-esp_err_t err =
-    fleet_read_record_exact_from_partition(
-        MATHOS_FLEET_LEGACY_PARTITION_NAME,
-        slot,
-        &source_record);
+    esp_err_t err =
+        fleet_read_record_exact_from_partition(
+            MATHOS_FLEET_LEGACY_PARTITION_NAME,
+            slot,
+            &source_record);
 
     if (err != ESP_OK)
     {
@@ -1137,6 +1626,568 @@ static void fleet_put_u32_le(
         (uint8_t)((value >> 24) & 0xFFU);
 }
 
+static esp_err_t fleet_build_fmk_wrap_aad(
+    const mathos_fleet_fmk_unlock_record_t *record,
+    uint8_t aad[MATHOS_FLEET_FMK_WRAP_AAD_LEN],
+    size_t *aad_len)
+{
+    if (record == NULL ||
+        aad == NULL ||
+        aad_len == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    static const uint8_t label[] =
+        "MATHOS/FLEET/FMK/WRAP/AAD/v1";
+
+    memset(
+        aad,
+        0,
+        MATHOS_FLEET_FMK_WRAP_AAD_LEN);
+
+    size_t index = 0U;
+
+    memcpy(
+        &aad[index],
+        label,
+        sizeof(label) - 1U);
+
+    index +=
+        sizeof(label) - 1U;
+
+    fleet_put_u32_le(
+        aad,
+        &index,
+        record->magic);
+
+    fleet_put_u16_le(
+        aad,
+        &index,
+        record->version);
+
+    fleet_put_u16_le(
+        aad,
+        &index,
+        record->record_size);
+
+    fleet_put_u32_le(
+        aad,
+        &index,
+        record->kdf_iteration_count);
+
+    memcpy(
+        &aad[index],
+        record->pin_salt,
+        MATHOS_FLEET_PIN_SALT_LEN);
+
+    index +=
+        MATHOS_FLEET_PIN_SALT_LEN;
+
+    if (index !=
+        MATHOS_FLEET_FMK_WRAP_AAD_LEN)
+    {
+        fleet_clear_sensitive_memory(
+            aad,
+            MATHOS_FLEET_FMK_WRAP_AAD_LEN);
+
+        *aad_len = 0U;
+
+        return ESP_FAIL;
+    }
+
+    *aad_len = index;
+
+    return ESP_OK;
+}
+
+static esp_err_t fleet_wrap_fmk(
+    const uint8_t kek[MATHOS_FLEET_MASTER_KEY_LEN],
+    const uint8_t fmk[MATHOS_FLEET_MASTER_KEY_LEN],
+    mathos_fleet_fmk_unlock_record_t *record)
+{
+    if (kek == NULL ||
+        fmk == NULL ||
+        record == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint8_t aad[MATHOS_FLEET_FMK_WRAP_AAD_LEN];
+    size_t aad_len = 0U;
+
+    esp_err_t err =
+        fleet_build_fmk_wrap_aad(
+            record,
+            aad,
+            &aad_len);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    esp_fill_random(
+        record->nonce,
+        MATHOS_FLEET_FMK_WRAP_NONCE_LEN);
+
+    mbedtls_gcm_context gcm;
+
+    mbedtls_gcm_init(
+        &gcm);
+
+    int gcm_err =
+        mbedtls_gcm_setkey(
+            &gcm,
+            MBEDTLS_CIPHER_ID_AES,
+            kek,
+            MATHOS_FLEET_MASTER_KEY_LEN * 8U);
+
+    if (gcm_err == 0)
+    {
+        gcm_err =
+            mbedtls_gcm_crypt_and_tag(
+                &gcm,
+                MBEDTLS_GCM_ENCRYPT,
+                MATHOS_FLEET_MASTER_KEY_LEN,
+                record->nonce,
+                MATHOS_FLEET_FMK_WRAP_NONCE_LEN,
+                aad,
+                aad_len,
+                fmk,
+                record->encrypted_fmk,
+                MATHOS_FLEET_FMK_WRAP_TAG_LEN,
+                record->tag);
+    }
+
+    mbedtls_gcm_free(
+        &gcm);
+
+    fleet_clear_sensitive_memory(
+        aad,
+        sizeof(aad));
+
+    if (gcm_err != 0)
+    {
+        fleet_clear_sensitive_memory(
+            record->nonce,
+            sizeof(record->nonce));
+
+        fleet_clear_sensitive_memory(
+            record->encrypted_fmk,
+            sizeof(record->encrypted_fmk));
+
+        fleet_clear_sensitive_memory(
+            record->tag,
+            sizeof(record->tag));
+
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+static esp_err_t fleet_unwrap_fmk(
+    const uint8_t kek[MATHOS_FLEET_MASTER_KEY_LEN],
+    const mathos_fleet_fmk_unlock_record_t *record,
+    uint8_t out_fmk[MATHOS_FLEET_MASTER_KEY_LEN])
+{
+    if (kek == NULL ||
+        record == NULL ||
+        out_fmk == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    fleet_clear_sensitive_memory(
+        out_fmk,
+        MATHOS_FLEET_MASTER_KEY_LEN);
+
+    if (!fleet_fmk_unlock_record_is_valid(record))
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint8_t aad[MATHOS_FLEET_FMK_WRAP_AAD_LEN];
+    size_t aad_len = 0U;
+
+    esp_err_t err =
+        fleet_build_fmk_wrap_aad(
+            record,
+            aad,
+            &aad_len);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    mbedtls_gcm_context gcm;
+
+    mbedtls_gcm_init(
+        &gcm);
+
+    int gcm_err =
+        mbedtls_gcm_setkey(
+            &gcm,
+            MBEDTLS_CIPHER_ID_AES,
+            kek,
+            MATHOS_FLEET_MASTER_KEY_LEN * 8U);
+
+    if (gcm_err == 0)
+    {
+        gcm_err =
+            mbedtls_gcm_auth_decrypt(
+                &gcm,
+                MATHOS_FLEET_MASTER_KEY_LEN,
+                record->nonce,
+                MATHOS_FLEET_FMK_WRAP_NONCE_LEN,
+                aad,
+                aad_len,
+                record->tag,
+                MATHOS_FLEET_FMK_WRAP_TAG_LEN,
+                record->encrypted_fmk,
+                out_fmk);
+    }
+
+    mbedtls_gcm_free(
+        &gcm);
+
+    fleet_clear_sensitive_memory(
+        aad,
+        sizeof(aad));
+
+    if (gcm_err != 0)
+    {
+        fleet_clear_sensitive_memory(
+            out_fmk,
+            MATHOS_FLEET_MASTER_KEY_LEN);
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+        An all-zero FMK is reserved as invalid.
+    */
+    int fmk_contains_nonzero_byte = 0;
+
+    for (size_t i = 0U;
+         i < MATHOS_FLEET_MASTER_KEY_LEN;
+         i++)
+    {
+        if (out_fmk[i] != 0U)
+        {
+            fmk_contains_nonzero_byte = 1;
+            break;
+        }
+    }
+
+    if (!fmk_contains_nonzero_byte)
+    {
+        fleet_clear_sensitive_memory(
+            out_fmk,
+            MATHOS_FLEET_MASTER_KEY_LEN);
+
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t fleet_provision_fmk_with_pin(
+    const char *pin,
+    uint32_t iteration_count)
+{
+    if (pin == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!mathos_fleet_secure_storage_ready)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    mathos_fleet_fmk_unlock_record_t record;
+
+    memset(
+        &record,
+        0,
+        sizeof(record));
+
+    record.magic =
+        MATHOS_FLEET_FMK_UNLOCK_MAGIC;
+
+    record.version =
+        MATHOS_FLEET_FMK_UNLOCK_VERSION;
+
+    record.record_size =
+        MATHOS_FLEET_FMK_UNLOCK_RECORD_WIRE_LEN;
+
+    record.kdf_iteration_count =
+        iteration_count;
+
+    /*
+        Generate a non-zero random PIN salt.
+    */
+    int salt_valid = 0;
+
+    for (unsigned int attempt = 0U;
+         attempt < 4U;
+         attempt++)
+    {
+        esp_fill_random(
+            record.pin_salt,
+            sizeof(record.pin_salt));
+
+        for (size_t i = 0U;
+             i < sizeof(record.pin_salt);
+             i++)
+        {
+            if (record.pin_salt[i] != 0U)
+            {
+                salt_valid = 1;
+                break;
+            }
+        }
+
+        if (salt_valid)
+        {
+            break;
+        }
+    }
+
+    if (!salt_valid)
+    {
+        fleet_clear_sensitive_memory(
+            &record,
+            sizeof(record));
+
+        return ESP_FAIL;
+    }
+
+    uint8_t pin_key[
+        MATHOS_FLEET_PIN_DERIVED_KEY_LEN];
+
+    uint8_t kek[
+        MATHOS_FLEET_MASTER_KEY_LEN];
+
+    uint8_t generated_fmk[
+        MATHOS_FLEET_MASTER_KEY_LEN];
+
+    uint8_t verified_fmk[
+        MATHOS_FLEET_MASTER_KEY_LEN];
+
+    memset(pin_key, 0, sizeof(pin_key));
+    memset(kek, 0, sizeof(kek));
+    memset(generated_fmk, 0, sizeof(generated_fmk));
+    memset(verified_fmk, 0, sizeof(verified_fmk));
+
+    esp_err_t err =
+        fleet_derive_pin_key(
+            pin,
+            record.pin_salt,
+            iteration_count,
+            pin_key);
+
+    if (err != ESP_OK)
+    {
+        goto cleanup;
+    }
+
+    err =
+        fleet_derive_fmk_kek(
+            pin_key,
+            kek);
+
+    if (err != ESP_OK)
+    {
+        goto cleanup;
+    }
+
+    /*
+        Generate the random 256-bit Fleet Master Key.
+        The all-zero value is reserved as invalid.
+    */
+    int fmk_valid = 0;
+
+    for (unsigned int attempt = 0U;
+         attempt < 4U;
+         attempt++)
+    {
+        esp_fill_random(
+            generated_fmk,
+            sizeof(generated_fmk));
+
+        for (size_t i = 0U;
+             i < sizeof(generated_fmk);
+             i++)
+        {
+            if (generated_fmk[i] != 0U)
+            {
+                fmk_valid = 1;
+                break;
+            }
+        }
+
+        if (fmk_valid)
+        {
+            break;
+        }
+    }
+
+    if (!fmk_valid)
+    {
+        err = ESP_FAIL;
+        goto cleanup;
+    }
+
+    err =
+        fleet_wrap_fmk(
+            kek,
+            generated_fmk,
+            &record);
+
+    if (err != ESP_OK)
+    {
+        goto cleanup;
+    }
+
+    record.crc32 =
+        fleet_fmk_unlock_record_calculate_crc32(
+            &record);
+
+    if (!fleet_fmk_unlock_record_is_valid(
+            &record))
+    {
+        err = ESP_FAIL;
+        goto cleanup;
+    }
+
+    err =
+        fleet_fmk_unlock_record_save(
+            &record);
+
+    if (err != ESP_OK)
+    {
+        goto cleanup;
+    }
+
+    /*
+        Cryptographically verify the persisted envelope,
+        not merely its CRC/read-back representation.
+    */
+    mathos_fleet_fmk_unlock_record_t verified_record;
+
+    memset(
+        &verified_record,
+        0,
+        sizeof(verified_record));
+
+    err =
+        fleet_fmk_unlock_record_load(
+            &verified_record);
+
+    if (err != ESP_OK)
+    {
+        fleet_clear_sensitive_memory(
+            &verified_record,
+            sizeof(verified_record));
+
+        goto cleanup;
+    }
+
+    err =
+        fleet_unwrap_fmk(
+            kek,
+            &verified_record,
+            verified_fmk);
+
+    fleet_clear_sensitive_memory(
+        &verified_record,
+        sizeof(verified_record));
+
+    if (err != ESP_OK)
+    {
+        goto cleanup;
+    }
+
+    if (!fleet_secret_matches(
+            generated_fmk,
+            verified_fmk,
+            MATHOS_FLEET_MASTER_KEY_LEN))
+    {
+        err = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+
+    err = ESP_OK;
+
+cleanup:
+
+    fleet_clear_sensitive_memory(
+        pin_key,
+        sizeof(pin_key));
+
+    fleet_clear_sensitive_memory(
+        kek,
+        sizeof(kek));
+
+    fleet_clear_sensitive_memory(
+        generated_fmk,
+        sizeof(generated_fmk));
+
+    fleet_clear_sensitive_memory(
+        verified_fmk,
+        sizeof(verified_fmk));
+
+    fleet_clear_sensitive_memory(
+        &record,
+        sizeof(record));
+
+    return err;
+}
+
+esp_err_t mathos_fleet_provision_master_key(
+    const char *pin,
+    uint32_t iteration_count)
+{
+    if (pin == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!mathos_fleet_secure_storage_ready)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    bool exists = false;
+
+    esp_err_t err =
+        mathos_fleet_fmk_unlock_record_exists(
+            &exists);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    /*
+        Provisioning is first-time only.
+
+        Never silently replace an existing FMK envelope.
+        PIN changes will use a separate explicit rewrap path.
+    */
+    if (exists)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return fleet_provision_fmk_with_pin(
+        pin,
+        iteration_count);
+}
+
 static uint16_t fleet_get_u16_le(
     const uint8_t *buffer,
     size_t *index)
@@ -1163,6 +2214,386 @@ static uint32_t fleet_get_u32_le(
     *index += 4;
 
     return value;
+}
+static esp_err_t fleet_fmk_unlock_record_load(
+    mathos_fleet_fmk_unlock_record_t *record)
+{
+    if (record == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(
+        record,
+        0,
+        sizeof(*record));
+
+    if (!mathos_fleet_secure_storage_ready)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    nvs_handle_t handle;
+
+    esp_err_t err =
+        nvs_open_from_partition(
+            MATHOS_FLEET_SECURE_PARTITION_NAME,
+            MATHOS_FLEET_SECURITY_NAMESPACE,
+            NVS_READONLY,
+            &handle);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    /*
+        Query the stored blob size first.
+
+        The persistent representation is the canonical
+        wire format, never sizeof(struct).
+    */
+    size_t stored_size = 0U;
+
+    err =
+        nvs_get_blob(
+            handle,
+            MATHOS_FLEET_FMK_UNLOCK_KEY,
+            NULL,
+            &stored_size);
+
+    if (err != ESP_OK)
+    {
+        nvs_close(handle);
+        return err;
+    }
+
+    if (stored_size !=
+        MATHOS_FLEET_FMK_UNLOCK_RECORD_WIRE_LEN)
+    {
+        nvs_close(handle);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    uint8_t buffer[MATHOS_FLEET_FMK_UNLOCK_RECORD_WIRE_LEN];
+
+    memset(
+        buffer,
+        0,
+        sizeof(buffer));
+
+    err =
+        nvs_get_blob(
+            handle,
+            MATHOS_FLEET_FMK_UNLOCK_KEY,
+            buffer,
+            &stored_size);
+
+    nvs_close(handle);
+
+    if (err != ESP_OK)
+    {
+        fleet_clear_sensitive_memory(
+            buffer,
+            sizeof(buffer));
+
+        return err;
+    }
+
+    if (stored_size != sizeof(buffer))
+    {
+        fleet_clear_sensitive_memory(
+            buffer,
+            sizeof(buffer));
+
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    size_t index = 0U;
+
+    record->magic =
+        fleet_get_u32_le(
+            buffer,
+            &index);
+
+    record->version =
+        fleet_get_u16_le(
+            buffer,
+            &index);
+
+    record->record_size =
+        fleet_get_u16_le(
+            buffer,
+            &index);
+
+    record->kdf_iteration_count =
+        fleet_get_u32_le(
+            buffer,
+            &index);
+
+    memcpy(
+        record->pin_salt,
+        &buffer[index],
+        MATHOS_FLEET_PIN_SALT_LEN);
+
+    index +=
+        MATHOS_FLEET_PIN_SALT_LEN;
+
+    memcpy(
+        record->nonce,
+        &buffer[index],
+        MATHOS_FLEET_FMK_WRAP_NONCE_LEN);
+
+    index +=
+        MATHOS_FLEET_FMK_WRAP_NONCE_LEN;
+
+    memcpy(
+        record->encrypted_fmk,
+        &buffer[index],
+        MATHOS_FLEET_MASTER_KEY_LEN);
+
+    index +=
+        MATHOS_FLEET_MASTER_KEY_LEN;
+
+    memcpy(
+        record->tag,
+        &buffer[index],
+        MATHOS_FLEET_FMK_WRAP_TAG_LEN);
+
+    index +=
+        MATHOS_FLEET_FMK_WRAP_TAG_LEN;
+
+    record->crc32 =
+        fleet_get_u32_le(
+            buffer,
+            &index);
+
+    fleet_clear_sensitive_memory(
+        buffer,
+        sizeof(buffer));
+
+    if (index !=
+        MATHOS_FLEET_FMK_UNLOCK_RECORD_WIRE_LEN)
+    {
+        memset(
+            record,
+            0,
+            sizeof(*record));
+
+        return ESP_FAIL;
+    }
+
+    if (!fleet_fmk_unlock_record_is_valid(
+            record))
+    {
+        memset(
+            record,
+            0,
+            sizeof(*record));
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t fleet_fmk_unlock_record_save(
+    const mathos_fleet_fmk_unlock_record_t *record)
+{
+    if (record == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!mathos_fleet_secure_storage_ready)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!fleet_fmk_unlock_record_is_valid(record))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint8_t buffer[MATHOS_FLEET_FMK_UNLOCK_RECORD_WIRE_LEN];
+
+    memset(
+        buffer,
+        0,
+        sizeof(buffer));
+
+    size_t index = 0U;
+
+    fleet_put_u32_le(
+        buffer,
+        &index,
+        record->magic);
+
+    fleet_put_u16_le(
+        buffer,
+        &index,
+        record->version);
+
+    fleet_put_u16_le(
+        buffer,
+        &index,
+        record->record_size);
+
+    fleet_put_u32_le(
+        buffer,
+        &index,
+        record->kdf_iteration_count);
+
+    memcpy(
+        &buffer[index],
+        record->pin_salt,
+        MATHOS_FLEET_PIN_SALT_LEN);
+
+    index +=
+        MATHOS_FLEET_PIN_SALT_LEN;
+
+    memcpy(
+        &buffer[index],
+        record->nonce,
+        MATHOS_FLEET_FMK_WRAP_NONCE_LEN);
+
+    index +=
+        MATHOS_FLEET_FMK_WRAP_NONCE_LEN;
+
+    memcpy(
+        &buffer[index],
+        record->encrypted_fmk,
+        MATHOS_FLEET_MASTER_KEY_LEN);
+
+    index +=
+        MATHOS_FLEET_MASTER_KEY_LEN;
+
+    memcpy(
+        &buffer[index],
+        record->tag,
+        MATHOS_FLEET_FMK_WRAP_TAG_LEN);
+
+    index +=
+        MATHOS_FLEET_FMK_WRAP_TAG_LEN;
+
+    fleet_put_u32_le(
+        buffer,
+        &index,
+        record->crc32);
+
+    if (index != sizeof(buffer))
+    {
+        fleet_clear_sensitive_memory(
+            buffer,
+            sizeof(buffer));
+
+        return ESP_FAIL;
+    }
+
+    nvs_handle_t handle;
+
+    esp_err_t err =
+        nvs_open_from_partition(
+            MATHOS_FLEET_SECURE_PARTITION_NAME,
+            MATHOS_FLEET_SECURITY_NAMESPACE,
+            NVS_READWRITE,
+            &handle);
+
+    if (err != ESP_OK)
+    {
+        fleet_clear_sensitive_memory(
+            buffer,
+            sizeof(buffer));
+
+        return err;
+    }
+
+    err =
+        nvs_set_blob(
+            handle,
+            MATHOS_FLEET_FMK_UNLOCK_KEY,
+            buffer,
+            sizeof(buffer));
+
+    if (err == ESP_OK)
+    {
+        err =
+            nvs_commit(handle);
+    }
+
+    nvs_close(handle);
+
+    fleet_clear_sensitive_memory(
+        buffer,
+        sizeof(buffer));
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    /*
+        Verify the committed record through the normal
+        production read path.
+
+        A successful NVS commit alone is not treated as
+        sufficient proof that the intended record is
+        readable and structurally valid.
+    */
+    mathos_fleet_fmk_unlock_record_t verified;
+
+    memset(
+        &verified,
+        0,
+        sizeof(verified));
+
+    err =
+        fleet_fmk_unlock_record_load(
+            &verified);
+
+    if (err != ESP_OK)
+    {
+        fleet_clear_sensitive_memory(
+            &verified,
+            sizeof(verified));
+
+        return err;
+    }
+
+    int matches =
+        verified.magic == record->magic &&
+        verified.version == record->version &&
+        verified.record_size == record->record_size &&
+        verified.kdf_iteration_count ==
+            record->kdf_iteration_count &&
+        fleet_secret_matches(
+            verified.pin_salt,
+            record->pin_salt,
+            MATHOS_FLEET_PIN_SALT_LEN) &&
+        fleet_secret_matches(
+            verified.nonce,
+            record->nonce,
+            MATHOS_FLEET_FMK_WRAP_NONCE_LEN) &&
+        fleet_secret_matches(
+            verified.encrypted_fmk,
+            record->encrypted_fmk,
+            MATHOS_FLEET_MASTER_KEY_LEN) &&
+        fleet_secret_matches(
+            verified.tag,
+            record->tag,
+            MATHOS_FLEET_FMK_WRAP_TAG_LEN) &&
+        verified.crc32 == record->crc32;
+
+    fleet_clear_sensitive_memory(
+        &verified,
+        sizeof(verified));
+
+    if (!matches)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return ESP_OK;
 }
 
 static uint32_t fleet_crc32_bytes(
@@ -1201,6 +2632,158 @@ static uint32_t fleet_crc32_bytes(
     }
 
     return ~crc;
+}
+
+static uint32_t fleet_fmk_unlock_record_calculate_crc32(
+    const mathos_fleet_fmk_unlock_record_t *record)
+{
+    if (record == NULL)
+    {
+        return 0U;
+    }
+
+    /*
+        Canonical FMK unlock record excluding the final
+        4-byte CRC field.
+    */
+    uint8_t buffer[MATHOS_FLEET_FMK_UNLOCK_RECORD_WIRE_LEN - 4U];
+
+    memset(
+        buffer,
+        0,
+        sizeof(buffer));
+
+    size_t index = 0U;
+
+    fleet_put_u32_le(
+        buffer,
+        &index,
+        record->magic);
+
+    fleet_put_u16_le(
+        buffer,
+        &index,
+        record->version);
+
+    fleet_put_u16_le(
+        buffer,
+        &index,
+        record->record_size);
+
+    fleet_put_u32_le(
+        buffer,
+        &index,
+        record->kdf_iteration_count);
+
+    memcpy(
+        &buffer[index],
+        record->pin_salt,
+        MATHOS_FLEET_PIN_SALT_LEN);
+
+    index +=
+        MATHOS_FLEET_PIN_SALT_LEN;
+
+    memcpy(
+        &buffer[index],
+        record->nonce,
+        MATHOS_FLEET_FMK_WRAP_NONCE_LEN);
+
+    index +=
+        MATHOS_FLEET_FMK_WRAP_NONCE_LEN;
+
+    memcpy(
+        &buffer[index],
+        record->encrypted_fmk,
+        MATHOS_FLEET_MASTER_KEY_LEN);
+
+    index +=
+        MATHOS_FLEET_MASTER_KEY_LEN;
+
+    memcpy(
+        &buffer[index],
+        record->tag,
+        MATHOS_FLEET_FMK_WRAP_TAG_LEN);
+
+    index +=
+        MATHOS_FLEET_FMK_WRAP_TAG_LEN;
+
+    if (index != sizeof(buffer))
+    {
+        return 0U;
+    }
+
+    return fleet_crc32_bytes(
+        buffer,
+        sizeof(buffer));
+}
+
+static int fleet_fmk_unlock_record_is_valid(
+    const mathos_fleet_fmk_unlock_record_t *record)
+{
+    if (record == NULL)
+    {
+        return 0;
+    }
+
+    if (record->magic !=
+        MATHOS_FLEET_FMK_UNLOCK_MAGIC)
+    {
+        return 0;
+    }
+
+    if (record->version !=
+        MATHOS_FLEET_FMK_UNLOCK_VERSION)
+    {
+        return 0;
+    }
+
+    if (record->record_size !=
+        MATHOS_FLEET_FMK_UNLOCK_RECORD_WIRE_LEN)
+    {
+        return 0;
+    }
+
+    if (record->kdf_iteration_count <
+            MATHOS_FLEET_PIN_KDF_MIN_ITERATIONS ||
+        record->kdf_iteration_count >
+            MATHOS_FLEET_PIN_KDF_MAX_ITERATIONS)
+    {
+        return 0;
+    }
+
+    /*
+        The PIN salt must be a real per-device random
+        value, never the all-zero uninitialized value.
+    */
+    int salt_contains_nonzero_byte = 0;
+
+    for (size_t i = 0;
+         i < MATHOS_FLEET_PIN_SALT_LEN;
+         i++)
+    {
+        if (record->pin_salt[i] != 0U)
+        {
+            salt_contains_nonzero_byte = 1;
+            break;
+        }
+    }
+
+    if (!salt_contains_nonzero_byte)
+    {
+        return 0;
+    }
+
+    uint32_t expected_crc =
+        fleet_fmk_unlock_record_calculate_crc32(
+            record);
+
+    if (expected_crc == 0U ||
+        record->crc32 != expected_crc)
+    {
+        return 0;
+    }
+
+    return 1;
 }
 
 void mathos_fleet_record_set_defaults(
@@ -1424,6 +3007,13 @@ int mathos_fleet_record_is_valid(
             MATHOS_FLEET_SECRET_FORMAT_DEV_RAW_PAIR_KEY &&
         record->secret_blob_len !=
             MATHOS_FLEET_PAIR_KEY_LEN)
+    {
+        return 0;
+    }
+    if (record->secret_format ==
+            MATHOS_FLEET_SECRET_FORMAT_WRAPPED_PAIR_KEY_V1 &&
+        record->secret_blob_len !=
+            MATHOS_FLEET_PAIR_WRAP_BLOB_LEN)
     {
         return 0;
     }
@@ -4876,6 +6466,14 @@ esp_err_t mathos_fleet_store_verified_pairing(
         return ESP_ERR_INVALID_ARG;
     }
 
+    if (secret_format ==
+            MATHOS_FLEET_SECRET_FORMAT_WRAPPED_PAIR_KEY_V1 &&
+        secret_blob_len !=
+            MATHOS_FLEET_PAIR_WRAP_BLOB_LEN)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     if (secret_format !=
             MATHOS_FLEET_SECRET_FORMAT_DEV_RAW_PAIR_KEY &&
         secret_format !=
@@ -4978,23 +6576,87 @@ esp_err_t mathos_fleet_store_verified_pairing(
 
     /*
         Same generation is accepted only when the stored
-        credential matches exactly. This makes retries
-        idempotent without permitting key replacement.
+        credential represents the same Pair Key.
+
+        RAW credentials can be compared directly.
+
+        WRAPPED_PAIR_KEY_V1 credentials must be authenticated
+        and unwrapped before comparison because AES-GCM uses
+        a fresh random nonce for every wrap. Therefore two
+        valid envelopes protecting the same Pair Key are not
+        expected to be byte-for-byte identical.
     */
     if (key_generation ==
         existing_record.key_generation)
     {
-        int same_credential =
-            existing_record.secret_format ==
+        int same_credential = 0;
+
+        if (existing_record.secret_format ==
                 (uint8_t)secret_format &&
-
             existing_record.secret_blob_len ==
-                secret_blob_len &&
+                secret_blob_len)
+        {
+            if (secret_format ==
+                MATHOS_FLEET_SECRET_FORMAT_DEV_RAW_PAIR_KEY)
+            {
+                same_credential =
+                    fleet_secret_matches(
+                        existing_record.secret_blob,
+                        secret_blob,
+                        secret_blob_len);
+            }
+            else if (secret_format ==
+                     MATHOS_FLEET_SECRET_FORMAT_WRAPPED_PAIR_KEY_V1)
+            {
+                uint8_t existing_pair_key[MATHOS_FLEET_PAIR_KEY_LEN];
 
-            fleet_secret_matches(
-                existing_record.secret_blob,
-                secret_blob,
-                secret_blob_len);
+                uint8_t incoming_pair_key[MATHOS_FLEET_PAIR_KEY_LEN];
+
+                memset(
+                    existing_pair_key,
+                    0,
+                    sizeof(existing_pair_key));
+
+                memset(
+                    incoming_pair_key,
+                    0,
+                    sizeof(incoming_pair_key));
+
+                esp_err_t existing_unwrap_err =
+                    fleet_unwrap_pair_key_v1(
+                        gateway_uid,
+                        key_generation,
+                        existing_record.secret_blob,
+                        existing_record.secret_blob_len,
+                        existing_pair_key);
+
+                esp_err_t incoming_unwrap_err =
+                    fleet_unwrap_pair_key_v1(
+                        gateway_uid,
+                        key_generation,
+                        secret_blob,
+                        secret_blob_len,
+                        incoming_pair_key);
+
+                if (existing_unwrap_err == ESP_OK &&
+                    incoming_unwrap_err == ESP_OK)
+                {
+                    same_credential =
+                        fleet_secret_matches(
+                            existing_pair_key,
+                            incoming_pair_key,
+                            MATHOS_FLEET_PAIR_KEY_LEN);
+                }
+
+                fleet_clear_sensitive_memory(
+                    existing_pair_key,
+                    sizeof(existing_pair_key));
+
+                fleet_clear_sensitive_memory(
+                    incoming_pair_key,
+                    sizeof(incoming_pair_key));
+            }
+        }
 
         if (!same_credential)
         {
@@ -5653,13 +7315,21 @@ esp_err_t mathos_fleet_add_aircraft(
     }
 
     /*
-        Development raw Pair Key must be exactly
-        32 bytes.
-    */
+      Development raw Pair Key must be exactly
+      32 bytes.
+  */
     if (secret_format ==
             MATHOS_FLEET_SECRET_FORMAT_DEV_RAW_PAIR_KEY &&
         secret_blob_len !=
             MATHOS_FLEET_PAIR_KEY_LEN)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (secret_format ==
+            MATHOS_FLEET_SECRET_FORMAT_WRAPPED_PAIR_KEY_V1 &&
+        secret_blob_len !=
+            MATHOS_FLEET_PAIR_WRAP_BLOB_LEN)
     {
         return ESP_ERR_INVALID_ARG;
     }
@@ -5671,7 +7341,6 @@ esp_err_t mathos_fleet_add_aircraft(
     {
         return ESP_ERR_INVALID_ARG;
     }
-
     /*
         Reject duplicate Gateway UID.
 
@@ -7085,6 +8754,881 @@ static esp_err_t fleet_derive_secure_nvs_keys(
 
     return ESP_OK;
 }
+static esp_err_t fleet_derive_pair_wrap_key(
+    uint8_t out_key[MATHOS_FLEET_PAIR_WRAP_KEY_LEN])
+{
+    if (out_key == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(
+        out_key,
+        0,
+        MATHOS_FLEET_PAIR_WRAP_KEY_LEN);
+
+    if (!mathos_fleet_secure_storage_ready)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    static const uint8_t wrap_key_label[] =
+        "MATHOS/FLEET/PAIR/WRAP/AES256-GCM/v1";
+
+    esp_err_t err =
+        esp_hmac_calculate(
+            (hmac_key_id_t)
+                mathos_fleet_secure_storage_hmac_key_id,
+            wrap_key_label,
+            sizeof(wrap_key_label) - 1U,
+            out_key);
+
+    if (err != ESP_OK)
+    {
+        fleet_clear_sensitive_memory(
+            out_key,
+            MATHOS_FLEET_PAIR_WRAP_KEY_LEN);
+
+        return err;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t fleet_wrap_pair_key_v1(
+    const mathos_device_uid_t *gateway_uid,
+    uint32_t key_generation,
+    const uint8_t pair_key[MATHOS_FLEET_PAIR_KEY_LEN],
+    uint8_t out_blob[MATHOS_FLEET_PAIR_WRAP_BLOB_LEN],
+    uint16_t *out_blob_len)
+{
+    if (gateway_uid == NULL ||
+        pair_key == NULL ||
+        out_blob == NULL ||
+        out_blob_len == NULL ||
+        key_generation == 0U)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *out_blob_len = 0U;
+
+    memset(
+        out_blob,
+        0,
+        MATHOS_FLEET_PAIR_WRAP_BLOB_LEN);
+
+    uint8_t wrap_key[MATHOS_FLEET_PAIR_WRAP_KEY_LEN];
+
+    memset(
+        wrap_key,
+        0,
+        sizeof(wrap_key));
+
+    esp_err_t err =
+        fleet_derive_pair_wrap_key(
+            wrap_key);
+
+    if (err != ESP_OK)
+    {
+        fleet_clear_sensitive_memory(
+            wrap_key,
+            sizeof(wrap_key));
+
+        return err;
+    }
+
+    static const uint8_t aad_label[] =
+        "MATHOS/FLEET/PAIR/WRAP/AAD/v1";
+
+    uint8_t aad[sizeof(aad_label) - 1U +
+                sizeof(gateway_uid->bytes) +
+                sizeof(uint32_t)];
+
+    size_t aad_index = 0U;
+
+    memcpy(
+        &aad[aad_index],
+        aad_label,
+        sizeof(aad_label) - 1U);
+
+    aad_index +=
+        sizeof(aad_label) - 1U;
+
+    memcpy(
+        &aad[aad_index],
+        gateway_uid->bytes,
+        sizeof(gateway_uid->bytes));
+
+    aad_index +=
+        sizeof(gateway_uid->bytes);
+
+    fleet_put_u32_le(
+        aad,
+        &aad_index,
+        key_generation);
+
+    uint8_t *nonce =
+        &out_blob[0];
+
+    uint8_t *ciphertext =
+        &out_blob[MATHOS_FLEET_PAIR_WRAP_NONCE_LEN];
+
+    uint8_t *tag =
+        &out_blob[MATHOS_FLEET_PAIR_WRAP_NONCE_LEN +
+                  MATHOS_FLEET_PAIR_KEY_LEN];
+
+    esp_fill_random(
+        nonce,
+        MATHOS_FLEET_PAIR_WRAP_NONCE_LEN);
+
+    mbedtls_gcm_context gcm;
+
+    mbedtls_gcm_init(
+        &gcm);
+
+    int gcm_err =
+        mbedtls_gcm_setkey(
+            &gcm,
+            MBEDTLS_CIPHER_ID_AES,
+            wrap_key,
+            MATHOS_FLEET_PAIR_WRAP_KEY_LEN * 8U);
+
+    if (gcm_err == 0)
+    {
+        gcm_err =
+            mbedtls_gcm_crypt_and_tag(
+                &gcm,
+                MBEDTLS_GCM_ENCRYPT,
+                MATHOS_FLEET_PAIR_KEY_LEN,
+                nonce,
+                MATHOS_FLEET_PAIR_WRAP_NONCE_LEN,
+                aad,
+                aad_index,
+                pair_key,
+                ciphertext,
+                MATHOS_FLEET_PAIR_WRAP_TAG_LEN,
+                tag);
+    }
+
+    mbedtls_gcm_free(
+        &gcm);
+
+    fleet_clear_sensitive_memory(
+        wrap_key,
+        sizeof(wrap_key));
+
+    if (gcm_err != 0)
+    {
+        fleet_clear_sensitive_memory(
+            out_blob,
+            MATHOS_FLEET_PAIR_WRAP_BLOB_LEN);
+
+        return ESP_FAIL;
+    }
+
+    *out_blob_len =
+        MATHOS_FLEET_PAIR_WRAP_BLOB_LEN;
+
+    return ESP_OK;
+}
+
+esp_err_t mathos_fleet_wrap_pair_key(
+    const mathos_device_uid_t *gateway_uid,
+    uint32_t key_generation,
+    const uint8_t pair_key[MATHOS_FLEET_PAIR_KEY_LEN],
+    uint8_t *out_wrapped_blob,
+    uint16_t out_wrapped_blob_capacity,
+    uint16_t *out_wrapped_blob_len)
+{
+    if (gateway_uid == NULL ||
+        pair_key == NULL ||
+        out_wrapped_blob == NULL ||
+        out_wrapped_blob_len == NULL ||
+        key_generation == 0U)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *out_wrapped_blob_len = 0U;
+
+    if (!mathos_fleet_secure_storage_ready)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!mathos_device_uid_is_valid(
+            gateway_uid))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (out_wrapped_blob_capacity <
+        MATHOS_FLEET_PAIR_WRAP_BLOB_LEN)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(
+        out_wrapped_blob,
+        0,
+        out_wrapped_blob_capacity);
+
+    esp_err_t err =
+        fleet_wrap_pair_key_v1(
+            gateway_uid,
+            key_generation,
+            pair_key,
+            out_wrapped_blob,
+            out_wrapped_blob_len);
+
+    if (err != ESP_OK)
+    {
+        fleet_clear_sensitive_memory(
+            out_wrapped_blob,
+            out_wrapped_blob_capacity);
+
+        *out_wrapped_blob_len = 0U;
+
+        return err;
+    }
+
+    if (*out_wrapped_blob_len !=
+        MATHOS_FLEET_PAIR_WRAP_BLOB_LEN)
+    {
+        fleet_clear_sensitive_memory(
+            out_wrapped_blob,
+            out_wrapped_blob_capacity);
+
+        *out_wrapped_blob_len = 0U;
+
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t fleet_unwrap_pair_key_v1(
+    const mathos_device_uid_t *gateway_uid,
+    uint32_t key_generation,
+    const uint8_t *wrapped_blob,
+    uint16_t wrapped_blob_len,
+    uint8_t out_pair_key[MATHOS_FLEET_PAIR_KEY_LEN])
+{
+    if (gateway_uid == NULL ||
+        wrapped_blob == NULL ||
+        out_pair_key == NULL ||
+        key_generation == 0U ||
+        wrapped_blob_len != MATHOS_FLEET_PAIR_WRAP_BLOB_LEN)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(
+        out_pair_key,
+        0,
+        MATHOS_FLEET_PAIR_KEY_LEN);
+
+    uint8_t wrap_key[MATHOS_FLEET_PAIR_WRAP_KEY_LEN];
+
+    memset(
+        wrap_key,
+        0,
+        sizeof(wrap_key));
+
+    esp_err_t err =
+        fleet_derive_pair_wrap_key(
+            wrap_key);
+
+    if (err != ESP_OK)
+    {
+        fleet_clear_sensitive_memory(
+            wrap_key,
+            sizeof(wrap_key));
+
+        return err;
+    }
+
+    static const uint8_t aad_label[] =
+        "MATHOS/FLEET/PAIR/WRAP/AAD/v1";
+
+    uint8_t aad[sizeof(aad_label) - 1U +
+                sizeof(gateway_uid->bytes) +
+                sizeof(uint32_t)];
+
+    size_t aad_index = 0U;
+
+    memcpy(
+        &aad[aad_index],
+        aad_label,
+        sizeof(aad_label) - 1U);
+
+    aad_index +=
+        sizeof(aad_label) - 1U;
+
+    memcpy(
+        &aad[aad_index],
+        gateway_uid->bytes,
+        sizeof(gateway_uid->bytes));
+
+    aad_index +=
+        sizeof(gateway_uid->bytes);
+
+    fleet_put_u32_le(
+        aad,
+        &aad_index,
+        key_generation);
+
+    const uint8_t *nonce =
+        &wrapped_blob[0];
+
+    const uint8_t *ciphertext =
+        &wrapped_blob[MATHOS_FLEET_PAIR_WRAP_NONCE_LEN];
+
+    const uint8_t *tag =
+        &wrapped_blob[MATHOS_FLEET_PAIR_WRAP_NONCE_LEN +
+                      MATHOS_FLEET_PAIR_KEY_LEN];
+
+    mbedtls_gcm_context gcm;
+
+    mbedtls_gcm_init(
+        &gcm);
+
+    int gcm_err =
+        mbedtls_gcm_setkey(
+            &gcm,
+            MBEDTLS_CIPHER_ID_AES,
+            wrap_key,
+            MATHOS_FLEET_PAIR_WRAP_KEY_LEN * 8U);
+
+    if (gcm_err == 0)
+    {
+        gcm_err =
+            mbedtls_gcm_auth_decrypt(
+                &gcm,
+                MATHOS_FLEET_PAIR_KEY_LEN,
+                nonce,
+                MATHOS_FLEET_PAIR_WRAP_NONCE_LEN,
+                aad,
+                aad_index,
+                tag,
+                MATHOS_FLEET_PAIR_WRAP_TAG_LEN,
+                ciphertext,
+                out_pair_key);
+    }
+
+    mbedtls_gcm_free(
+        &gcm);
+
+    fleet_clear_sensitive_memory(
+        wrap_key,
+        sizeof(wrap_key));
+
+    if (gcm_err != 0)
+    {
+        fleet_clear_sensitive_memory(
+            out_pair_key,
+            MATHOS_FLEET_PAIR_KEY_LEN);
+
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t mathos_fleet_migrate_pair_key_to_wrapped(
+    uint16_t slot,
+    bool *migrated_out)
+{
+    if (migrated_out == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *migrated_out = false;
+
+    if (!mathos_fleet_secure_storage_ready)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    mathos_fleet_record_t record;
+    memset(&record, 0, sizeof(record));
+
+    esp_err_t err =
+        mathos_fleet_record_load_slot(
+            slot,
+            &record);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    uint8_t pair_key[MATHOS_FLEET_PAIR_KEY_LEN];
+    memset(pair_key, 0, sizeof(pair_key));
+
+    /*
+        Already migrated.
+
+        Authenticate and unwrap it once to prove that the
+        stored wrapped credential is usable, but do not
+        rewrite it on every boot.
+    */
+    if (record.secret_format ==
+        MATHOS_FLEET_SECRET_FORMAT_WRAPPED_PAIR_KEY_V1)
+    {
+        err =
+            fleet_unwrap_pair_key_v1(
+                &record.gateway_uid,
+                record.key_generation,
+                record.secret_blob,
+                record.secret_blob_len,
+                pair_key);
+
+        fleet_clear_sensitive_memory(
+            pair_key,
+            sizeof(pair_key));
+
+        fleet_clear_sensitive_memory(
+            &record,
+            sizeof(record));
+
+        return err;
+    }
+
+    if (record.secret_format !=
+            MATHOS_FLEET_SECRET_FORMAT_DEV_RAW_PAIR_KEY ||
+        record.secret_blob_len !=
+            MATHOS_FLEET_PAIR_KEY_LEN)
+    {
+        fleet_clear_sensitive_memory(
+            pair_key,
+            sizeof(pair_key));
+
+        fleet_clear_sensitive_memory(
+            &record,
+            sizeof(record));
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+        Preserve the original Pair Key only temporarily
+        while constructing and verifying the wrapped record.
+    */
+    memcpy(
+        pair_key,
+        record.secret_blob,
+        sizeof(pair_key));
+
+    uint8_t wrapped_blob[MATHOS_FLEET_PAIR_WRAP_BLOB_LEN];
+
+    memset(
+        wrapped_blob,
+        0,
+        sizeof(wrapped_blob));
+
+    uint16_t wrapped_blob_len = 0U;
+
+    err =
+        fleet_wrap_pair_key_v1(
+            &record.gateway_uid,
+            record.key_generation,
+            pair_key,
+            wrapped_blob,
+            &wrapped_blob_len);
+
+    if (err != ESP_OK)
+    {
+        goto cleanup;
+    }
+
+    if (wrapped_blob_len !=
+        MATHOS_FLEET_PAIR_WRAP_BLOB_LEN)
+    {
+        err = ESP_FAIL;
+        goto cleanup;
+    }
+
+    record.secret_format =
+        MATHOS_FLEET_SECRET_FORMAT_WRAPPED_PAIR_KEY_V1;
+
+    memset(
+        record.secret_blob,
+        0,
+        sizeof(record.secret_blob));
+
+    memcpy(
+        record.secret_blob,
+        wrapped_blob,
+        wrapped_blob_len);
+
+    record.secret_blob_len =
+        wrapped_blob_len;
+
+    err =
+        mathos_fleet_record_save_slot(
+            slot,
+            &record);
+
+    if (err != ESP_OK)
+    {
+        goto cleanup;
+    }
+
+    /*
+        Reload the authoritative stored record.
+    */
+    mathos_fleet_record_t verified_record;
+
+    memset(
+        &verified_record,
+        0,
+        sizeof(verified_record));
+
+    err =
+        mathos_fleet_record_load_slot(
+            slot,
+            &verified_record);
+
+    if (err != ESP_OK)
+    {
+        fleet_clear_sensitive_memory(
+            &verified_record,
+            sizeof(verified_record));
+
+        goto cleanup;
+    }
+
+    if (verified_record.secret_format !=
+            MATHOS_FLEET_SECRET_FORMAT_WRAPPED_PAIR_KEY_V1 ||
+        verified_record.secret_blob_len !=
+            MATHOS_FLEET_PAIR_WRAP_BLOB_LEN ||
+        verified_record.key_generation !=
+            record.key_generation ||
+        memcmp(
+            verified_record.gateway_uid.bytes,
+            record.gateway_uid.bytes,
+            MATHOS_DEVICE_UID_LEN) != 0)
+    {
+        fleet_clear_sensitive_memory(
+            &verified_record,
+            sizeof(verified_record));
+
+        err = ESP_FAIL;
+        goto cleanup;
+    }
+
+    uint8_t verified_pair_key[MATHOS_FLEET_PAIR_KEY_LEN];
+
+    memset(
+        verified_pair_key,
+        0,
+        sizeof(verified_pair_key));
+
+    err =
+        fleet_unwrap_pair_key_v1(
+            &verified_record.gateway_uid,
+            verified_record.key_generation,
+            verified_record.secret_blob,
+            verified_record.secret_blob_len,
+            verified_pair_key);
+
+    if (err == ESP_OK &&
+        !fleet_secret_matches(
+            pair_key,
+            verified_pair_key,
+            sizeof(pair_key)))
+    {
+        err = ESP_FAIL;
+    }
+
+    fleet_clear_sensitive_memory(
+        verified_pair_key,
+        sizeof(verified_pair_key));
+
+    fleet_clear_sensitive_memory(
+        &verified_record,
+        sizeof(verified_record));
+
+    if (err == ESP_OK)
+    {
+        *migrated_out = true;
+    }
+
+cleanup:
+
+    fleet_clear_sensitive_memory(
+        pair_key,
+        sizeof(pair_key));
+
+    fleet_clear_sensitive_memory(
+        wrapped_blob,
+        sizeof(wrapped_blob));
+
+    fleet_clear_sensitive_memory(
+        &record,
+        sizeof(record));
+
+    return err;
+}
+
+esp_err_t mathos_fleet_unwrap_pair_key(
+    const mathos_fleet_record_t *record,
+    uint8_t out_pair_key[MATHOS_FLEET_PAIR_KEY_LEN])
+{
+    if (record == NULL ||
+        out_pair_key == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(
+        out_pair_key,
+        0,
+        MATHOS_FLEET_PAIR_KEY_LEN);
+
+    if (!mathos_fleet_secure_storage_ready)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!mathos_fleet_record_is_valid(
+            record))
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (record->secret_format !=
+            MATHOS_FLEET_SECRET_FORMAT_WRAPPED_PAIR_KEY_V1 ||
+        record->secret_blob_len !=
+            MATHOS_FLEET_PAIR_WRAP_BLOB_LEN)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t err =
+        fleet_unwrap_pair_key_v1(
+            &record->gateway_uid,
+            record->key_generation,
+            record->secret_blob,
+            record->secret_blob_len,
+            out_pair_key);
+
+    if (err != ESP_OK)
+    {
+        fleet_clear_sensitive_memory(
+            out_pair_key,
+            MATHOS_FLEET_PAIR_KEY_LEN);
+
+        return err;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t mathos_fleet_pair_wrap_self_test(void)
+{
+    if (!mathos_fleet_secure_storage_ready)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    mathos_device_uid_t test_uid;
+
+    memset(
+        &test_uid,
+        0,
+        sizeof(test_uid));
+
+    for (size_t index = 0U;
+         index < sizeof(test_uid.bytes);
+         index++)
+    {
+        test_uid.bytes[index] =
+            (uint8_t)(0xA0U + index);
+    }
+
+    uint8_t test_pair_key[MATHOS_FLEET_PAIR_KEY_LEN];
+
+    for (size_t index = 0U;
+         index < sizeof(test_pair_key);
+         index++)
+    {
+        test_pair_key[index] =
+            (uint8_t)(0x40U + index);
+    }
+
+    uint8_t wrapped_blob[MATHOS_FLEET_PAIR_WRAP_BLOB_LEN];
+
+    memset(
+        wrapped_blob,
+        0,
+        sizeof(wrapped_blob));
+
+    uint16_t wrapped_blob_len = 0U;
+
+    const uint32_t test_generation = 7U;
+
+    esp_err_t err =
+        fleet_wrap_pair_key_v1(
+            &test_uid,
+            test_generation,
+            test_pair_key,
+            wrapped_blob,
+            &wrapped_blob_len);
+
+    if (err != ESP_OK ||
+        wrapped_blob_len !=
+            MATHOS_FLEET_PAIR_WRAP_BLOB_LEN)
+    {
+        goto cleanup_fail;
+    }
+
+    uint8_t recovered_pair_key[MATHOS_FLEET_PAIR_KEY_LEN];
+
+    memset(
+        recovered_pair_key,
+        0,
+        sizeof(recovered_pair_key));
+
+    err =
+        fleet_unwrap_pair_key_v1(
+            &test_uid,
+            test_generation,
+            wrapped_blob,
+            wrapped_blob_len,
+            recovered_pair_key);
+
+    if (err != ESP_OK ||
+        !fleet_secret_matches(
+            test_pair_key,
+            recovered_pair_key,
+            sizeof(test_pair_key)))
+    {
+        fleet_clear_sensitive_memory(
+            recovered_pair_key,
+            sizeof(recovered_pair_key));
+
+        goto cleanup_fail;
+    }
+
+    fleet_clear_sensitive_memory(
+        recovered_pair_key,
+        sizeof(recovered_pair_key));
+
+    /*
+        Tamper test:
+        modify one ciphertext byte.
+    */
+    wrapped_blob[MATHOS_FLEET_PAIR_WRAP_NONCE_LEN] ^=
+        0x01U;
+
+    err =
+        fleet_unwrap_pair_key_v1(
+            &test_uid,
+            test_generation,
+            wrapped_blob,
+            wrapped_blob_len,
+            recovered_pair_key);
+
+    wrapped_blob[MATHOS_FLEET_PAIR_WRAP_NONCE_LEN] ^=
+        0x01U;
+
+    if (err == ESP_OK)
+    {
+        goto cleanup_fail;
+    }
+
+    /*
+        Generation binding test.
+    */
+    err =
+        fleet_unwrap_pair_key_v1(
+            &test_uid,
+            test_generation + 1U,
+            wrapped_blob,
+            wrapped_blob_len,
+            recovered_pair_key);
+
+    if (err == ESP_OK)
+    {
+        goto cleanup_fail;
+    }
+
+    /*
+        Gateway UID binding test.
+    */
+    mathos_device_uid_t wrong_uid =
+        test_uid;
+
+    wrong_uid.bytes[0] ^=
+        0x01U;
+
+    err =
+        fleet_unwrap_pair_key_v1(
+            &wrong_uid,
+            test_generation,
+            wrapped_blob,
+            wrapped_blob_len,
+            recovered_pair_key);
+
+    if (err == ESP_OK)
+    {
+        goto cleanup_fail;
+    }
+
+    fleet_clear_sensitive_memory(
+        recovered_pair_key,
+        sizeof(recovered_pair_key));
+
+    fleet_clear_sensitive_memory(
+        test_pair_key,
+        sizeof(test_pair_key));
+
+    fleet_clear_sensitive_memory(
+        wrapped_blob,
+        sizeof(wrapped_blob));
+
+    fleet_clear_sensitive_memory(
+        &test_uid,
+        sizeof(test_uid));
+
+    fleet_clear_sensitive_memory(
+        &wrong_uid,
+        sizeof(wrong_uid));
+
+    ESP_LOGI(
+        TAG,
+        "Pair-key wrap self-test PASSED");
+
+    return ESP_OK;
+
+cleanup_fail:
+
+    fleet_clear_sensitive_memory(
+        recovered_pair_key,
+        sizeof(recovered_pair_key));
+
+    fleet_clear_sensitive_memory(
+        test_pair_key,
+        sizeof(test_pair_key));
+
+    fleet_clear_sensitive_memory(
+        wrapped_blob,
+        sizeof(wrapped_blob));
+
+    fleet_clear_sensitive_memory(
+        &test_uid,
+        sizeof(test_uid));
+
+    ESP_LOGE(
+        TAG,
+        "Pair-key wrap self-test FAILED");
+
+    return ESP_FAIL;
+}
 
 esp_err_t mathos_fleet_secure_storage_init(
     uint8_t hmac_key_id)
@@ -7203,6 +9747,18 @@ cleanup:
 
     if (err == ESP_OK)
     {
+        /*
+            Mounting encrypted Fleet storage does NOT unlock
+            operational credentials.
+
+            Every boot begins with the Fleet Master Key locked
+            and absent from RAM.
+        */
+        fleet_master_key_lock();
+
+        mathos_fleet_secure_storage_hmac_key_id =
+            hmac_key_id;
+
         mathos_fleet_secure_storage_ready = true;
 
         ESP_LOGI(
@@ -7236,71 +9792,69 @@ esp_err_t mathos_fleet_init(void)
 
         return ESP_ERR_INVALID_STATE;
     }
-/*
-    The legacy plaintext Fleet is needed only until
-    secure persistent-state migration has completed.
+    /*
+        The legacy plaintext Fleet is needed only until
+        secure persistent-state migration has completed.
 
-    Once the encrypted migration marker is present,
-    normal startup must no longer initialize or depend
-    on the legacy Fleet partition.
-*/
-bool migration_complete = false;
+        Once the encrypted migration marker is present,
+        normal startup must no longer initialize or depend
+        on the legacy Fleet partition.
+    */
+    bool migration_complete = false;
 
-esp_err_t err =
-    mathos_fleet_secure_migration_is_complete(
-        &migration_complete);
-
-if (err != ESP_OK)
-{
-    ESP_LOGE(
-        TAG,
-        "Secure Fleet migration state read failed: %s",
-        esp_err_to_name(err));
-
-    return err;
-}
-
-if (!migration_complete)
-{
-    err =
-        nvs_flash_init_partition(
-            MATHOS_FLEET_LEGACY_PARTITION_NAME);
-
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
-        err == ESP_ERR_NVS_NEW_VERSION_FOUND)
-    {
-        ESP_LOGE(
-            TAG,
-            "Legacy Fleet partition requires explicit recovery "
-            "error=%s. Automatic erase is forbidden.",
-            esp_err_to_name(err));
-
-        return err;
-    }
+    esp_err_t err =
+        mathos_fleet_secure_migration_is_complete(
+            &migration_complete);
 
     if (err != ESP_OK)
     {
         ESP_LOGE(
             TAG,
-            "Legacy Fleet partition initialization failed: %s",
+            "Secure Fleet migration state read failed: %s",
             esp_err_to_name(err));
 
         return err;
     }
 
-    ESP_LOGI(
-        TAG,
-        "Legacy Fleet initialized for one-time migration");
-}
-else
-{
-    ESP_LOGI(
-        TAG,
-        "Legacy Fleet initialization skipped; "
-        "secure migration complete");
-}
-   
+    if (!migration_complete)
+    {
+        err =
+            nvs_flash_init_partition(
+                MATHOS_FLEET_LEGACY_PARTITION_NAME);
 
+        if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
+            err == ESP_ERR_NVS_NEW_VERSION_FOUND)
+        {
+            ESP_LOGE(
+                TAG,
+                "Legacy Fleet partition requires explicit recovery "
+                "error=%s. Automatic erase is forbidden.",
+                esp_err_to_name(err));
+
+            return err;
+        }
+
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(
+                TAG,
+                "Legacy Fleet partition initialization failed: %s",
+                esp_err_to_name(err));
+
+            return err;
+        }
+
+        ESP_LOGI(
+            TAG,
+            "Legacy Fleet initialized for one-time migration");
+    }
+    else
+    {
+        ESP_LOGI(
+            TAG,
+            "Legacy Fleet initialization skipped; "
+            "secure migration complete");
+    }
 
     nvs_handle_t handle;
 
